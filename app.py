@@ -7,10 +7,20 @@ Compares two geothermal ORC configurations:
 """
 
 import streamlit as st
+import streamlit.components.v1 as components
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
 import pandas as pd
+import json
+import re
+import os
+
+try:
+    from anthropic import Anthropic
+    _ANTHROPIC_AVAILABLE = True
+except ImportError:
+    _ANTHROPIC_AVAILABLE = False
 
 from fluid_properties import FluidProperties
 from thermodynamics import (
@@ -21,9 +31,28 @@ from cost_model import (
     calculate_costs_a, calculate_costs_b, lifecycle_cost,
     optimize_approach_temp, construction_schedule_delta, simple_payback,
     schedule_savings_npv, COST_FACTORS, U_VALUES,
+    hx_area_vs_pinch, acc_area_vs_pinch, duct_diameter_vs_dp,
+    acc_tubes_vs_dp, sizing_tradeoff_sweep, ACC_TUBE_DEFAULTS,
+    _duct_segment_cost,
 )
 
 st.set_page_config(page_title="ORC Comparator", layout="wide")
+
+# ============================================================================
+# SESSION STATE -- CHAT & APPLY
+# ============================================================================
+
+if "chat_messages" not in st.session_state:
+    st.session_state.chat_messages = []
+if "pending_apply" not in st.session_state:
+    st.session_state.pending_apply = {}
+
+# Apply pending unit cost overrides from Claude recommendations.
+# This runs BEFORE widgets render so session_state values take effect.
+if st.session_state.pending_apply:
+    for widget_key, value in st.session_state.pending_apply.items():
+        st.session_state[widget_key] = value
+    st.session_state.pending_apply = {}
 
 
 @st.cache_resource
@@ -100,7 +129,58 @@ with st.sidebar:
             discount_rate = st.slider("Discount rate (%)", 3, 15, 8, 1)
             project_life = st.number_input("Plant life (years)", 10, 40, 30, 1)
 
-        submitted = st.form_submit_button("Run Calculation", type="primary", use_container_width=True)
+        with st.expander("Unit Cost Assumptions (2024 USD Installed)"):
+            st.markdown("**Heat Exchanger Costs**")
+            uc_vaporizer_per_ft2 = st.number_input(
+                "Vaporizer ($/ft2)", 20, 60, 35, 1, key="uc_vaporizer")
+            uc_preheater_per_ft2 = st.number_input(
+                "Preheater ($/ft2)", 15, 50, 30, 1, key="uc_preheater")
+            uc_recuperator_per_ft2 = st.number_input(
+                "Recuperator ($/ft2)", 15, 45, 25, 1, key="uc_recuperator")
+            uc_ihx_per_ft2 = st.number_input(
+                "IHX ($/ft2, pressure rated)", 25, 70, 40, 1, key="uc_ihx")
+            uc_acc_per_ft2 = st.number_input(
+                "ACC ($/ft2 face area)", 8, 20, 12, 1, key="uc_acc")
+
+            st.markdown("**Duct and Piping Costs**")
+            uc_iso_duct_per_ft2 = st.number_input(
+                "Iso duct ($/ft2 surface)", 100, 300, 180, 5,
+                key="uc_iso_duct",
+                help="Diameter multiplier: >72\" x1.7, >60\" x1.4")
+            uc_prop_pipe_per_ft2 = st.number_input(
+                "Propane pipe ($/ft2 surface)", 80, 200, 120, 5,
+                key="uc_prop_pipe")
+            uc_prop_piping_pct = st.number_input(
+                "Propane system (% of IHX cost)", 10, 35, 20, 1,
+                key="uc_prop_pct")
+
+            st.markdown("**Turbine and Electrical**")
+            uc_turbine_per_kw = st.number_input(
+                "Turbine-generator ($/kW)", 800, 1800, 1200, 50,
+                key="uc_turbine")
+
+            st.markdown("**Civil and Structural**")
+            uc_steel_per_lb = st.number_input(
+                "Structural steel ($/lb)", 3.0, 7.0, 4.5, 0.25,
+                key="uc_steel", format="%.2f")
+            uc_foundation_pct = st.number_input(
+                "Foundation (% of equipment)", 5, 15, 8, 1,
+                key="uc_foundation")
+
+            st.markdown("**Indirect Costs**")
+            uc_engineering_pct = st.number_input(
+                "Engineering & procurement (%)", 8, 18, 12, 1,
+                key="uc_eng")
+            uc_construction_mgmt_pct = st.number_input(
+                "Construction management (%)", 5, 12, 8, 1,
+                key="uc_cm")
+            uc_contingency_pct = st.number_input(
+                "Contingency (%)", 10, 25, 15, 1,
+                key="uc_contingency")
+
+            st.caption("Cost basis: AACE Class 4-5 factored estimate. Accuracy range -30% to +50%.")
+
+        submitted = st.form_submit_button("Run Calculation", type="primary", width="stretch")
 
 inputs = {
     "T_geo_in": T_geo_in,
@@ -135,6 +215,21 @@ inputs = {
     "dp_tailpipe_iso_b": dp_tailpipe_iso_b,
     "dp_acc_tubes_prop": dp_acc_tubes_prop,
     "dp_ihx_prop": dp_ihx_prop,
+    # Unit cost overrides
+    "uc_vaporizer_per_ft2": uc_vaporizer_per_ft2,
+    "uc_preheater_per_ft2": uc_preheater_per_ft2,
+    "uc_recuperator_per_ft2": uc_recuperator_per_ft2,
+    "uc_ihx_per_ft2": uc_ihx_per_ft2,
+    "uc_acc_per_ft2": uc_acc_per_ft2,
+    "uc_iso_duct_per_ft2": uc_iso_duct_per_ft2,
+    "uc_prop_pipe_per_ft2": uc_prop_pipe_per_ft2,
+    "uc_prop_piping_pct": uc_prop_piping_pct,
+    "uc_turbine_per_kw": uc_turbine_per_kw,
+    "uc_steel_per_lb": uc_steel_per_lb,
+    "uc_foundation_pct": uc_foundation_pct,
+    "uc_engineering_pct": uc_engineering_pct,
+    "uc_construction_mgmt_pct": uc_construction_mgmt_pct,
+    "uc_contingency_pct": uc_contingency_pct,
 }
 
 # Validate
@@ -216,6 +311,413 @@ total_economic_advantage = npv_delta + sched_npv
 
 
 # ============================================================================
+# SIDEBAR -- COST IMPACT ANALYSIS
+# ============================================================================
+
+with st.sidebar:
+    with st.expander("Cost Impact by Assumption"):
+        # Build table of unit cost assumptions and their $ impact per config
+        _uc_impact_rows = []
+
+        # Helper: map unit cost key to the relevant area/quantity and label
+        _uc_items = [
+            ("Vaporizer", "uc_vaporizer_per_ft2", "vaporizer_per_ft2",
+             costs_a.get("vaporizer_area_ft2", 0), costs_b.get("vaporizer_area_ft2", 0), "ft2"),
+            ("Preheater", "uc_preheater_per_ft2", "preheater_per_ft2",
+             costs_a.get("preheater_area_ft2", 0), costs_b.get("preheater_area_ft2", 0), "ft2"),
+            ("Recuperator", "uc_recuperator_per_ft2", "recup_per_ft2",
+             costs_a.get("recuperator_area_ft2", 0), costs_b.get("recuperator_area_ft2", 0), "ft2"),
+            ("IHX", "uc_ihx_per_ft2", "hx_per_ft2",
+             costs_a.get("intermediate_hx_area_ft2", 0), costs_b.get("intermediate_hx_area_ft2", 0), "ft2"),
+            ("ACC", "uc_acc_per_ft2", "acc_per_ft2",
+             costs_a.get("acc_area_ft2", 0), costs_b.get("acc_area_ft2", 0), "ft2"),
+            ("Turbine", "uc_turbine_per_kw", "turbine_per_kw",
+             perf_a["gross_power_kw"], perf_b["gross_power_kw"], "kW"),
+        ]
+        for label, uc_key, cf_key, qty_a, qty_b, unit in _uc_items:
+            uc_val = inputs.get(uc_key, COST_FACTORS[cf_key])
+            cost_a_val = uc_val * qty_a
+            cost_b_val = uc_val * qty_b
+            _uc_impact_rows.append({
+                "Component": label,
+                "Rate": f"${uc_val:,.0f}/{unit}",
+                "Cost A ($k)": f"{cost_a_val/1e3:,.0f}",
+                "Cost B ($k)": f"{cost_b_val/1e3:,.0f}",
+            })
+        st.dataframe(pd.DataFrame(_uc_impact_rows).set_index("Component"), width="stretch")
+
+    with st.expander("Cost Sensitivity Tornado"):
+        # Algebraic tornado: perturb each unit cost +/-20%, measure change in B-A delta
+        _base_delta = costs_b["total_installed"] - costs_a["total_installed"]
+
+        _tornado_items = [
+            ("Vaporizer $/ft2", "uc_vaporizer_per_ft2", "vaporizer_per_ft2"),
+            ("Preheater $/ft2", "uc_preheater_per_ft2", "preheater_per_ft2"),
+            ("Recuperator $/ft2", "uc_recuperator_per_ft2", "recup_per_ft2"),
+            ("IHX $/ft2", "uc_ihx_per_ft2", "hx_per_ft2"),
+            ("ACC $/ft2", "uc_acc_per_ft2", "acc_per_ft2"),
+            ("Iso Duct $/ft2", "uc_iso_duct_per_ft2", "iso_duct_per_ft2"),
+            ("Propane Pipe $/ft2", "uc_prop_pipe_per_ft2", "prop_pipe_per_ft2"),
+            ("Turbine $/kW", "uc_turbine_per_kw", "turbine_per_kw"),
+            ("Steel $/lb", "uc_steel_per_lb", "steel_per_lb"),
+            ("Foundation %", "uc_foundation_pct", "foundation_pct"),
+            ("Engineering %", "uc_engineering_pct", "engineering_pct"),
+            ("Constr. Mgmt %", "uc_construction_mgmt_pct", "construction_mgmt_pct"),
+            ("Contingency %", "uc_contingency_pct", "contingency_pct"),
+            ("Propane Sys %", "uc_prop_piping_pct", "prop_piping_pct"),
+        ]
+
+        _tornado_data = []
+        for label, uc_key, cf_key in _tornado_items:
+            base_val = inputs.get(uc_key, COST_FACTORS[cf_key])
+            deltas = []
+            for mult in [0.8, 1.2]:
+                perturbed_inputs = {**inputs, uc_key: base_val * mult}
+                ca = calculate_costs_a(states_a, perf_a, perturbed_inputs, duct_a)
+                cb = calculate_costs_b(states_b, prop_states, perf_b, perturbed_inputs, duct_b)
+                new_delta = cb["total_installed"] - ca["total_installed"]
+                deltas.append((new_delta - _base_delta) / 1e6)
+            _tornado_data.append({"param": label, "low": deltas[0], "high": deltas[1]})
+
+        _tornado_data.sort(key=lambda d: abs(d["high"] - d["low"]))
+        _t_params = [d["param"] for d in _tornado_data]
+        _t_lows = [d["low"] for d in _tornado_data]
+        _t_highs = [d["high"] for d in _tornado_data]
+
+        _fig_tornado_uc = go.Figure()
+        _fig_tornado_uc.add_trace(go.Bar(
+            y=_t_params, x=_t_lows, orientation="h",
+            name="-20%", marker_color="steelblue"))
+        _fig_tornado_uc.add_trace(go.Bar(
+            y=_t_params, x=_t_highs, orientation="h",
+            name="+20%", marker_color="indianred"))
+        _fig_tornado_uc.update_layout(
+            title=f"Unit Cost Sensitivity (B-A delta base: ${_base_delta/1e6:.2f}MM)",
+            xaxis_title="Change in B-A Delta ($MM)",
+            barmode="overlay",
+            height=450,
+            margin=dict(l=120),
+        )
+        st.plotly_chart(_fig_tornado_uc, width="stretch")
+
+
+# ============================================================================
+# CLAUDE CHAT -- CONTEXT, PARSER, DIALOG
+# ============================================================================
+
+# Widget key map: maps recommendation keys to the Streamlit widget keys used
+# in the sidebar form. These are the `key=` params on st.number_input.
+_WIDGET_KEY_MAP = {
+    "uc_vaporizer_per_ft2": "uc_vaporizer",
+    "uc_preheater_per_ft2": "uc_preheater",
+    "uc_recuperator_per_ft2": "uc_recuperator",
+    "uc_ihx_per_ft2": "uc_ihx",
+    "uc_acc_per_ft2": "uc_acc",
+    "uc_iso_duct_per_ft2": "uc_iso_duct",
+    "uc_prop_pipe_per_ft2": "uc_prop_pipe",
+    "uc_prop_piping_pct": "uc_prop_pct",
+    "uc_turbine_per_kw": "uc_turbine",
+    "uc_steel_per_lb": "uc_steel",
+    "uc_foundation_pct": "uc_foundation",
+    "uc_engineering_pct": "uc_eng",
+    "uc_construction_mgmt_pct": "uc_cm",
+    "uc_contingency_pct": "uc_contingency",
+}
+
+# Bounds for validation (min, max) keyed by widget key
+_WIDGET_BOUNDS = {
+    "uc_vaporizer": (20, 60), "uc_preheater": (15, 50),
+    "uc_recuperator": (15, 45), "uc_ihx": (25, 70),
+    "uc_acc": (8, 20), "uc_iso_duct": (100, 300),
+    "uc_prop_pipe": (80, 200), "uc_prop_pct": (10, 35),
+    "uc_turbine": (800, 1800), "uc_steel": (3.0, 7.0),
+    "uc_foundation": (5, 15), "uc_eng": (8, 18),
+    "uc_cm": (5, 12), "uc_contingency": (10, 25),
+}
+
+
+def _build_chat_context():
+    """Build JSON context string for Claude system prompt injection."""
+    ctx = {
+        "inputs": {
+            "brine_inlet_T_F": inputs["T_geo_in"],
+            "brine_flow_lbs": inputs["m_dot_geo"],
+            "ambient_T_F": inputs["T_ambient"],
+            "brine_outlet_min_T_F": inputs["T_geo_out_min"],
+            "vaporizer_pinch_F": inputs["dt_pinch_vaporizer"],
+            "preheater_pinch_F": inputs["dt_pinch_preheater"],
+            "acc_pinch_A_F": inputs["dt_pinch_acc_a"],
+            "acc_pinch_B_F": inputs["dt_pinch_acc_b"],
+            "recuperator_pinch_F": inputs["dt_pinch_recup"],
+            "ihx_approach_F": inputs["dt_approach_intermediate"],
+            "turbine_eff": inputs["eta_turbine"],
+            "pump_eff": inputs["eta_pump"],
+            "electricity_price_per_MWh": inputs["electricity_price"],
+        },
+        "unit_costs": {
+            "vaporizer_per_ft2": inputs.get("uc_vaporizer_per_ft2", COST_FACTORS["vaporizer_per_ft2"]),
+            "preheater_per_ft2": inputs.get("uc_preheater_per_ft2", COST_FACTORS["preheater_per_ft2"]),
+            "recuperator_per_ft2": inputs.get("uc_recuperator_per_ft2", COST_FACTORS["recup_per_ft2"]),
+            "ihx_per_ft2": inputs.get("uc_ihx_per_ft2", COST_FACTORS["hx_per_ft2"]),
+            "acc_per_ft2": inputs.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"]),
+            "iso_duct_per_ft2": inputs.get("uc_iso_duct_per_ft2", COST_FACTORS["iso_duct_per_ft2"]),
+            "prop_pipe_per_ft2": inputs.get("uc_prop_pipe_per_ft2", COST_FACTORS["prop_pipe_per_ft2"]),
+            "turbine_per_kw": inputs.get("uc_turbine_per_kw", COST_FACTORS["turbine_per_kw"]),
+            "steel_per_lb": inputs.get("uc_steel_per_lb", COST_FACTORS["steel_per_lb"]),
+            "foundation_pct": inputs.get("uc_foundation_pct", COST_FACTORS["foundation_pct"]),
+            "engineering_pct": inputs.get("uc_engineering_pct", COST_FACTORS["engineering_pct"]),
+            "construction_mgmt_pct": inputs.get("uc_construction_mgmt_pct", COST_FACTORS["construction_mgmt_pct"]),
+            "contingency_pct": inputs.get("uc_contingency_pct", COST_FACTORS["contingency_pct"]),
+            "prop_piping_pct": inputs.get("uc_prop_piping_pct", COST_FACTORS["prop_piping_pct"]),
+        },
+        "config_a": {
+            "net_power_kw": round(perf_a["net_power_kw"], 1),
+            "gross_power_kw": round(perf_a["gross_power_kw"], 1),
+            "thermal_eff_pct": round(perf_a["eta_thermal"] * 100, 2),
+            "T_cond_F": round(perf_a["T_cond"], 1),
+            "brine_effectiveness_kW_per_lbs": round(perf_a["brine_effectiveness"], 3),
+            "tailpipe_diameter_in": round(duct_a["tailpipe_diameter_in"], 1),
+            "acc_header_diameter_in": round(duct_a["acc_header_diameter_in"], 1),
+            "total_installed_cost": round(costs_a["total_installed"]),
+            "equipment_subtotal": round(costs_a["equipment_subtotal"]),
+            "vaporizer_area_ft2": round(costs_a["vaporizer_area_ft2"]),
+            "preheater_area_ft2": round(costs_a["preheater_area_ft2"]),
+            "recuperator_area_ft2": round(costs_a["recuperator_area_ft2"]),
+            "acc_area_ft2": round(costs_a["acc_area_ft2"]),
+            "ductwork_cost": round(costs_a["ductwork"]),
+            "structural_steel_cost": round(costs_a["structural_steel"]),
+            "lcoe_per_MWh": round(lc_a["lcoe"], 2),
+            "net_npv": round(lc_a["net_npv"]),
+            "specific_cost_per_kw": round(lc_a["specific_cost_per_kw"]),
+        },
+        "config_b": {
+            "net_power_kw": round(perf_b["net_power_kw"], 1),
+            "gross_power_kw": round(perf_b["gross_power_kw"], 1),
+            "thermal_eff_pct": round(perf_b["eta_thermal"] * 100, 2),
+            "T_cond_iso_F": round(perf_b["T_cond_iso"], 1),
+            "T_propane_cond_F": round(perf_b["T_propane_cond"], 1),
+            "brine_effectiveness_kW_per_lbs": round(perf_b["brine_effectiveness"], 3),
+            "tailpipe_diameter_in": round(duct_b["tailpipe_diameter_in"], 1),
+            "total_installed_cost": round(costs_b["total_installed"]),
+            "equipment_subtotal": round(costs_b["equipment_subtotal"]),
+            "vaporizer_area_ft2": round(costs_b["vaporizer_area_ft2"]),
+            "preheater_area_ft2": round(costs_b["preheater_area_ft2"]),
+            "recuperator_area_ft2": round(costs_b["recuperator_area_ft2"]),
+            "ihx_area_ft2": round(costs_b["intermediate_hx_area_ft2"]),
+            "acc_area_ft2": round(costs_b["acc_area_ft2"]),
+            "ductwork_cost": round(costs_b["ductwork"]),
+            "structural_steel_cost": round(costs_b["structural_steel"]),
+            "propane_system_cost": round(costs_b["propane_system"]),
+            "lcoe_per_MWh": round(lc_b["lcoe"], 2),
+            "net_npv": round(lc_b["net_npv"]),
+            "specific_cost_per_kw": round(lc_b["specific_cost_per_kw"]),
+        },
+        "comparison": {
+            "cost_delta_B_minus_A": round(costs_b["total_installed"] - costs_a["total_installed"]),
+            "power_delta_B_minus_A_kw": round(perf_b["net_power_kw"] - perf_a["net_power_kw"], 1),
+            "npv_advantage_B": round(total_economic_advantage),
+            "schedule_delta_weeks": sched_info["net_delta"],
+            "vol_flow_ratio_A_over_B": round(vol_ratio, 1),
+        },
+        "validation": {
+            "config_a_pass": all(passed for _, passed, _ in checks_a),
+            "config_b_pass": all(passed for _, passed, _ in checks_b),
+            "warnings": warns,
+        },
+    }
+    return json.dumps(ctx, indent=2)
+
+
+def _parse_recommendations(text):
+    """Extract specific cost recommendations from Claude's response.
+
+    Looks for component-name + dollar-value or percentage patterns and maps
+    them to the corresponding widget keys for the Apply button.
+    """
+    recs = []
+    seen = set()
+
+    # (regex, widget_key, display_label, value_type)
+    patterns = [
+        (r'vaporizer[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*ft', "uc_vaporizer", "Vaporizer", "int"),
+        (r'\$\s*(\d+(?:\.\d+)?)\s*/\s*ft[²2]?\s*(?:for\s+)?(?:the\s+)?vaporizer', "uc_vaporizer", "Vaporizer", "int"),
+        (r'preheater[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*ft', "uc_preheater", "Preheater", "int"),
+        (r'\$\s*(\d+(?:\.\d+)?)\s*/\s*ft[²2]?\s*(?:for\s+)?(?:the\s+)?preheater', "uc_preheater", "Preheater", "int"),
+        (r'recuperator[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*ft', "uc_recuperator", "Recuperator", "int"),
+        (r'\$\s*(\d+(?:\.\d+)?)\s*/\s*ft[²2]?\s*(?:for\s+)?(?:the\s+)?recuperator', "uc_recuperator", "Recuperator", "int"),
+        (r'(?:IHX|intermediate)[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*ft', "uc_ihx", "IHX", "int"),
+        (r'\$\s*(\d+(?:\.\d+)?)\s*/\s*ft[²2]?\s*(?:for\s+)?(?:the\s+)?(?:IHX|intermediate)', "uc_ihx", "IHX", "int"),
+        (r'ACC[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*ft', "uc_acc", "ACC", "int"),
+        (r'\$\s*(\d+(?:\.\d+)?)\s*/\s*ft[²2]?\s*(?:for\s+)?(?:the\s+)?ACC', "uc_acc", "ACC", "int"),
+        (r'(?:iso(?:pentane)?\s*)?duct(?:work)?[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*ft', "uc_iso_duct", "Iso Duct", "int"),
+        (r'propane\s*pip(?:e|ing)[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*ft', "uc_prop_pipe", "Propane Pipe", "int"),
+        (r'turbine[^$\n]{0,80}\$\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*/\s*kW', "uc_turbine", "Turbine", "int"),
+        (r'\$\s*(\d+(?:,\d{3})*(?:\.\d+)?)\s*/\s*kW\s*(?:for\s+)?(?:the\s+)?turbine', "uc_turbine", "Turbine", "int"),
+        (r'(?:structural\s*)?steel[^$\n]{0,80}\$\s*(\d+(?:\.\d+)?)\s*/\s*lb', "uc_steel", "Steel", "float"),
+        (r'foundation\D{0,80}?(\d+(?:\.\d+)?)\s*%', "uc_foundation", "Foundation", "int"),
+        (r'engineering\D{0,80}?(\d+(?:\.\d+)?)\s*%', "uc_eng", "Engineering", "int"),
+        (r'construction\s*(?:management|mgmt)\D{0,80}?(\d+(?:\.\d+)?)\s*%', "uc_cm", "Constr. Mgmt", "int"),
+        (r'contingency\D{0,80}?(\d+(?:\.\d+)?)\s*%', "uc_contingency", "Contingency", "int"),
+    ]
+
+    for pat, wkey, label, vtype in patterns:
+        if wkey in seen:
+            continue
+        match = re.search(pat, text, re.IGNORECASE)
+        if match:
+            val_str = match.group(1).replace(",", "")
+            val = float(val_str)
+            if vtype == "int":
+                val = int(round(val))
+            # Validate against widget bounds
+            bounds = _WIDGET_BOUNDS.get(wkey)
+            if bounds and bounds[0] <= val <= bounds[1]:
+                seen.add(wkey)
+                recs.append((wkey, label, val))
+
+    return recs
+
+
+_CLAUDE_SYSTEM_PROMPT = """You are an expert geothermal ORC process engineer and cost estimator with deep knowledge of organic Rankine cycles, air cooled condensers, heat exchanger design, and geothermal power plant construction costs. You are embedded in an ORC comparison tool that analyzes a traditional isopentane ORC against a split propane loop ORC configuration. Both cycles include a preheater, vaporizer, recuperator, and air cooled condensers. The split configuration adds an isopentane/propane intermediate heat exchanger and propane loop to reduce vapor ductwork size.
+
+You have access to the current calculation results and inputs shown below. Use these to give specific, quantitative answers where possible. When reassessing cost assumptions, provide a specific recommended value with a brief justification based on market conditions, service requirements, or industry standards. When the user asks about cost assumptions, always provide a specific number they can enter into the tool, not a range. Be direct and concise -- this is an engineering tool, not a general discussion.
+
+IMPORTANT: When recommending a specific unit cost, always state it in the format "$XX/ft2" or "$XX/kW" or "$XX/lb" or "XX%" so the tool can parse and offer an Apply button. Always give ONE specific number, not a range.
+
+Current calculation state:
+{context}"""
+
+
+def _get_anthropic_client():
+    """Get Anthropic client, checking secrets then env var."""
+    api_key = None
+    try:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY")
+    except Exception:
+        pass
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        return None
+    return Anthropic(api_key=api_key)
+
+
+@st.dialog("Ask Claude -- ORC Engineering Assistant", width="large")
+def _claude_chat_dialog():
+    """Modal dialog with embedded Claude chat."""
+
+    if not _ANTHROPIC_AVAILABLE:
+        st.error("The `anthropic` package is not installed. Run: `pip install anthropic`")
+        return
+
+    client = _get_anthropic_client()
+    if client is None:
+        st.warning(
+            "No Anthropic API key configured. Set `ANTHROPIC_API_KEY` in "
+            "`.streamlit/secrets.toml` or as an environment variable."
+        )
+        st.code('# .streamlit/secrets.toml\nANTHROPIC_API_KEY = "sk-ant-..."', language="toml")
+        return
+
+    # --- Quick-access prompt buttons ---
+    st.markdown("**Quick questions:**")
+    qcols = st.columns(3)
+    _quick_prompts = [
+        "Reassess ACC unit cost",
+        "Reassess intermediate HX cost",
+        "Sanity check these results",
+        "Why is Config A/B winning?",
+        "Recommend pinch point adjustments",
+        "Explain the key tradeoff",
+    ]
+    _clicked_prompt = None
+    for i, qp in enumerate(_quick_prompts):
+        with qcols[i % 3]:
+            if st.button(qp, key=f"_qp_{i}", use_container_width=True):
+                _clicked_prompt = qp
+
+    st.divider()
+
+    # --- Message history display ---
+    chat_box = st.container(height=420)
+    with chat_box:
+        for i, msg in enumerate(st.session_state.chat_messages):
+            with st.chat_message(msg["role"]):
+                st.markdown(msg["content"])
+                # Show Apply buttons for assistant messages with recommendations
+                if msg["role"] == "assistant" and msg.get("recs"):
+                    for wkey, label, val in msg["recs"]:
+                        btn_label = f"Apply: {label} = {val}"
+                        if st.button(btn_label, key=f"_apply_{wkey}_{i}"):
+                            st.session_state.pending_apply = {wkey: val}
+                            st.rerun()
+
+    # --- Chat input ---
+    user_input = st.chat_input("Ask about the ORC design, costs, or assumptions...")
+
+    # Resolve actual prompt (typed or quick-button)
+    prompt = user_input or _clicked_prompt
+    if not prompt:
+        # --- Footer ---
+        fcol1, fcol2 = st.columns([3, 1])
+        with fcol2:
+            if st.button("Clear Chat", key="_clear_chat"):
+                st.session_state.chat_messages = []
+                st.rerun(scope="fragment")
+        st.caption(
+            "AI recommendations should be validated against current vendor quotes "
+            "and project-specific conditions before use in project decisions."
+        )
+        return
+
+    # Add user message
+    st.session_state.chat_messages.append({"role": "user", "content": prompt})
+
+    # Build API messages (role/content only, no extra keys)
+    api_messages = [
+        {"role": m["role"], "content": m["content"]}
+        for m in st.session_state.chat_messages
+    ]
+
+    # Build system prompt with current context
+    context_json = _build_chat_context()
+    system_prompt = _CLAUDE_SYSTEM_PROMPT.format(context=context_json)
+
+    # Call Anthropic API
+    with st.spinner("Claude is thinking..."):
+        try:
+            response = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=1000,
+                system=system_prompt,
+                messages=api_messages,
+            )
+            reply = response.content[0].text
+        except Exception as e:
+            reply = f"API error: {e}"
+
+    # Parse recommendations from response
+    recs = _parse_recommendations(reply)
+
+    # Store assistant message with recs
+    st.session_state.chat_messages.append({
+        "role": "assistant",
+        "content": reply,
+        "recs": recs,
+    })
+
+    # Rerun dialog to display the new messages
+    st.rerun(scope="fragment")
+
+
+# --- Sidebar button to open chat ---
+with st.sidebar:
+    st.divider()
+    if st.button("💬 Ask Claude", use_container_width=True, type="secondary"):
+        _claude_chat_dialog()
+
+
+# ============================================================================
 # HELPERS
 # ============================================================================
 
@@ -247,6 +749,299 @@ def _color_winner(winner):
     elif winner == "B":
         return ":red[**B**]"
     return "Tie"
+
+
+def _svg_defs():
+    """Shared SVG arrow marker definitions."""
+    return """
+    <defs>
+      <marker id="arr-red" viewBox="0 0 8 6" refX="8" refY="3"
+              markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#c0392b"/>
+      </marker>
+      <marker id="arr-blue" viewBox="0 0 8 6" refX="8" refY="3"
+              markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#2980b9"/>
+      </marker>
+      <marker id="arr-green" viewBox="0 0 8 6" refX="8" refY="3"
+              markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#27ae60"/>
+      </marker>
+      <marker id="arr-orange" viewBox="0 0 8 6" refX="8" refY="3"
+              markerWidth="8" markerHeight="6" orient="auto-start-reverse">
+        <path d="M0,0 L8,3 L0,6 Z" fill="#d35400"/>
+      </marker>
+    </defs>"""
+
+
+def _svg_style():
+    """Shared SVG CSS styles."""
+    return """
+    <style>
+      .eq-box { stroke: #333; stroke-width: 1.5; rx: 6; ry: 6; }
+      .eq-label { font-size: 10.5px; font-weight: bold; fill: #222; font-family: sans-serif; }
+      .eq-duty { font-size: 8.5px; fill: #555; font-family: sans-serif; }
+      .state-label { font-size: 8px; fill: #444; font-family: monospace; }
+      .flow-hot { stroke: #c0392b; stroke-width: 2.5; fill: none; }
+      .flow-cold { stroke: #2980b9; stroke-width: 2.5; fill: none; }
+      .flow-green { stroke: #27ae60; stroke-width: 2.5; fill: none; }
+      .flow-brine { stroke: #d35400; stroke-width: 2; fill: none; stroke-dasharray: 6,3; }
+      .halo { stroke: #c0392b; stroke-opacity: 0.12; stroke-width: 10; fill: none; }
+      .annot-box { fill: none; stroke: #c0392b; stroke-width: 1; stroke-dasharray: 4,2; rx: 4; }
+      .annot-text { font-size: 8px; fill: #c0392b; font-weight: bold; font-family: sans-serif; }
+      .annot-green { font-size: 8px; fill: #27ae60; font-weight: bold; font-family: sans-serif; }
+      .title-text { font-size: 13px; font-weight: bold; fill: #333; font-family: sans-serif; }
+      .brine-label { font-size: 8px; fill: #d35400; font-family: sans-serif; }
+    </style>"""
+
+
+def _eq_box(x, y, w, h, fill, name, duty_str):
+    """Generate SVG rect + centered labels for an equipment block."""
+    cx = x + w / 2
+    return (
+        f'<rect x="{x}" y="{y}" width="{w}" height="{h}" '
+        f'class="eq-box" fill="{fill}"/>'
+        f'<text x="{cx}" y="{y + h/2 - 4}" text-anchor="middle" '
+        f'class="eq-label">{name}</text>'
+        f'<text x="{cx}" y="{y + h/2 + 9}" text-anchor="middle" '
+        f'class="eq-duty">{duty_str}</text>'
+    )
+
+
+def _state_tag(x, y, num, T, P, anchor="start"):
+    """State point annotation: number, T, P."""
+    return (
+        f'<text x="{x}" y="{y}" text-anchor="{anchor}" class="state-label">'
+        f'{num}: {T:.0f}F / {P:.0f} psia</text>'
+    )
+
+
+def _generate_pfd_a(states, perf, duct, inputs):
+    """Generate Config A PFD as inline SVG wrapped in an HTML div."""
+    m = perf["m_dot_iso"]
+
+    # Duties
+    vap_duty = m * perf["q_vaporizer"] / 1e6
+    pre_duty = m * perf["q_preheater"] / 1e6
+    turb_kw = perf["gross_power_kw"]
+    recup_duty = perf["Q_recup_mmbtu_hr"]
+    rej_duty = perf["Q_reject_mmbtu_hr"]
+    pump_kw = m * perf["w_pump"] / 3412.14
+
+    s = states
+    tp_dia = duct["tailpipe_diameter_in"]
+    L_run = inputs.get("L_tailpipe_a", 30) + inputs.get("L_long_header", 120)
+
+    svg = f"""<div style="background:#fafafa;border:1px solid #ddd;border-radius:8px;padding:4px;">
+<svg viewBox="0 0 580 500" xmlns="http://www.w3.org/2000/svg">
+{_svg_style()}
+{_svg_defs()}
+
+<!-- Title -->
+<text x="290" y="20" text-anchor="middle" class="title-text">Config A -- Direct ACC</text>
+
+<!-- Equipment boxes -->
+{_eq_box(140, 45, 150, 44, '#fff3e0', 'VAPORIZER', f'{vap_duty:.2f} MMBtu/hr')}
+{_eq_box(420, 80, 120, 48, '#fce4ec', 'TURBINE', f'{turb_kw:.0f} kW')}
+{_eq_box(235, 195, 145, 68, '#f3e5f5', 'RECUPERATOR', f'{recup_duty:.2f} MMBtu/hr')}
+{_eq_box(370, 340, 145, 50, '#e3f2fd', 'ACC', f'{rej_duty:.2f} MMBtu/hr')}
+{_eq_box(55, 345, 125, 40, '#e8f5e9', 'ISO PUMP', f'{pump_kw:.0f} kW')}
+{_eq_box(35, 165, 145, 44, '#fff3e0', 'PREHEATER', f'{pre_duty:.2f} MMBtu/hr')}
+
+<!-- Recuperator internal divider -->
+<line x1="245" y1="229" x2="370" y2="229" stroke="#999" stroke-width="0.8" stroke-dasharray="3,2"/>
+
+<!-- ============ FLOW LINES ============ -->
+
+<!-- State 1: Vaporizer -> Turbine (hot vapor, red, right across top) -->
+<polyline points="290,67 355,67 355,104 420,104"
+  class="flow-hot" marker-end="url(#arr-red)"/>
+{_state_tag(300, 62, 1, s['1'].T, s['1'].P)}
+
+<!-- State 2: Turbine -> Recuperator hot in (red, down right side) -->
+<polyline points="480,128 480,175 380,175 380,195"
+  class="flow-hot" marker-end="url(#arr-red)"/>
+<!-- Big pipe halo on state 2-3 path -->
+<polyline points="480,128 480,175 380,175 380,195"
+  class="halo"/>
+{_state_tag(485, 155, 2, s['2'].T, s['2'].P)}
+
+<!-- State 3: Recuperator hot out -> ACC (red, down) -->
+<polyline points="380,263 380,310 442,310 442,340"
+  class="flow-hot" marker-end="url(#arr-red)"/>
+<polyline points="380,263 380,310 442,310 442,340"
+  class="halo"/>
+{_state_tag(387, 300, 3, s['3'].T, s['3'].P)}
+
+<!-- State 4: ACC -> Pump (blue, left across bottom) -->
+<polyline points="370,365 210,365 210,420 180,420 180,365"
+  class="flow-cold" marker-end="url(#arr-blue)"/>
+{_state_tag(210, 440, 4, s['4'].T, s['4'].P)}
+
+<!-- State 5: Pump -> Recuperator cold in (blue, up) -->
+<polyline points="55,345 55,260 235,260"
+  class="flow-cold" marker-end="url(#arr-blue)"/>
+{_state_tag(15, 300, 5, s['5'].T, s['5'].P, 'start')}
+
+<!-- State 6: Recuperator cold out -> Preheater (blue, left) -->
+<polyline points="235,215 190,215 180,187 180,209"
+  class="flow-cold" marker-end="url(#arr-blue)"/>
+{_state_tag(182, 215, 6, s['6'].T, s['6'].P, 'end')}
+
+<!-- State 7: Preheater -> Vaporizer (warm, up left side) -->
+<polyline points="107,165 107,110 107,89 140,67"
+  class="flow-cold" marker-end="url(#arr-red)"/>
+{_state_tag(15, 140, 7, s['7'].T, s['7'].P)}
+
+<!-- ============ BRINE PATH (orange dashed) ============ -->
+<polyline points="215,30 215,45"
+  class="flow-brine" marker-end="url(#arr-orange)"/>
+<text x="218" y="28" class="brine-label">Brine In {inputs['T_geo_in']:.0f}F</text>
+
+<polyline points="215,89 107,89 107,165"
+  class="flow-brine" marker-end="url(#arr-orange)"/>
+<text x="155" y="100" class="brine-label">T_mid {perf['T_brine_mid']:.0f}F</text>
+
+<polyline points="107,209 107,230"
+  class="flow-brine"/>
+<text x="60" y="245" class="brine-label">Brine Out {perf['T_geo_out_calc']:.0f}F</text>
+
+<!-- Big Pipe annotation box -->
+<rect x="420" y="135" width="150" height="48" class="annot-box"/>
+<text x="495" y="152" text-anchor="middle" class="annot-text">LOW-PRESSURE VAPOR PATH</text>
+<text x="495" y="164" text-anchor="middle" class="annot-text">{tp_dia:.0f}" dia x {L_run:.0f} ft run</text>
+<text x="495" y="176" text-anchor="middle" style="font-size:7.5px;fill:#c0392b;font-family:sans-serif;">
+  (field-routed isopentane vapor)</text>
+
+</svg></div>"""
+    return svg
+
+
+def _generate_pfd_b(states, prop_states, perf, duct, duct_a, inputs):
+    """Generate Config B PFD as inline SVG wrapped in an HTML div."""
+    m = perf["m_dot_iso"]
+    m_prop = perf["m_dot_prop"]
+
+    vap_duty = m * perf["q_vaporizer"] / 1e6
+    pre_duty = m * perf["q_preheater"] / 1e6
+    turb_kw = perf["gross_power_kw"]
+    recup_duty = perf["Q_recup_mmbtu_hr"]
+    ihx_duty = m * perf["q_cond_iso"] / 1e6
+    pump_iso_kw = m * perf["w_pump_iso"] / 3412.14
+    pump_prop_kw = m_prop * perf["w_pump_prop"] / 3412.14
+    rej_duty = perf["Q_reject_mmbtu_hr"]
+
+    s = states
+    ps = prop_states
+    prop_dia = duct.get("propane_header_diameter_in", 0)
+    tp_a_dia = duct_a["tailpipe_diameter_in"]
+
+    svg = f"""<div style="background:#fafafa;border:1px solid #ddd;border-radius:8px;padding:4px;">
+<svg viewBox="0 0 580 500" xmlns="http://www.w3.org/2000/svg">
+{_svg_style()}
+{_svg_defs()}
+
+<!-- Title -->
+<text x="290" y="20" text-anchor="middle" class="title-text">Config B -- Propane Intermediate Loop</text>
+
+<!-- Equipment boxes -->
+{_eq_box(55, 45, 140, 44, '#fff3e0', 'VAPORIZER', f'{vap_duty:.2f} MMBtu/hr')}
+{_eq_box(295, 80, 110, 48, '#fce4ec', 'TURBINE', f'{turb_kw:.0f} kW')}
+{_eq_box(140, 195, 135, 62, '#f3e5f5', 'RECUPERATOR', f'{recup_duty:.2f} MMBtu/hr')}
+{_eq_box(140, 320, 135, 50, '#fffde7', 'IHX', f'{ihx_duty:.2f} MMBtu/hr')}
+{_eq_box(10, 325, 105, 38, '#e8f5e9', 'ISO PUMP', f'{pump_iso_kw:.0f} kW')}
+{_eq_box(10, 155, 115, 44, '#fff3e0', 'PREHEATER', f'{pre_duty:.2f} MMBtu/hr')}
+{_eq_box(400, 175, 140, 50, '#e3f2fd', 'PROPANE ACC', f'{rej_duty:.2f} MMBtu/hr')}
+{_eq_box(410, 320, 120, 38, '#e8f5e9', 'PROP PUMP', f'{pump_prop_kw:.0f} kW')}
+
+<!-- Recuperator internal divider -->
+<line x1="150" y1="226" x2="265" y2="226" stroke="#999" stroke-width="0.8" stroke-dasharray="3,2"/>
+
+<!-- ============ ISOPENTANE LOOP ============ -->
+
+<!-- State 1: Vaporizer -> Turbine (hot vapor, red) -->
+<polyline points="195,67 245,67 245,104 295,104"
+  class="flow-hot" marker-end="url(#arr-red)"/>
+{_state_tag(200, 58, 1, s['1'].T, s['1'].P)}
+
+<!-- State 2: Turbine -> Recuperator hot in (red) -->
+<polyline points="350,128 350,175 275,175 275,195"
+  class="flow-hot" marker-end="url(#arr-red)"/>
+{_state_tag(355, 155, 2, s['2'].T, s['2'].P)}
+
+<!-- State 3: Recuperator hot out -> IHX (red, down) -->
+<polyline points="275,257 275,290 207,290 207,320"
+  class="flow-hot" marker-end="url(#arr-red)"/>
+{_state_tag(280, 286, 3, s['3'].T, s['3'].P)}
+
+<!-- State 4: IHX -> Pump (blue, left) -->
+<polyline points="140,345 115,345 115,400 62,400 62,363"
+  class="flow-cold" marker-end="url(#arr-blue)"/>
+{_state_tag(70, 415, 4, s['4'].T, s['4'].P)}
+
+<!-- State 5: Pump -> Recuperator cold in (blue, up) -->
+<polyline points="10,325 10,250 140,250"
+  class="flow-cold" marker-end="url(#arr-blue)"/>
+{_state_tag(4, 275, 5, s['5'].T, s['5'].P, 'start')}
+
+<!-- State 6: Recuperator cold out -> Preheater (blue, left) -->
+<polyline points="140,210 130,210 125,190 125,199"
+  class="flow-cold" marker-end="url(#arr-blue)"/>
+{_state_tag(72, 218, 6, s['6'].T, s['6'].P, 'start')}
+
+<!-- State 7: Preheater -> Vaporizer (warm, up) -->
+<polyline points="67,155 67,110 67,89 55,67"
+  class="flow-cold" marker-end="url(#arr-red)"/>
+{_state_tag(4, 135, 7, s['7'].T, s['7'].P)}
+
+<!-- ============ PROPANE LOOP (green) ============ -->
+
+<!-- State A: IHX -> Propane ACC (green, right) -->
+<polyline points="275,345 340,345 340,215 400,215"
+  class="flow-green" marker-end="url(#arr-green)"/>
+<text x="342" y="280" text-anchor="start" class="state-label">A: {ps['A'].T:.0f}F / {ps['A'].P:.0f} psia</text>
+
+<!-- State B: Propane ACC -> Prop Pump (green, down) -->
+<polyline points="470,225 470,260 470,320"
+  class="flow-green" marker-end="url(#arr-green)"/>
+<text x="475" y="275" text-anchor="start" class="state-label">B: {ps['B'].T:.0f}F / {ps['B'].P:.0f} psia</text>
+
+<!-- State C: Prop Pump -> IHX (green, left) -->
+<polyline points="410,339 340,339 340,365 275,365 275,370"
+  class="flow-green" marker-end="url(#arr-green)"/>
+<text x="350" y="380" text-anchor="start" class="state-label">C: {ps['C'].T:.0f}F / {ps['C'].P:.0f} psia</text>
+
+<!-- ============ BRINE PATH (orange dashed) ============ -->
+<polyline points="125,30 125,45"
+  class="flow-brine" marker-end="url(#arr-orange)"/>
+<text x="128" y="28" class="brine-label">Brine In {inputs['T_geo_in']:.0f}F</text>
+
+<polyline points="125,89 67,89 67,155"
+  class="flow-brine" marker-end="url(#arr-orange)"/>
+<text x="80" y="100" class="brine-label">T_mid {perf['T_brine_mid']:.0f}F</text>
+
+<polyline points="67,199 67,220"
+  class="flow-brine"/>
+<text x="4" y="235" class="brine-label">Brine Out {perf['T_geo_out_calc']:.0f}F</text>
+
+<!-- Short iso runs annotation -->
+<rect x="140" y="380" width="130" height="30" rx="4"
+  fill="none" stroke="#666" stroke-width="0.8" stroke-dasharray="3,2"/>
+<text x="205" y="398" text-anchor="middle"
+  style="font-size:8px;fill:#555;font-weight:bold;font-family:sans-serif;">
+  SHORT ISO RUNS (all indoor)</text>
+
+<!-- Propane loop annotation -->
+<rect x="395" y="265" width="150" height="48" rx="4"
+  fill="none" stroke="#27ae60" stroke-width="1" stroke-dasharray="4,2"/>
+<text x="470" y="280" text-anchor="middle" class="annot-green">HIGH-P PROPANE LOOP</text>
+<text x="470" y="292" text-anchor="middle" class="annot-green">{prop_dia:.0f}" dia vs {tp_a_dia:.0f}" (Config A)</text>
+<text x="470" y="304" text-anchor="middle"
+  style="font-size:7.5px;fill:#27ae60;font-family:sans-serif;">
+  (small-bore, high-pressure piping)</text>
+
+</svg></div>"""
+    return svg
 
 
 # ============================================================================
@@ -324,6 +1119,10 @@ summary_rows.append(("row", "Total installed cost",
                       _fmt(costs_a["total_installed"]/1e6, ".2f"), "$MM",
                       _fmt(costs_b["total_installed"]/1e6, ".2f"), "$MM",
                       _winner(costs_a["total_installed"], costs_b["total_installed"], lower_better=True)))
+summary_rows.append(("row", "Cost confidence band",
+                      f"{costs_a['total_installed']*0.7/1e6:.2f} - {costs_a['total_installed']*1.5/1e6:.2f}", "$MM",
+                      f"{costs_b['total_installed']*0.7/1e6:.2f} - {costs_b['total_installed']*1.5/1e6:.2f}", "$MM",
+                      ""))
 summary_rows.append(("row", "Specific capital cost",
                       _fmt(lc_a["specific_cost_per_kw"], ".0f"), "$/kW",
                       _fmt(lc_b["specific_cost_per_kw"], ".0f"), "$/kW",
@@ -487,6 +1286,20 @@ with st.expander("Validation Checks"):
             color = "green" if passed else "red"
             st.markdown(f":{color}[{icon}] {name} -- {detail}")
 
+# ============================================================================
+# PROCESS FLOW DIAGRAMS
+# ============================================================================
+
+st.header("Process Flow Diagrams")
+
+pfd_col1, pfd_col2 = st.columns(2)
+with pfd_col1:
+    pfd_html_a = _generate_pfd_a(states_a, perf_a, duct_a, inputs)
+    components.html(pfd_html_a, height=530, scrolling=False)
+with pfd_col2:
+    pfd_html_b = _generate_pfd_b(states_b, prop_states, perf_b, duct_b, duct_a, inputs)
+    components.html(pfd_html_b, height=530, scrolling=False)
+
 
 # ============================================================================
 # SECTION 2: COST WATERFALL CHARTS
@@ -502,9 +1315,13 @@ comp_list = [
     ("Recuperator", "recuperator"),
     ("Air-Cooled Condensers", "acc"),
     ("Vapor Ductwork", "ductwork"),
+    ("Structural Steel", "structural_steel"),
     ("Intermediate HX", "intermediate_hx"),
-    ("Propane Pump", "propane_pump"),
-    ("Propane Loop Piping", "propane_loop_piping"),
+    ("Propane System", "propane_system"),
+    ("Foundation", "foundation"),
+    ("Engineering & Procurement", "engineering"),
+    ("Construction Mgmt", "construction_mgmt"),
+    ("Contingency", "contingency"),
 ]
 
 comp_names = [c[0] for c in comp_list]
@@ -576,18 +1393,17 @@ st.plotly_chart(fig_delta, width="stretch")
 
 # Duct segment cost breakdown
 with st.expander("Duct Segment Cost Detail"):
-    from cost_model import _duct_segment_cost
     duct_seg_data = []
     for seg in duct_a["segments"]:
         duct_seg_data.append({"Config": "A", "Segment": seg["name"],
                               "Diameter (in)": f"{seg['diameter_in']:.1f}",
                               "Length (ft)": f"{seg['length_ft']:.0f}",
-                              "Cost ($)": f"${_duct_segment_cost(seg):,.0f}"})
+                              "Cost ($)": f"${_duct_segment_cost(seg, inputs):,.0f}"})
     for seg in duct_b["segments"]:
         duct_seg_data.append({"Config": "B", "Segment": seg["name"],
                               "Diameter (in)": f"{seg['diameter_in']:.1f}",
                               "Length (ft)": f"{seg['length_ft']:.0f}",
-                              "Cost ($)": f"${_duct_segment_cost(seg):,.0f}"})
+                              "Cost ($)": f"${_duct_segment_cost(seg, inputs):,.0f}"})
     st.dataframe(pd.DataFrame(duct_seg_data).set_index("Config"), width="stretch")
 
 
@@ -647,9 +1463,10 @@ pwr_col4.metric("Vol. Flow Ratio (A/B)", f"{vol_ratio:.1f}x")
 
 st.header("Technical Analysis")
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "T-s Diagram", "Duct Sizing", "Approach Optimization",
     "Brine Utilization", "Sensitivity Analysis", "Hydraulic Analysis",
+    "Equipment Sizing Trade-offs",
 ])
 
 # -- Tab 1: T-s Diagram ---------------------------------------------------
@@ -1166,6 +1983,472 @@ with tab6:
     st.plotly_chart(fig_acc_sweep, width="stretch")
 
 
+# -- Tab 7: Equipment Sizing Trade-offs --------------------------------------
+with tab7:
+    st.subheader("Heat Exchanger Area vs Pinch Temperature")
+    st.markdown("Holding duty constant at the current operating point, "
+                "varying pinch to show area and cost sensitivity.")
+
+    pinch_sweep = np.linspace(5, 25, 21)
+    m_a = perf_a["m_dot_iso"]
+    m_b = perf_b["m_dot_iso"]
+
+    # -- Config A heat exchangers --
+    Q_vap_a = m_a * perf_a["q_vaporizer"]
+    Q_pre_a = m_a * perf_a["q_preheater"]
+    Q_rec_a = m_a * perf_a["q_recup"]
+    Q_cond_a = m_a * perf_a["q_cond"]
+
+    hx_sweeps_a = {
+        "Vaporizer": hx_area_vs_pinch(
+            Q_vap_a, U_VALUES["vaporizer"],
+            inputs["T_geo_in"], perf_a["T_brine_mid"],
+            states_a["7"].T, states_a["1"].T,
+            pinch_sweep, inputs.get("uc_vaporizer_per_ft2", COST_FACTORS["vaporizer_per_ft2"])),
+        "Preheater": hx_area_vs_pinch(
+            Q_pre_a, U_VALUES["preheater"],
+            perf_a["T_brine_mid"], perf_a["T_geo_out_calc"],
+            states_a["6"].T, states_a["7"].T,
+            pinch_sweep, inputs.get("uc_preheater_per_ft2", COST_FACTORS["preheater_per_ft2"])),
+        "Recuperator": hx_area_vs_pinch(
+            Q_rec_a, U_VALUES["recuperator"],
+            states_a["2"].T, states_a["3"].T,
+            states_a["5"].T, states_a["6"].T,
+            pinch_sweep, inputs.get("uc_recuperator_per_ft2", COST_FACTORS["recup_per_ft2"])),
+    }
+    acc_sweep_a = acc_area_vs_pinch(Q_cond_a, inputs["T_ambient"], pinch_sweep,
+                                    inputs.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"]))
+
+    # -- Config B heat exchangers --
+    Q_vap_b = m_b * perf_b["q_vaporizer"]
+    Q_pre_b = m_b * perf_b["q_preheater"]
+    Q_rec_b = m_b * perf_b["q_recup"]
+    Q_ihx_b = m_b * perf_b["q_cond_iso"]
+    m_prop = perf_b["m_dot_prop"]
+    Q_acc_b = m_prop * (prop_states["A"].h - prop_states["B"].h)
+
+    hx_sweeps_b = {
+        "Vaporizer": hx_area_vs_pinch(
+            Q_vap_b, U_VALUES["vaporizer"],
+            inputs["T_geo_in"], perf_b["T_brine_mid"],
+            states_b["7"].T, states_b["1"].T,
+            pinch_sweep, inputs.get("uc_vaporizer_per_ft2", COST_FACTORS["vaporizer_per_ft2"])),
+        "Preheater": hx_area_vs_pinch(
+            Q_pre_b, U_VALUES["preheater"],
+            perf_b["T_brine_mid"], perf_b["T_geo_out_calc"],
+            states_b["6"].T, states_b["7"].T,
+            pinch_sweep, inputs.get("uc_preheater_per_ft2", COST_FACTORS["preheater_per_ft2"])),
+        "Recuperator": hx_area_vs_pinch(
+            Q_rec_b, U_VALUES["recuperator"],
+            states_b["2"].T, states_b["3"].T,
+            states_b["5"].T, states_b["6"].T,
+            pinch_sweep, inputs.get("uc_recuperator_per_ft2", COST_FACTORS["recup_per_ft2"])),
+        "Intermediate HX": hx_area_vs_pinch(
+            Q_ihx_b, U_VALUES["intermediate_hx"],
+            states_b["3"].T, states_b["4"].T,
+            prop_states["C"].T, prop_states["A"].T,
+            pinch_sweep, inputs.get("uc_ihx_per_ft2", COST_FACTORS["hx_per_ft2"])),
+    }
+    acc_sweep_b = acc_area_vs_pinch(Q_acc_b, inputs["T_ambient"], pinch_sweep,
+                                    inputs.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"]))
+
+    # Current operating pinch points for markers
+    pinch_ops_a = {
+        "Vaporizer": inputs["dt_pinch_vaporizer"],
+        "Preheater": inputs["dt_pinch_preheater"],
+        "Recuperator": inputs["dt_pinch_recup"],
+    }
+    pinch_ops_b = {
+        "Vaporizer": inputs["dt_pinch_vaporizer"],
+        "Preheater": inputs["dt_pinch_preheater"],
+        "Recuperator": inputs["dt_pinch_recup"],
+        "Intermediate HX": inputs["dt_approach_intermediate"],
+    }
+
+    # Plot HX area subplots
+    hx_names_a = list(hx_sweeps_a.keys())
+    hx_names_b = list(hx_sweeps_b.keys())
+    all_hx_names = list(dict.fromkeys(hx_names_a + hx_names_b))
+
+    fig_hx = make_subplots(
+        rows=2, cols=len(all_hx_names),
+        subplot_titles=[f"{n} (Area)" for n in all_hx_names]
+                       + [f"{n} (Cost)" for n in all_hx_names],
+        vertical_spacing=0.12, horizontal_spacing=0.06,
+    )
+
+    colors_cfg = {"A": "steelblue", "B": "indianred"}
+
+    for i, name in enumerate(all_hx_names):
+        col = i + 1
+        # Config A
+        if name in hx_sweeps_a:
+            sw = hx_sweeps_a[name]
+            p_vals = [d["pinch"] for d in sw]
+            areas = [d["area_ft2"] for d in sw]
+            costs_hx = [d["cost"] / 1e6 for d in sw]
+            fig_hx.add_trace(go.Scatter(
+                x=p_vals, y=areas, name="A" if col == 1 else None,
+                legendgroup="A", showlegend=(col == 1),
+                line=dict(color=colors_cfg["A"], width=2),
+            ), row=1, col=col)
+            fig_hx.add_trace(go.Scatter(
+                x=p_vals, y=costs_hx, name=None,
+                legendgroup="A", showlegend=False,
+                line=dict(color=colors_cfg["A"], width=2),
+            ), row=2, col=col)
+            # Operating point marker
+            op = pinch_ops_a.get(name)
+            if op is not None:
+                op_area = costs_a.get(f"{name.lower().replace(' ', '_')}_area_ft2",
+                                      costs_a.get("vaporizer_area_ft2", 0))
+                # Find the closest sweep point to mark
+                idx = min(range(len(p_vals)), key=lambda j: abs(p_vals[j] - op))
+                fig_hx.add_trace(go.Scatter(
+                    x=[p_vals[idx]], y=[areas[idx]], mode="markers",
+                    marker=dict(size=10, color=colors_cfg["A"], symbol="diamond"),
+                    showlegend=False,
+                ), row=1, col=col)
+                fig_hx.add_trace(go.Scatter(
+                    x=[p_vals[idx]], y=[costs_hx[idx]], mode="markers",
+                    marker=dict(size=10, color=colors_cfg["A"], symbol="diamond"),
+                    showlegend=False,
+                ), row=2, col=col)
+
+        # Config B
+        if name in hx_sweeps_b:
+            sw = hx_sweeps_b[name]
+            p_vals = [d["pinch"] for d in sw]
+            areas = [d["area_ft2"] for d in sw]
+            costs_hx = [d["cost"] / 1e6 for d in sw]
+            fig_hx.add_trace(go.Scatter(
+                x=p_vals, y=areas, name="B" if col == 1 else None,
+                legendgroup="B", showlegend=(col == 1 and name in hx_sweeps_a),
+                line=dict(color=colors_cfg["B"], width=2, dash="dash"),
+            ), row=1, col=col)
+            fig_hx.add_trace(go.Scatter(
+                x=p_vals, y=costs_hx, name=None,
+                legendgroup="B", showlegend=False,
+                line=dict(color=colors_cfg["B"], width=2, dash="dash"),
+            ), row=2, col=col)
+            op = pinch_ops_b.get(name)
+            if op is not None:
+                idx = min(range(len(p_vals)), key=lambda j: abs(p_vals[j] - op))
+                fig_hx.add_trace(go.Scatter(
+                    x=[p_vals[idx]], y=[areas[idx]], mode="markers",
+                    marker=dict(size=10, color=colors_cfg["B"], symbol="diamond"),
+                    showlegend=False,
+                ), row=1, col=col)
+                fig_hx.add_trace(go.Scatter(
+                    x=[p_vals[idx]], y=[costs_hx[idx]], mode="markers",
+                    marker=dict(size=10, color=colors_cfg["B"], symbol="diamond"),
+                    showlegend=False,
+                ), row=2, col=col)
+
+    fig_hx.update_layout(
+        height=600,
+        title_text="Heat Exchanger Area & Cost vs Pinch Temperature (diamonds = current operating point)",
+    )
+    for i in range(len(all_hx_names)):
+        fig_hx.update_xaxes(title_text="Pinch (degF)", row=2, col=i + 1)
+    fig_hx.update_yaxes(title_text="Area (ft2)", row=1, col=1)
+    fig_hx.update_yaxes(title_text="Cost ($MM)", row=2, col=1)
+    st.plotly_chart(fig_hx, width="stretch")
+
+    # ACC area vs pinch
+    st.subheader("ACC Face Area vs Pinch Temperature")
+    fig_acc_pinch = go.Figure()
+    p_vals_acc_a = [d["pinch"] for d in acc_sweep_a]
+    cost_acc_a = [d["cost"] / 1e6 for d in acc_sweep_a]
+    area_acc_a = [d["area_ft2"] for d in acc_sweep_a]
+    p_vals_acc_b = [d["pinch"] for d in acc_sweep_b]
+    cost_acc_b = [d["cost"] / 1e6 for d in acc_sweep_b]
+
+    fig_acc_pinch.add_trace(go.Scatter(
+        x=p_vals_acc_a, y=cost_acc_a, name="Config A ACC",
+        line=dict(color="steelblue", width=2),
+    ))
+    fig_acc_pinch.add_trace(go.Scatter(
+        x=p_vals_acc_b, y=cost_acc_b, name="Config B Propane ACC",
+        line=dict(color="indianred", width=2, dash="dash"),
+    ))
+    # Operating point markers
+    acc_pinch_a_op = inputs["dt_pinch_acc_a"]
+    acc_pinch_b_op = inputs["dt_pinch_acc_b"]
+    idx_a = min(range(len(p_vals_acc_a)), key=lambda j: abs(p_vals_acc_a[j] - acc_pinch_a_op))
+    idx_b = min(range(len(p_vals_acc_b)), key=lambda j: abs(p_vals_acc_b[j] - acc_pinch_b_op))
+    fig_acc_pinch.add_trace(go.Scatter(
+        x=[p_vals_acc_a[idx_a]], y=[cost_acc_a[idx_a]], mode="markers",
+        marker=dict(size=12, color="steelblue", symbol="diamond"),
+        name="A operating point",
+    ))
+    fig_acc_pinch.add_trace(go.Scatter(
+        x=[p_vals_acc_b[idx_b]], y=[cost_acc_b[idx_b]], mode="markers",
+        marker=dict(size=12, color="indianred", symbol="diamond"),
+        name="B operating point",
+    ))
+    fig_acc_pinch.update_layout(
+        xaxis_title="ACC Pinch (degF)", yaxis_title="Installed Cost ($MM)",
+        height=400,
+    )
+    st.plotly_chart(fig_acc_pinch, width="stretch")
+
+    # -- Duct diameter vs allowable dP --
+    st.subheader("Duct Diameter & Cost vs Allowable Pressure Drop")
+
+    dp_sweep = np.linspace(0.1, 2.0, 20)
+    m_dot_a_lbs = perf_a["m_dot_iso"] / 3600
+    m_dot_b_lbs = perf_b["m_dot_iso"] / 3600
+    m_dot_prop_lbs = perf_b["m_dot_prop"] / 3600
+
+    uc_duct = inputs.get("uc_iso_duct_per_ft2", COST_FACTORS["iso_duct_per_ft2"])
+    uc_prop = inputs.get("uc_prop_pipe_per_ft2", COST_FACTORS["prop_pipe_per_ft2"])
+
+    duct_curves = {}
+    # Config A segments
+    for seg in duct_a["segments"]:
+        duct_curves[f"A: {seg['name']}"] = {
+            "data": duct_diameter_vs_dp(
+                m_dot_a_lbs, seg["rho_lbft3"], seg["length_ft"],
+                inputs.get("f_darcy", 0.02), dp_sweep, uc_duct),
+            "color": "steelblue",
+            "current_dp": seg["delta_P_psi"],
+            "current_dia": seg["diameter_in"],
+        }
+    # Config B segments
+    for seg in duct_b["segments"]:
+        is_prop = "Propane" in seg["name"] or "propane" in seg["name"]
+        m_seg = m_dot_prop_lbs if is_prop else m_dot_b_lbs
+        seg_uc = uc_prop if is_prop else uc_duct
+        duct_curves[f"B: {seg['name']}"] = {
+            "data": duct_diameter_vs_dp(
+                m_seg, seg["rho_lbft3"], seg["length_ft"],
+                inputs.get("f_darcy", 0.02), dp_sweep, seg_uc),
+            "color": "indianred",
+            "current_dp": seg["delta_P_psi"],
+            "current_dia": seg["diameter_in"],
+        }
+
+    fig_duct_dp = make_subplots(rows=1, cols=2,
+                                subplot_titles=["Diameter vs Allowable dP",
+                                                "Duct Cost vs Allowable dP"])
+    for name, info in duct_curves.items():
+        sw = info["data"]
+        dp_vals = [d["dp_psi"] for d in sw]
+        dia_vals = [d["diameter_in"] for d in sw]
+        cost_vals = [d["cost"] / 1e3 for d in sw]
+
+        fig_duct_dp.add_trace(go.Scatter(
+            x=dp_vals, y=dia_vals, name=name,
+            line=dict(color=info["color"], width=1.5),
+        ), row=1, col=1)
+        fig_duct_dp.add_trace(go.Scatter(
+            x=dp_vals, y=cost_vals, name=name, showlegend=False,
+            line=dict(color=info["color"], width=1.5),
+        ), row=1, col=2)
+
+        # Operating point
+        fig_duct_dp.add_trace(go.Scatter(
+            x=[info["current_dp"]], y=[info["current_dia"]], mode="markers",
+            marker=dict(size=8, color=info["color"], symbol="diamond"),
+            showlegend=False,
+        ), row=1, col=1)
+
+    fig_duct_dp.update_layout(height=450, title_text="Duct Sizing vs Allowable dP (diamonds = current)")
+    fig_duct_dp.update_xaxes(title_text="Allowable dP (psi)", row=1, col=1)
+    fig_duct_dp.update_xaxes(title_text="Allowable dP (psi)", row=1, col=2)
+    fig_duct_dp.update_yaxes(title_text="Diameter (in)", row=1, col=1)
+    fig_duct_dp.update_yaxes(title_text="Cost ($k)", row=1, col=2)
+    st.plotly_chart(fig_duct_dp, width="stretch")
+
+    # -- ACC tube bundle model --
+    st.subheader("ACC Tube Bundle: Face Area & Cost vs Allowable dP")
+
+    acc_tube_a = acc_tubes_vs_dp(m_dot_a_lbs, states_a["3"].rho, dp_sweep)
+    acc_tube_b_prop = acc_tubes_vs_dp(m_dot_prop_lbs, prop_states["A"].rho, dp_sweep)
+
+    fig_acc_tube = make_subplots(rows=1, cols=2,
+                                 subplot_titles=["Face Area vs dP", "Cost vs dP"])
+
+    dp_a_vals = [d["dp_psi"] for d in acc_tube_a]
+    fa_a = [d["face_area_ft2"] for d in acc_tube_a]
+    c_a = [d["cost"] / 1e3 for d in acc_tube_a]
+    dp_b_vals = [d["dp_psi"] for d in acc_tube_b_prop]
+    fa_b = [d["face_area_ft2"] for d in acc_tube_b_prop]
+    c_b = [d["cost"] / 1e3 for d in acc_tube_b_prop]
+
+    fig_acc_tube.add_trace(go.Scatter(
+        x=dp_a_vals, y=fa_a, name="A: ISO ACC tubes",
+        line=dict(color="steelblue", width=2),
+    ), row=1, col=1)
+    fig_acc_tube.add_trace(go.Scatter(
+        x=dp_b_vals, y=fa_b, name="B: Propane ACC tubes",
+        line=dict(color="indianred", width=2),
+    ), row=1, col=1)
+    fig_acc_tube.add_trace(go.Scatter(
+        x=dp_a_vals, y=c_a, name="A: ISO ACC tubes", showlegend=False,
+        line=dict(color="steelblue", width=2),
+    ), row=1, col=2)
+    fig_acc_tube.add_trace(go.Scatter(
+        x=dp_b_vals, y=c_b, name="B: Propane ACC tubes", showlegend=False,
+        line=dict(color="indianred", width=2),
+    ), row=1, col=2)
+
+    # Mark current operating dP
+    op_dp_a = inputs.get("dp_acc_tubes_a", 0.5)
+    op_dp_b = inputs.get("dp_acc_tubes_prop", 1.0)
+    idx_opa = min(range(len(dp_a_vals)), key=lambda j: abs(dp_a_vals[j] - op_dp_a))
+    idx_opb = min(range(len(dp_b_vals)), key=lambda j: abs(dp_b_vals[j] - op_dp_b))
+    fig_acc_tube.add_trace(go.Scatter(
+        x=[dp_a_vals[idx_opa]], y=[fa_a[idx_opa]], mode="markers",
+        marker=dict(size=10, color="steelblue", symbol="diamond"),
+        showlegend=False,
+    ), row=1, col=1)
+    fig_acc_tube.add_trace(go.Scatter(
+        x=[dp_b_vals[idx_opb]], y=[fa_b[idx_opb]], mode="markers",
+        marker=dict(size=10, color="indianred", symbol="diamond"),
+        showlegend=False,
+    ), row=1, col=1)
+
+    fig_acc_tube.update_layout(
+        height=400,
+        title_text=(f"ACC Tube Bundle Model (f={ACC_TUBE_DEFAULTS['f_tube']}, "
+                    f"L={ACC_TUBE_DEFAULTS['L_tube_ft']}ft, "
+                    f"D={ACC_TUBE_DEFAULTS['D_tube_in']}in, "
+                    f"N_rows={ACC_TUBE_DEFAULTS['N_rows']})"),
+    )
+    fig_acc_tube.update_xaxes(title_text="Allowable dP (psi)")
+    fig_acc_tube.update_yaxes(title_text="Face Area (ft2)", row=1, col=1)
+    fig_acc_tube.update_yaxes(title_text="Cost ($k)", row=1, col=2)
+    st.plotly_chart(fig_acc_tube, width="stretch")
+
+    # -- Overall Trade-off: Cost vs Power Recovery --
+    st.subheader("Overall Trade-off: Spend More on Equipment to Recover Power")
+    st.markdown(
+        "Scaling all pinch points and dP allowances together from 2x (loose) "
+        "to 0.25x (tight) relative to current values. Shows implicit cost of "
+        "additional capacity ($/kW)."
+    )
+
+    with st.spinner("Running trade-off sweeps..."):
+        tradeoff_a = sizing_tradeoff_sweep(inputs, fp, config="A")
+        tradeoff_b = sizing_tradeoff_sweep(inputs, fp, config="B")
+
+    fig_tradeoff = make_subplots(
+        rows=1, cols=2,
+        subplot_titles=["Additional Cost vs Additional Power",
+                        "Marginal Cost of Electricity"],
+    )
+
+    # Filter to valid points
+    valid_a = [r for r in tradeoff_a
+               if not np.isnan(r["delta_cost"]) and not np.isnan(r["delta_power_kw"])]
+    valid_b = [r for r in tradeoff_b
+               if not np.isnan(r["delta_cost"]) and not np.isnan(r["delta_power_kw"])]
+
+    if valid_a:
+        fig_tradeoff.add_trace(go.Scatter(
+            x=[r["delta_power_kw"] for r in valid_a],
+            y=[r["delta_cost"] / 1e6 for r in valid_a],
+            name="Config A",
+            mode="lines+markers",
+            line=dict(color="steelblue", width=2),
+            marker=dict(size=5),
+            text=[f"mult={r['multiplier']:.2f}" for r in valid_a],
+        ), row=1, col=1)
+        # Operating point at mult ~1.0
+        base_a = min(valid_a, key=lambda r: abs(r["multiplier"] - 1.0))
+        fig_tradeoff.add_trace(go.Scatter(
+            x=[base_a["delta_power_kw"]], y=[base_a["delta_cost"] / 1e6],
+            mode="markers",
+            marker=dict(size=12, color="steelblue", symbol="diamond"),
+            showlegend=False,
+        ), row=1, col=1)
+
+    if valid_b:
+        fig_tradeoff.add_trace(go.Scatter(
+            x=[r["delta_power_kw"] for r in valid_b],
+            y=[r["delta_cost"] / 1e6 for r in valid_b],
+            name="Config B",
+            mode="lines+markers",
+            line=dict(color="indianred", width=2),
+            marker=dict(size=5),
+            text=[f"mult={r['multiplier']:.2f}" for r in valid_b],
+        ), row=1, col=1)
+        base_b = min(valid_b, key=lambda r: abs(r["multiplier"] - 1.0))
+        fig_tradeoff.add_trace(go.Scatter(
+            x=[base_b["delta_power_kw"]], y=[base_b["delta_cost"] / 1e6],
+            mode="markers",
+            marker=dict(size=12, color="indianred", symbol="diamond"),
+            showlegend=False,
+        ), row=1, col=1)
+
+    # Marginal cost of electricity ($/kW capacity, annualized)
+    # Convert to $/MWh: marginal_cost_per_kw / (8760 * CF * annuity_factor) * 1000
+    cf = inputs["capacity_factor"] / 100
+    r_disc = inputs["discount_rate"] / 100
+    n_life = inputs["project_life"]
+    if r_disc > 0:
+        ann_factor = (1 - (1 + r_disc) ** (-n_life)) / r_disc
+    else:
+        ann_factor = n_life
+    hrs_factor = 8760 * cf * ann_factor / 1000  # MWh-equiv per kW over lifetime
+
+    marginal_a = [r for r in valid_a if r["delta_power_kw"] > 0.1
+                  and not np.isnan(r["marginal_cost_per_kw"])]
+    marginal_b = [r for r in valid_b if r["delta_power_kw"] > 0.1
+                  and not np.isnan(r["marginal_cost_per_kw"])]
+
+    if marginal_a:
+        fig_tradeoff.add_trace(go.Scatter(
+            x=[r["delta_power_kw"] for r in marginal_a],
+            y=[r["marginal_cost_per_kw"] / hrs_factor for r in marginal_a],
+            name="A marginal $/MWh", mode="lines",
+            line=dict(color="steelblue", width=2, dash="dot"),
+        ), row=1, col=2)
+
+    if marginal_b:
+        fig_tradeoff.add_trace(go.Scatter(
+            x=[r["delta_power_kw"] for r in marginal_b],
+            y=[r["marginal_cost_per_kw"] / hrs_factor for r in marginal_b],
+            name="B marginal $/MWh", mode="lines",
+            line=dict(color="indianred", width=2, dash="dot"),
+        ), row=1, col=2)
+
+    # Reference line: electricity price
+    if marginal_a or marginal_b:
+        all_delta_kw = ([r["delta_power_kw"] for r in marginal_a]
+                        + [r["delta_power_kw"] for r in marginal_b])
+        if all_delta_kw:
+            fig_tradeoff.add_hline(
+                y=inputs["electricity_price"], line_dash="dash",
+                line_color="orange",
+                annotation_text=f"Elec price: ${inputs['electricity_price']}/MWh",
+                row=1, col=2,
+            )
+
+    fig_tradeoff.update_layout(height=500)
+    fig_tradeoff.update_xaxes(title_text="Additional Power (kW)", row=1, col=1)
+    fig_tradeoff.update_xaxes(title_text="Additional Power (kW)", row=1, col=2)
+    fig_tradeoff.update_yaxes(title_text="Additional Cost ($MM)", row=1, col=1)
+    fig_tradeoff.update_yaxes(title_text="Marginal Cost ($/MWh)", row=1, col=2)
+    st.plotly_chart(fig_tradeoff, width="stretch")
+
+    # Summary interpretation
+    if valid_a and valid_b:
+        tight_a = min(valid_a, key=lambda r: r["multiplier"])
+        tight_b = min(valid_b, key=lambda r: r["multiplier"])
+        st.markdown(f"""
+**Interpretation:** Tightening all pinch points and dP allowances to 0.25x current values:
+- Config A: **{tight_a['delta_power_kw']:+.0f} kW** for **${tight_a['delta_cost']/1e6:+.2f}MM** additional cost
+- Config B: **{tight_b['delta_power_kw']:+.0f} kW** for **${tight_b['delta_cost']/1e6:+.2f}MM** additional cost
+
+Invest in tighter heat exchangers and ducts where the marginal cost curve is
+**below** the electricity price line -- those kW pay for themselves over
+the plant lifetime.
+""")
+
+
 # ============================================================================
 # SECTION 5: ASSUMPTIONS AND SOFTWARE INFORMATION
 # ============================================================================
@@ -1182,11 +2465,31 @@ with st.expander("Assumptions and Software Information"):
             u_table.append({"Component": name.replace("_", " ").title(), "U (BTU/hr-ft2-degF)": val})
         st.dataframe(pd.DataFrame(u_table).set_index("Component"), width="stretch")
 
-        st.markdown("**Cost Factors (2024 USD, installed)**")
-        cf_table = []
-        for name, val in COST_FACTORS.items():
-            cf_table.append({"Factor": name.replace("_", " ").title(), "Value": f"${val:,.0f}"})
+        st.markdown("**Unit Cost Factors (2024 USD, installed)**")
+        uc_display = [
+            ("Vaporizer", f"${inputs.get('uc_vaporizer_per_ft2', COST_FACTORS['vaporizer_per_ft2'])}/ft2"),
+            ("Preheater", f"${inputs.get('uc_preheater_per_ft2', COST_FACTORS['preheater_per_ft2'])}/ft2"),
+            ("Recuperator", f"${inputs.get('uc_recuperator_per_ft2', COST_FACTORS['recup_per_ft2'])}/ft2"),
+            ("IHX", f"${inputs.get('uc_ihx_per_ft2', COST_FACTORS['hx_per_ft2'])}/ft2"),
+            ("ACC", f"${inputs.get('uc_acc_per_ft2', COST_FACTORS['acc_per_ft2'])}/ft2"),
+            ("Iso Duct", f"${inputs.get('uc_iso_duct_per_ft2', COST_FACTORS['iso_duct_per_ft2'])}/ft2"),
+            ("Propane Pipe", f"${inputs.get('uc_prop_pipe_per_ft2', COST_FACTORS['prop_pipe_per_ft2'])}/ft2"),
+            ("Turbine", f"${inputs.get('uc_turbine_per_kw', COST_FACTORS['turbine_per_kw'])}/kW"),
+            ("Steel", f"${inputs.get('uc_steel_per_lb', COST_FACTORS['steel_per_lb']):.2f}/lb"),
+        ]
+        cf_table = [{"Factor": n, "Value": v} for n, v in uc_display]
         st.dataframe(pd.DataFrame(cf_table).set_index("Factor"), width="stretch")
+
+        st.markdown("**Indirect Cost Percentages**")
+        indirect_display = [
+            ("Foundation", f"{inputs.get('uc_foundation_pct', COST_FACTORS['foundation_pct'])}%"),
+            ("Engineering & Procurement", f"{inputs.get('uc_engineering_pct', COST_FACTORS['engineering_pct'])}%"),
+            ("Construction Mgmt", f"{inputs.get('uc_construction_mgmt_pct', COST_FACTORS['construction_mgmt_pct'])}%"),
+            ("Contingency", f"{inputs.get('uc_contingency_pct', COST_FACTORS['contingency_pct'])}%"),
+            ("Propane System", f"{inputs.get('uc_prop_piping_pct', COST_FACTORS['prop_piping_pct'])}% of IHX"),
+        ]
+        ind_table = [{"Item": n, "Rate": v} for n, v in indirect_display]
+        st.dataframe(pd.DataFrame(ind_table).set_index("Item"), width="stretch")
 
     with assum_col2:
         st.markdown("**Key Assumptions**")
@@ -1217,4 +2520,4 @@ with st.expander("Assumptions and Software Information"):
 - Charts: Plotly
 """)
 
-    st.caption("ORC Comparator v4.0 -- Hydraulic analysis with CoolProp backend")
+    st.caption("ORC Comparator v5.0 -- Adjustable unit costs, indirect cost layers, cost sensitivity")
