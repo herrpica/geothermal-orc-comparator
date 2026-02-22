@@ -49,7 +49,8 @@ def _default_inputs():
         "T_ambient": 95,            # degF
         "dt_pinch_vaporizer": 10,   # degF
         "dt_pinch_preheater": 10,   # degF
-        "dt_pinch_acc": 15,         # degF
+        "dt_pinch_acc_a": 15,       # degF - Config A ACC pinch
+        "dt_pinch_acc_b": 15,       # degF - Config B ACC pinch
         "dt_pinch_recup": 15,       # degF
         "dt_approach_intermediate": 10,  # degF (Config B only)
         "eta_turbine": 0.82,
@@ -511,7 +512,7 @@ def solve_config_a(inputs: dict, fp) -> dict:
     inp = {**_default_inputs(), **inputs}
     fluid = "isopentane"
 
-    T_cond_base = inp["T_ambient"] + inp["dt_pinch_acc"]
+    T_cond_base = inp["T_ambient"] + inp["dt_pinch_acc_a"]
     dt_penalty = 0.0
 
     for iteration in range(20):
@@ -541,7 +542,7 @@ def solve_config_b(inputs: dict, fp) -> dict:
     prop_fluid = "propane"
 
     T_amb = inp["T_ambient"]
-    dt_acc = inp["dt_pinch_acc"]
+    dt_acc = inp["dt_pinch_acc_b"]
     dt_approach = inp["dt_approach_intermediate"]
 
     T_propane_cond = T_amb + dt_acc

@@ -63,7 +63,8 @@ with left_col:
         T_ambient = st.number_input("Ambient dry bulb temperature (degF)", 50, 130, 95, 5)
 
     with st.expander("Pinch Points"):
-        dt_pinch_acc = st.number_input("ACC pinch (degF)", 5, 50, 15, 1)
+        dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)", 5, 50, 15, 1)
+        dt_pinch_acc_b = st.number_input("ACC pinch Config B (degF)", 5, 50, 15, 1)
         dt_pinch_vaporizer = st.number_input("Vaporizer pinch (degF)", 3, 30, 10, 1)
         dt_pinch_preheater = st.number_input("Preheater pinch (degF)", 3, 30, 10, 1)
         dt_pinch_recup = st.number_input("Recuperator pinch (degF)", 5, 40, 15, 1)
@@ -91,7 +92,8 @@ inputs = {
     "T_ambient": T_ambient,
     "dt_pinch_vaporizer": dt_pinch_vaporizer,
     "dt_pinch_preheater": dt_pinch_preheater,
-    "dt_pinch_acc": dt_pinch_acc,
+    "dt_pinch_acc_a": dt_pinch_acc_a,
+    "dt_pinch_acc_b": dt_pinch_acc_b,
     "dt_pinch_recup": dt_pinch_recup,
     "dt_approach_intermediate": dt_approach_intermediate,
     "superheat": superheat,
