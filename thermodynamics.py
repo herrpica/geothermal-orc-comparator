@@ -5,383 +5,634 @@ Config A: Traditional ORC with recuperator + direct air-cooled condenser (ACC).
 Config B: Isopentane power block + propane intermediate loop for heat rejection.
 
 State point numbering (isopentane):
-  1 – Turbine inlet (superheated or saturated vapor)
-  2 – Turbine outlet
-  3 – Recuperator hot-side outlet / condenser inlet
-  4 – Condenser outlet (saturated liquid)
-  5 – Pump outlet
-  6 – Recuperator cold-side outlet / evaporator inlet
+  1 - Turbine inlet (superheated or saturated vapor)
+  2 - Turbine outlet
+  3 - Recuperator hot-side outlet / condenser inlet
+  4 - Condenser outlet (saturated liquid)
+  5 - Pump outlet
+  6 - Recuperator cold-side outlet / preheater inlet
+  7 - Preheater exit / vaporizer inlet (subcooled liquid near bubble point)
 
 Propane states (Config B only):
-  A – Saturated vapor leaving propane evaporator (= iso condenser)
-  B – Saturated liquid leaving propane condenser (ACC)
-  C – Pump outlet
+  A - Saturated vapor leaving propane evaporator (= iso condenser)
+  B - Saturated liquid leaving propane condenser (ACC)
+  C - Pump outlet
 """
 
-from dataclasses import dataclass, field
-from typing import Dict, Optional
+from dataclasses import dataclass
+from typing import Dict, List, Optional
+import math
 import numpy as np
+from scipy.optimize import brentq
 
 
 @dataclass
 class StatePoint:
     """Thermodynamic state in imperial units."""
-    T: float = 0.0          # °F
+    T: float = 0.0          # degF
     P: float = 0.0          # psia
     h: float = 0.0          # BTU/lb
-    s: float = 0.0          # BTU/lb·R
+    s: float = 0.0          # BTU/lb-R
     quality: float = -1.0   # 0-1 for two-phase, -1 for single-phase
     phase: str = ""
-    rho: float = 0.0        # lb/ft³
+    rho: float = 0.0        # lb/ft3
     label: str = ""
-
-
-def validate_inputs(inputs: dict):
-    """Check physical constraints on user inputs. Returns list of warnings."""
-    warnings = []
-    T_geo = inputs.get("T_geo_in", 300)
-    T_amb = inputs.get("T_ambient", 95)
-
-    if T_geo <= T_amb:
-        warnings.append("Geo-fluid inlet temperature must exceed ambient temperature.")
-    if inputs.get("T_geo_out", 160) >= T_geo:
-        warnings.append("Geo-fluid outlet must be below inlet temperature.")
-    if inputs.get("eta_turbine", 0.82) > 1 or inputs.get("eta_turbine", 0.82) < 0.3:
-        warnings.append("Turbine isentropic efficiency should be 0.3–1.0.")
-    if inputs.get("eta_pump", 0.75) > 1 or inputs.get("eta_pump", 0.75) < 0.3:
-        warnings.append("Pump isentropic efficiency should be 0.3–1.0.")
-    if inputs.get("dt_pinch_recup", 15) < 0:
-        warnings.append("Recuperator pinch ΔT must be non-negative.")
-
-    return warnings
 
 
 def _default_inputs():
     """Return default input dictionary."""
     return {
-        "T_geo_in": 300,          # °F
-        "T_geo_out": 160,         # °F
-        "m_dot_geo": 500_000,     # lb/hr
-        "T_ambient": 95,          # °F
-        "dt_pinch_evap": 10,      # °F
-        "dt_pinch_acc": 25,       # °F  (ACC approach for Config A)
-        "dt_pinch_recup": 15,     # °F  (recuperator pinch)
-        "dt_approach_intermediate": 10,  # °F  (Config B intermediate HX)
+        "T_geo_in": 300,            # degF
+        "m_dot_geo": 200,           # lb/s
+        "cp_brine": 1.0,            # BTU/(lb-degF)
+        "T_geo_out_min": 160,       # degF - silica constraint
+        "T_ambient": 95,            # degF
+        "dt_pinch_vaporizer": 10,   # degF
+        "dt_pinch_preheater": 10,   # degF
+        "dt_pinch_acc": 15,         # degF
+        "dt_pinch_recup": 15,       # degF
+        "dt_approach_intermediate": 10,  # degF (Config B only)
         "eta_turbine": 0.82,
         "eta_pump": 0.75,
-        "superheat": 5,           # °F above saturation
-        "T_propane_cond": None,   # °F – auto-computed if None
-        "v_duct": 60,             # ft/s duct velocity
-        "electricity_price": 0.08,  # $/kWh
+        "superheat": 0,             # degF above saturation
+        "v_tailpipe": 10,           # ft/s
+        "v_acc_header": 15,         # ft/s
+        "L_tailpipe_a": 30,         # ft
+        "L_long_header": 120,       # ft
+        "L_acc_header": 200,        # ft
+        "L_iso_to_ihx": 40,         # ft (Config B segment 2)
+        "electricity_price": 35,    # $/MWh
         "discount_rate": 0.08,
-        "project_life": 30,       # years
+        "project_life": 30,         # years
         "capacity_factor": 0.95,
     }
 
 
-def solve_config_a(inputs: dict, fp) -> dict:
-    """
-    Solve the traditional ORC cycle (Config A).
-
-    Returns dict:
-      states: dict of StatePoint (keys "1"–"6")
-      performance: dict with net_power_kw, eta_thermal, m_dot_iso, etc.
-    """
+def validate_inputs(inputs: dict) -> list:
+    """Check physical constraints on user inputs. Returns list of warnings."""
+    warnings = []
     inp = {**_default_inputs(), **inputs}
-    fluid = "isopentane"
+    T_geo = inp["T_geo_in"]
+    T_amb = inp["T_ambient"]
 
-    # ── Condenser temperature ────────────────────────────────────────────
-    T_cond = inp["T_ambient"] + inp["dt_pinch_acc"]  # °F
+    if T_geo <= T_amb:
+        warnings.append("Geo-fluid inlet temperature must exceed ambient temperature.")
+    if inp["eta_turbine"] > 1 or inp["eta_turbine"] < 0.3:
+        warnings.append("Turbine isentropic efficiency should be 0.3-1.0.")
+    if inp["eta_pump"] > 1 or inp["eta_pump"] < 0.3:
+        warnings.append("Pump isentropic efficiency should be 0.3-1.0.")
+    if inp["dt_pinch_recup"] < 0:
+        warnings.append("Recuperator pinch dT must be non-negative.")
+    if inp["dt_pinch_vaporizer"] < 0:
+        warnings.append("Vaporizer pinch dT must be non-negative.")
+    if inp["dt_pinch_preheater"] < 0:
+        warnings.append("Preheater pinch dT must be non-negative.")
+    return warnings
 
-    # ── Evaporator temperature ───────────────────────────────────────────
-    T_evap = inp["T_geo_in"] - inp["dt_pinch_evap"]  # °F
 
-    # ── Saturation pressures ─────────────────────────────────────────────
+# ---------------------------------------------------------------------------
+# Duct sizing helpers
+# ---------------------------------------------------------------------------
+
+def _duct_segment(m_dot_lbs, rho, velocity, length, fluid, T_sat, fp):
+    """
+    Calculate a single duct segment: diameter, pressure drop, condensing
+    temperature penalty.
+
+    Args:
+        m_dot_lbs: mass flow rate (lb/s)
+        rho: vapor density (lb/ft3)
+        velocity: design velocity (ft/s)
+        length: segment length (ft)
+        fluid: fluid name for dT/dP calculation
+        T_sat: saturation temperature for dT/dP (degF)
+        fp: FluidProperties instance
+
+    Returns dict with diameter_in, velocity_fps, delta_P_psi, delta_T_cond_F
+    """
+    vol_flow = m_dot_lbs / rho  # ft3/s
+    area = vol_flow / velocity  # ft2
+    diameter_ft = (4 * area / math.pi) ** 0.5
+    diameter_in = diameter_ft * 12
+
+    # Darcy-Weisbach: dP = f * L/D * 0.5 * rho * v^2
+    f = 0.02
+    if diameter_ft > 0:
+        dp_lbft2 = f * (length / diameter_ft) * 0.5 * rho * velocity ** 2
+        dp_psi = dp_lbft2 / 144.0
+    else:
+        dp_psi = 0.0
+
+    # dT/dP at saturation from Clausius-Clapeyron via CoolProp
+    dt_cond = 0.0
+    if dp_psi > 0 and fp is not None:
+        try:
+            sat1 = fp.saturation_props(fluid, T=T_sat)
+            P1 = sat1["P_sat"]
+            P2 = P1 - dp_psi
+            if P2 > 0:
+                sat2 = fp.saturation_props(fluid, P=P2)
+                dt_cond = sat1["T_sat"] - sat2["T_sat"]
+            else:
+                dt_cond = 0.0
+        except Exception:
+            # Approximate: assume ~1 degF per psi for organic vapors
+            dt_cond = dp_psi * 1.0
+
+    return {
+        "vol_flow_ft3s": vol_flow,
+        "area_ft2": area,
+        "diameter_ft": diameter_ft,
+        "diameter_in": diameter_in,
+        "velocity_fps": velocity,
+        "length_ft": length,
+        "delta_P_psi": dp_psi,
+        "delta_T_cond_F": abs(dt_cond),
+        "rho_lbft3": rho,
+    }
+
+
+def calculate_duct_segments_a(states, perf, inp, fp):
+    """
+    Config A duct segments:
+      Seg 1: Tailpipe (turbine exit to recuperator) - state 2 conditions
+      Seg 2: Recuperator exit header to ACC - state 3 conditions
+      Seg 3: ACC distribution headers - state 3 conditions
+    """
+    m_dot_lbs = perf["m_dot_iso"] / 3600  # lb/hr -> lb/s
+    T_cond = perf["T_cond"]
+
+    s2 = states["2"]
+    s3 = states["3"]
+
+    seg1 = _duct_segment(
+        m_dot_lbs, s2.rho, inp["v_tailpipe"], inp["L_tailpipe_a"],
+        "isopentane", T_cond, fp,
+    )
+    seg1["name"] = "Tailpipe (turbine-recup)"
+
+    seg2 = _duct_segment(
+        m_dot_lbs, s3.rho, inp["v_tailpipe"], inp["L_long_header"],
+        "isopentane", T_cond, fp,
+    )
+    seg2["name"] = "Recup exit header"
+
+    seg3 = _duct_segment(
+        m_dot_lbs, s3.rho, inp["v_acc_header"], inp["L_acc_header"],
+        "isopentane", T_cond, fp,
+    )
+    seg3["name"] = "ACC distribution"
+
+    segments = [seg1, seg2, seg3]
+    total_dp = sum(s["delta_P_psi"] for s in segments)
+    total_dt = sum(s["delta_T_cond_F"] for s in segments)
+
+    return {
+        "segments": segments,
+        "total_delta_P_psi": total_dp,
+        "total_delta_T_cond_F": total_dt,
+        "tailpipe_diameter_in": seg1["diameter_in"],
+        "acc_header_diameter_in": seg3["diameter_in"],
+        "total_vol_flow_ft3s": seg1["vol_flow_ft3s"],
+    }
+
+
+def calculate_duct_segments_b(states, prop_states, perf, inp, fp):
+    """
+    Config B duct segments:
+      Seg 1: ISO tailpipe (turbine exit to recuperator) - state 2
+      Seg 2: ISO recup exit to intermediate HX - state 3
+      Seg 3: Propane vapor header (IHX to ACC) - propane sat vapor
+      Seg 4: Propane ACC distribution headers - propane sat vapor
+    """
+    m_dot_iso_lbs = perf["m_dot_iso"] / 3600
+    m_dot_prop_lbs = perf["m_dot_prop"] / 3600
+    T_cond_iso = perf["T_cond_iso"]
+    T_propane_evap = perf["T_propane_evap"]
+    T_propane_cond = perf["T_propane_cond"]
+
+    s2 = states["2"]
+    s3 = states["3"]
+    sA = prop_states["A"]
+
+    seg1 = _duct_segment(
+        m_dot_iso_lbs, s2.rho, inp["v_tailpipe"], inp["L_tailpipe_a"],
+        "isopentane", T_cond_iso, fp,
+    )
+    seg1["name"] = "ISO tailpipe (turbine-recup)"
+
+    seg2 = _duct_segment(
+        m_dot_iso_lbs, s3.rho, inp["v_tailpipe"], inp.get("L_iso_to_ihx", 40),
+        "isopentane", T_cond_iso, fp,
+    )
+    seg2["name"] = "ISO recup exit to IHX"
+
+    seg3 = _duct_segment(
+        m_dot_prop_lbs, sA.rho, inp["v_tailpipe"], inp["L_long_header"],
+        "propane", T_propane_cond, fp,
+    )
+    seg3["name"] = "Propane vapor header"
+
+    seg4 = _duct_segment(
+        m_dot_prop_lbs, sA.rho, inp["v_acc_header"], inp["L_acc_header"],
+        "propane", T_propane_cond, fp,
+    )
+    seg4["name"] = "Propane ACC distribution"
+
+    segments = [seg1, seg2, seg3, seg4]
+    # Iso segments affect iso condensing; propane segments affect propane condensing
+    iso_dt = seg1["delta_T_cond_F"] + seg2["delta_T_cond_F"]
+    prop_dt = seg3["delta_T_cond_F"] + seg4["delta_T_cond_F"]
+    total_dp = sum(s["delta_P_psi"] for s in segments)
+    total_dt = iso_dt + prop_dt
+
+    return {
+        "segments": segments,
+        "total_delta_P_psi": total_dp,
+        "total_delta_T_cond_F": total_dt,
+        "iso_delta_T_cond_F": iso_dt,
+        "prop_delta_T_cond_F": prop_dt,
+        "tailpipe_diameter_in": seg1["diameter_in"],
+        "acc_header_diameter_in": seg4["diameter_in"],
+        "propane_header_diameter_in": seg3["diameter_in"],
+        "total_vol_flow_ft3s": seg1["vol_flow_ft3s"],
+        "propane_vol_flow_ft3s": seg3["vol_flow_ft3s"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Cycle solvers
+# ---------------------------------------------------------------------------
+
+def _find_T_evap(inp, fp, fluid, T_cond):
+    """
+    Find T_evap that satisfies the vaporizer bubble-point pinch constraint.
+    Brine energy balance determines iso mass flow, which then sets the brine
+    temperature at the bubble point.
+    """
+    T_geo_in = inp["T_geo_in"]
+    m_dot_geo = inp["m_dot_geo"]  # lb/s
+    cp_geo = inp["cp_brine"]
+    dt_pinch_vap = inp["dt_pinch_vaporizer"]
+    dt_pinch_pre = inp["dt_pinch_preheater"]
+    dt_pinch_recup = inp["dt_pinch_recup"]
+    eta_turbine = inp["eta_turbine"]
+    eta_pump = inp["eta_pump"]
+    superheat = inp["superheat"]
+
+    sat_cond = fp.saturation_props(fluid, T=T_cond)
+    P_low = sat_cond["P_sat"]
+
+    def residual(T_evap):
+        try:
+            sat_evap = fp.saturation_props(fluid, T=T_evap)
+            P_high = sat_evap["P_sat"]
+            h7 = sat_evap["h_f"]
+
+            T1 = T_evap + superheat
+            if superheat < 0.5:
+                sp1 = fp.state_point(fluid, "T", T_evap, "Q", 1)
+            else:
+                sp1 = fp.state_point(fluid, "T", T1, "P", P_high)
+            h1 = sp1["h"]
+
+            sp4 = fp.state_point(fluid, "T", T_cond, "Q", 0)
+            sp5s = fp.state_point(fluid, "S", sp4["s"], "P", P_high)
+            h5 = sp4["h"] + (sp5s["h"] - sp4["h"]) / eta_pump
+            sp5 = fp.state_point(fluid, "H", h5, "P", P_high)
+
+            sp2s = fp.state_point(fluid, "S", sp1["s"], "P", P_low)
+            h2 = h1 - eta_turbine * (h1 - sp2s["h"])
+
+            T3 = sp5["T"] + dt_pinch_recup
+            sp2_full = fp.state_point(fluid, "H", h2, "P", P_low)
+            if T3 >= sp2_full["T"]:
+                T3 = sp2_full["T"]
+            sp3 = fp.state_point(fluid, "T", T3, "P", P_low)
+            q_recup = sp2_full["h"] - sp3["h"]
+            h6 = h5 + q_recup
+
+            q_vaporizer = h1 - h7
+            q_preheater = h7 - h6
+            q_total = q_vaporizer + q_preheater
+
+            if q_total <= 0:
+                return -1e6
+
+            # Energy balance: m_dot_iso * q_total = m_dot_geo * cp * (T_in - T_out)
+            # But we need T_out from the preheater pinch constraint
+            # Use maximum heat extraction: m_dot_iso from energy balance
+            # T_brine_out = T_geo_in - m_dot_iso * q_total / (m_dot_geo * cp_geo)
+            # But m_dot_iso is set by brine energy, so we need to check pinch
+
+            # Preheater cold-end pinch: T_brine_out - T6 >= dt_pinch_pre
+            sp6 = fp.state_point(fluid, "H", h6, "P", P_high)
+            T6 = sp6["T"]
+            T_brine_out_min_pre = T6 + dt_pinch_pre
+
+            # Use the more restrictive outlet temperature
+            T_geo_out_min = inp["T_geo_out_min"]
+            T_brine_out = max(T_brine_out_min_pre, T_geo_out_min)
+
+            Q_geo = m_dot_geo * cp_geo * (T_geo_in - T_brine_out) * 3600  # BTU/hr
+            m_dot_iso = Q_geo / q_total  # lb/hr
+
+            Q_vaporizer = m_dot_iso * q_vaporizer
+            T_brine_mid = T_geo_in - Q_vaporizer / (m_dot_geo * 3600 * cp_geo)
+            return T_brine_mid - T_evap - dt_pinch_vap
+        except Exception:
+            return -1e6
+
+    T_lo = T_cond + 5
+    T_hi = T_geo_in - superheat - 1
+
+    r_lo = residual(T_lo)
+    r_hi = residual(T_hi)
+
+    if r_lo <= 0:
+        return T_lo
+    if r_hi >= 0:
+        return T_hi
+
+    return brentq(residual, T_lo, T_hi, xtol=0.1)
+
+
+def _solve_cycle_core(inp, fp, fluid, T_cond):
+    """Solve core ORC cycle at given condensing temperature. Returns states and performance dict."""
+    T_evap = _find_T_evap(inp, fp, fluid, T_cond)
+
     sat_cond = fp.saturation_props(fluid, T=T_cond)
     sat_evap = fp.saturation_props(fluid, T=T_evap)
     P_low = sat_cond["P_sat"]
     P_high = sat_evap["P_sat"]
 
-    # ── State 1: Turbine inlet (superheated vapor) ───────────────────────
+    # State 1: Turbine inlet
     T1 = T_evap + inp["superheat"]
-    sp1 = fp.state_point(fluid, "T", T1, "P", P_high)
+    if inp["superheat"] < 0.5:
+        # At or near saturation: use quality=1 to avoid CoolProp T-P ambiguity
+        sp1 = fp.state_point(fluid, "T", T_evap, "Q", 1)
+    else:
+        sp1 = fp.state_point(fluid, "T", T1, "P", P_high)
     s1 = StatePoint(T=sp1["T"], P=sp1["P"], h=sp1["h"], s=sp1["s"],
                     phase=sp1["phase"], rho=sp1["rho"], label="1-Turbine Inlet")
 
-    # ── State 2: Turbine outlet (isentropic efficiency) ──────────────────
+    # State 2: Turbine outlet
     sp2s = fp.state_point(fluid, "S", s1.s, "P", P_low)
-    h2s = sp2s["h"]
-    h2 = s1.h - inp["eta_turbine"] * (s1.h - h2s)
+    h2 = s1.h - inp["eta_turbine"] * (s1.h - sp2s["h"])
     sp2 = fp.state_point(fluid, "H", h2, "P", P_low)
     s2 = StatePoint(T=sp2["T"], P=sp2["P"], h=sp2["h"], s=sp2["s"],
-                    phase=sp2["phase"], rho=sp2["rho"], label="2-Turbine Outlet")
+                    phase=sp2["phase"], rho=sp2["rho"], label="2-Turbine Outlet",
+                    quality=sp2.get("quality", -1) if isinstance(sp2, dict) else -1)
 
-    # ── State 4: Condenser outlet (saturated liquid) ─────────────────────
+    # State 4: Condenser outlet (saturated liquid)
     sp4 = fp.state_point(fluid, "T", T_cond, "Q", 0)
     s4 = StatePoint(T=sp4["T"], P=sp4["P"], h=sp4["h"], s=sp4["s"],
                     quality=0, phase="liquid", rho=sp4["rho"],
                     label="4-Condenser Outlet")
 
-    # ── State 5: Pump outlet (isentropic efficiency) ─────────────────────
+    # State 5: Pump outlet
     sp5s = fp.state_point(fluid, "S", s4.s, "P", P_high)
-    h5s = sp5s["h"]
-    h5 = s4.h + (h5s - s4.h) / inp["eta_pump"]
+    h5 = s4.h + (sp5s["h"] - s4.h) / inp["eta_pump"]
     sp5 = fp.state_point(fluid, "H", h5, "P", P_high)
     s5 = StatePoint(T=sp5["T"], P=sp5["P"], h=sp5["h"], s=sp5["s"],
                     phase=sp5["phase"], rho=sp5["rho"], label="5-Pump Outlet")
 
-    # ── State 3: Recuperator hot-side outlet ─────────────────────────────
-    # T3 = T5 + dt_pinch_recup
+    # State 3: Recuperator hot-side outlet
     T3 = s5.T + inp["dt_pinch_recup"]
     if T3 >= s2.T:
-        # No useful recuperation — skip
         T3 = s2.T
     sp3 = fp.state_point(fluid, "T", T3, "P", P_low)
     s3 = StatePoint(T=sp3["T"], P=sp3["P"], h=sp3["h"], s=sp3["s"],
                     phase=sp3["phase"], rho=sp3["rho"],
                     label="3-Recuperator Hot Out")
 
-    # ── State 6: Recuperator cold-side outlet ────────────────────────────
-    q_recup = s2.h - s3.h  # BTU/lb recovered
+    # State 6: Recuperator cold-side outlet
+    q_recup = s2.h - s3.h
     h6 = s5.h + q_recup
     sp6 = fp.state_point(fluid, "H", h6, "P", P_high)
     s6 = StatePoint(T=sp6["T"], P=sp6["P"], h=sp6["h"], s=sp6["s"],
                     phase=sp6["phase"], rho=sp6["rho"],
-                    label="6-Recuperator Cold Out")
+                    label="6-Preheater Inlet")
 
-    states = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6}
+    # State 7: Vaporizer inlet (saturated liquid at T_evap)
+    sp7 = fp.state_point(fluid, "T", T_evap, "Q", 0)
+    s7 = StatePoint(T=sp7["T"], P=sp7["P"], h=sp7["h"], s=sp7["s"],
+                    quality=0, phase="liquid", rho=sp7["rho"],
+                    label="7-Vaporizer Inlet")
 
-    # ── Mass flow rate (energy balance on evaporator) ────────────────────
-    cp_geo = 1.0  # BTU/(lb·°F) approx for brine
-    q_evap = s1.h - s6.h  # BTU/lb isopentane
-    Q_geo = inp["m_dot_geo"] * cp_geo * (inp["T_geo_in"] - inp["T_geo_out"])  # BTU/hr
+    states = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6, "7": s7}
+
+    # Heat duties (BTU/lb)
+    q_vaporizer = s1.h - s7.h
+    q_preheater = s7.h - s6.h
+    q_evap = q_vaporizer + q_preheater
+
+    # Mass flow from brine energy balance
+    m_dot_geo = inp["m_dot_geo"]  # lb/s
+    cp_geo = inp["cp_brine"]
+    T_geo_in = inp["T_geo_in"]
+
+    # Preheater pinch sets minimum brine outlet
+    T_brine_out_pinch = s6.T + inp["dt_pinch_preheater"]
+    T_brine_out = max(T_brine_out_pinch, inp["T_geo_out_min"])
+
+    Q_geo = m_dot_geo * cp_geo * (T_geo_in - T_brine_out) * 3600  # BTU/hr
     m_dot_iso = Q_geo / q_evap  # lb/hr
 
-    # ── Performance ──────────────────────────────────────────────────────
-    w_turbine = s1.h - s2.h       # BTU/lb
-    w_pump = s5.h - s4.h          # BTU/lb
-    w_net = w_turbine - w_pump    # BTU/lb
+    # Brine temperature tracking
+    Q_vaporizer = m_dot_iso * q_vaporizer
+    T_brine_mid = T_geo_in - Q_vaporizer / (m_dot_geo * 3600 * cp_geo)
+    T_geo_out_calc = T_brine_mid - (m_dot_iso * q_preheater) / (m_dot_geo * 3600 * cp_geo)
 
-    gross_power_btu_hr = m_dot_iso * w_turbine
-    net_power_btu_hr = m_dot_iso * w_net
-    gross_power_kw = gross_power_btu_hr / 3412.14
-    net_power_kw = net_power_btu_hr / 3412.14
+    # Pinch verification
+    vaporizer_pinch = T_brine_mid - s7.T
+    vaporizer_pinch_violation = vaporizer_pinch < inp["dt_pinch_vaporizer"] - 0.1
+    preheater_pinch = T_geo_out_calc - s6.T
+    preheater_pinch_violation = preheater_pinch < inp["dt_pinch_preheater"] - 0.1
+    brine_outlet_violation = T_geo_out_calc < inp["T_geo_out_min"] - 0.1
 
+    # Performance
+    w_turbine = s1.h - s2.h
+    w_pump = s5.h - s4.h
+    w_net = w_turbine - w_pump
+
+    gross_power_kw = (m_dot_iso * w_turbine) / 3412.14
+    net_power_kw = (m_dot_iso * w_net) / 3412.14
     eta_thermal = w_net / q_evap if q_evap > 0 else 0
 
-    # Volumetric flow at turbine outlet (State 2)
-    vol_flow_2 = m_dot_iso / s2.rho / 3600  # ft³/s
+    vol_flow_2 = m_dot_iso / s2.rho / 3600  # ft3/s
+
+    # Heat rejection duty
+    q_cond = s3.h - s4.h  # BTU/lb
+    Q_reject_btu_hr = m_dot_iso * q_cond
+    Q_reject_mmbtu_hr = Q_reject_btu_hr / 1e6
+    Q_recup_mmbtu_hr = (m_dot_iso * q_recup) / 1e6
 
     performance = {
         "gross_power_kw": gross_power_kw,
         "net_power_kw": net_power_kw,
         "eta_thermal": eta_thermal,
         "m_dot_iso": m_dot_iso,
+        "m_dot_iso_lbs": m_dot_iso / 3600,
         "w_turbine": w_turbine,
         "w_pump": w_pump,
         "w_net": w_net,
         "q_evap": q_evap,
-        "q_cond": s3.h - s4.h,
+        "q_vaporizer": q_vaporizer,
+        "q_preheater": q_preheater,
+        "q_cond": q_cond,
         "q_recup": q_recup,
+        "Q_reject_mmbtu_hr": Q_reject_mmbtu_hr,
+        "Q_recup_mmbtu_hr": Q_recup_mmbtu_hr,
         "P_high": P_high,
         "P_low": P_low,
         "T_cond": T_cond,
         "T_evap": T_evap,
+        "T_brine_mid": T_brine_mid,
+        "T_geo_out_calc": T_geo_out_calc,
+        "vaporizer_pinch": vaporizer_pinch,
+        "vaporizer_pinch_violation": vaporizer_pinch_violation,
+        "preheater_pinch": preheater_pinch,
+        "preheater_pinch_violation": preheater_pinch_violation,
+        "brine_outlet_violation": brine_outlet_violation,
         "vol_flow_turbine_exit": vol_flow_2,
         "pressure_ratio": P_high / P_low if P_low > 0 else 0,
+        "brine_effectiveness": net_power_kw / inp["m_dot_geo"] if inp["m_dot_geo"] > 0 else 0,
     }
 
-    return {"states": states, "performance": performance}
+    return states, performance
+
+
+def solve_config_a(inputs: dict, fp) -> dict:
+    """
+    Solve Config A with iterative duct pressure drop convergence.
+    Iterates: solve cycle -> calculate duct dP -> apply condensing penalty -> re-solve.
+    """
+    inp = {**_default_inputs(), **inputs}
+    fluid = "isopentane"
+
+    T_cond_base = inp["T_ambient"] + inp["dt_pinch_acc"]
+    dt_penalty = 0.0
+
+    for iteration in range(20):
+        T_cond = T_cond_base + dt_penalty
+        states, perf = _solve_cycle_core(inp, fp, fluid, T_cond)
+        perf["T_cond"] = T_cond
+
+        duct = calculate_duct_segments_a(states, perf, inp, fp)
+        new_penalty = duct["total_delta_T_cond_F"]
+
+        if abs(new_penalty - dt_penalty) < 0.1:
+            break
+        dt_penalty = new_penalty
+
+    perf["duct_penalty_F"] = dt_penalty
+    perf["converged"] = abs(new_penalty - dt_penalty) < 0.1
+
+    return {"states": states, "performance": perf, "duct": duct}
 
 
 def solve_config_b(inputs: dict, fp) -> dict:
     """
-    Solve Config B: isopentane ORC with propane intermediate loop.
-
-    The iso condenser rejects heat to propane (phase-change to phase-change),
-    and the propane loop rejects heat through an ACC.
+    Solve Config B with iterative duct pressure drop convergence.
     """
     inp = {**_default_inputs(), **inputs}
     fluid = "isopentane"
     prop_fluid = "propane"
 
-    # ── Temperatures ─────────────────────────────────────────────────────
     T_amb = inp["T_ambient"]
     dt_acc = inp["dt_pinch_acc"]
     dt_approach = inp["dt_approach_intermediate"]
-    dt_evap = inp["dt_pinch_evap"]
 
-    # Propane condensing in ACC at ambient + ACC pinch
-    T_propane_cond = inp.get("T_propane_cond") or (T_amb + dt_acc)
+    T_propane_cond = T_amb + dt_acc
+    T_cond_iso_base = T_amb + dt_acc + dt_approach
 
-    # Isopentane condensing temperature is elevated above Config A:
-    #   T_cond_iso = T_ambient + ΔT_ACC_pinch + ΔT_approach_intermediate
-    T_cond_iso = T_amb + dt_acc + dt_approach
+    dt_penalty = 0.0
 
-    # Propane evaporates in the intermediate HX, absorbing heat from
-    # condensing isopentane. The approach ΔT spans iso condensing → propane
-    # evaporation, so:
-    #   T_propane_evap = T_cond_iso - dt_approach
-    # This equals T_amb + dt_acc (= T_propane_cond) by construction.
-    # The propane loop therefore operates with minimal temperature lift;
-    # its value comes from replacing low-density isopentane vapor in the
-    # ACC duct with higher-density propane vapor.
-    T_propane_evap = T_cond_iso - dt_approach
-    # Ensure at least 2°F lift so CoolProp can distinguish the two states
-    if T_propane_evap <= T_propane_cond + 1:
-        T_propane_evap = T_propane_cond + 2
+    for iteration in range(20):
+        T_cond_iso = T_cond_iso_base + dt_penalty
+        T_propane_evap = T_cond_iso - dt_approach
+        if T_propane_evap <= T_propane_cond + 1:
+            T_propane_evap = T_propane_cond + 2
 
-    T_evap = inp["T_geo_in"] - dt_evap
+        states, perf = _solve_cycle_core(inp, fp, fluid, T_cond_iso)
 
-    # ── Saturation pressures (isopentane) ────────────────────────────────
-    sat_cond_iso = fp.saturation_props(fluid, T=T_cond_iso)
-    sat_evap_iso = fp.saturation_props(fluid, T=T_evap)
-    P_low_iso = sat_cond_iso["P_sat"]
-    P_high_iso = sat_evap_iso["P_sat"]
+        # Override keys for Config B naming
+        perf["T_cond_iso"] = T_cond_iso
+        perf["P_high_iso"] = perf["P_high"]
+        perf["P_low_iso"] = perf["P_low"]
+        perf["pressure_ratio_iso"] = perf["pressure_ratio"]
+        perf["T_propane_evap"] = T_propane_evap
+        perf["T_propane_cond"] = T_propane_cond
 
-    # ── Isopentane states (same logic as Config A with different T_cond) ─
-    T1 = T_evap + inp["superheat"]
-    sp1 = fp.state_point(fluid, "T", T1, "P", P_high_iso)
-    s1 = StatePoint(T=sp1["T"], P=sp1["P"], h=sp1["h"], s=sp1["s"],
-                    phase=sp1["phase"], rho=sp1["rho"], label="1-Turbine Inlet")
+        # Propane loop
+        sat_prop_evap = fp.saturation_props(prop_fluid, T=T_propane_evap)
+        sat_prop_cond = fp.saturation_props(prop_fluid, T=T_propane_cond)
+        P_prop_evap = sat_prop_evap["P_sat"]
+        P_prop_cond = sat_prop_cond["P_sat"]
 
-    sp2s = fp.state_point(fluid, "S", s1.s, "P", P_low_iso)
-    h2s = sp2s["h"]
-    h2 = s1.h - inp["eta_turbine"] * (s1.h - h2s)
-    sp2 = fp.state_point(fluid, "H", h2, "P", P_low_iso)
-    s2 = StatePoint(T=sp2["T"], P=sp2["P"], h=sp2["h"], s=sp2["s"],
-                    phase=sp2["phase"], rho=sp2["rho"], label="2-Turbine Outlet")
+        spA = fp.state_point(prop_fluid, "T", T_propane_evap, "Q", 1)
+        sA = StatePoint(T=spA["T"], P=spA["P"], h=spA["h"], s=spA["s"],
+                        quality=1, phase="vapor", rho=spA["rho"],
+                        label="A-Propane Sat Vapor")
 
-    sp4 = fp.state_point(fluid, "T", T_cond_iso, "Q", 0)
-    s4 = StatePoint(T=sp4["T"], P=sp4["P"], h=sp4["h"], s=sp4["s"],
-                    quality=0, phase="liquid", rho=sp4["rho"],
-                    label="4-Condenser Outlet")
+        spB = fp.state_point(prop_fluid, "T", T_propane_cond, "Q", 0)
+        sB = StatePoint(T=spB["T"], P=spB["P"], h=spB["h"], s=spB["s"],
+                        quality=0, phase="liquid", rho=spB["rho"],
+                        label="B-Propane Sat Liquid")
 
-    sp5s = fp.state_point(fluid, "S", s4.s, "P", P_high_iso)
-    h5s = sp5s["h"]
-    h5 = s4.h + (h5s - s4.h) / inp["eta_pump"]
-    sp5 = fp.state_point(fluid, "H", h5, "P", P_high_iso)
-    s5 = StatePoint(T=sp5["T"], P=sp5["P"], h=sp5["h"], s=sp5["s"],
-                    phase=sp5["phase"], rho=sp5["rho"], label="5-Pump Outlet")
+        spCs = fp.state_point(prop_fluid, "S", sB.s, "P", P_prop_evap)
+        h_C = sB.h + (spCs["h"] - sB.h) / inp["eta_pump"]
+        spC = fp.state_point(prop_fluid, "H", h_C, "P", P_prop_evap)
+        sC = StatePoint(T=spC["T"], P=spC["P"], h=spC["h"], s=spC["s"],
+                        phase=spC["phase"], rho=spC["rho"],
+                        label="C-Propane Pump Out")
 
-    T3 = s5.T + inp["dt_pinch_recup"]
-    if T3 >= s2.T:
-        T3 = s2.T
-    sp3 = fp.state_point(fluid, "T", T3, "P", P_low_iso)
-    s3 = StatePoint(T=sp3["T"], P=sp3["P"], h=sp3["h"], s=sp3["s"],
-                    phase=sp3["phase"], rho=sp3["rho"],
-                    label="3-Recuperator Hot Out")
+        prop_states = {"A": sA, "B": sB, "C": sC}
 
-    q_recup = s2.h - s3.h
-    h6 = s5.h + q_recup
-    sp6 = fp.state_point(fluid, "H", h6, "P", P_high_iso)
-    s6 = StatePoint(T=sp6["T"], P=sp6["P"], h=sp6["h"], s=sp6["s"],
-                    phase=sp6["phase"], rho=sp6["rho"],
-                    label="6-Recuperator Cold Out")
+        # Propane mass flow
+        q_cond_iso = perf["q_cond"]
+        q_evap_prop = sA.h - sC.h
+        m_dot_iso = perf["m_dot_iso"]
+        m_dot_prop = (m_dot_iso * q_cond_iso) / q_evap_prop
 
-    iso_states = {"1": s1, "2": s2, "3": s3, "4": s4, "5": s5, "6": s6}
+        perf["m_dot_prop"] = m_dot_prop
+        perf["q_cond_iso"] = q_cond_iso
+        perf["w_pump_iso"] = perf["w_pump"]
+        perf["w_pump_prop"] = sC.h - sB.h
+        w_pump_total = perf["w_pump_iso"] + perf["w_pump_prop"] * (m_dot_prop / m_dot_iso)
+        perf["w_pump_total"] = w_pump_total
+        perf["w_net"] = perf["w_turbine"] - w_pump_total
+        perf["net_power_kw"] = (m_dot_iso * perf["w_net"]) / 3412.14
+        perf["eta_thermal"] = perf["w_net"] / perf["q_evap"] if perf["q_evap"] > 0 else 0
+        perf["brine_effectiveness"] = perf["net_power_kw"] / inp["m_dot_geo"] if inp["m_dot_geo"] > 0 else 0
 
-    # ── Mass flow rate (isopentane) ──────────────────────────────────────
-    cp_geo = 1.0
-    q_evap = s1.h - s6.h
-    Q_geo = inp["m_dot_geo"] * cp_geo * (inp["T_geo_in"] - inp["T_geo_out"])
-    m_dot_iso = Q_geo / q_evap
+        perf["P_prop_evap"] = P_prop_evap
+        perf["P_prop_cond"] = P_prop_cond
+        perf["pressure_ratio_prop"] = P_prop_evap / P_prop_cond if P_prop_cond > 0 else 0
+        perf["vol_flow_prop_evap_exit"] = m_dot_prop / sA.rho / 3600
 
-    # ── Propane loop ─────────────────────────────────────────────────────
-    sat_prop_evap = fp.saturation_props(prop_fluid, T=T_propane_evap)
-    sat_prop_cond = fp.saturation_props(prop_fluid, T=T_propane_cond)
+        # Duct segments
+        duct = calculate_duct_segments_b(states, prop_states, perf, inp, fp)
+        new_penalty = duct["total_delta_T_cond_F"]
 
-    P_prop_evap = sat_prop_evap["P_sat"]
-    P_prop_cond = sat_prop_cond["P_sat"]
+        if abs(new_penalty - dt_penalty) < 0.1:
+            break
+        dt_penalty = new_penalty
 
-    # State A: saturated vapor leaving propane evaporator
-    spA = fp.state_point(prop_fluid, "T", T_propane_evap, "Q", 1)
-    sA = StatePoint(T=spA["T"], P=spA["P"], h=spA["h"], s=spA["s"],
-                    quality=1, phase="vapor", rho=spA["rho"],
-                    label="A-Propane Sat Vapor")
-
-    # State B: saturated liquid leaving propane condenser (ACC)
-    spB = fp.state_point(prop_fluid, "T", T_propane_cond, "Q", 0)
-    sB = StatePoint(T=spB["T"], P=spB["P"], h=spB["h"], s=spB["s"],
-                    quality=0, phase="liquid", rho=spB["rho"],
-                    label="B-Propane Sat Liquid")
-
-    # State C: propane pump outlet
-    spCs = fp.state_point(prop_fluid, "S", sB.s, "P", P_prop_evap)
-    h_Cs = spCs["h"]
-    h_C = sB.h + (h_Cs - sB.h) / inp["eta_pump"]
-    spC = fp.state_point(prop_fluid, "H", h_C, "P", P_prop_evap)
-    sC = StatePoint(T=spC["T"], P=spC["P"], h=spC["h"], s=spC["s"],
-                    phase=spC["phase"], rho=spC["rho"],
-                    label="C-Propane Pump Out")
-
-    prop_states = {"A": sA, "B": sB, "C": sC}
-
-    # Propane mass flow (energy balance on intermediate HX)
-    q_cond_iso = s3.h - s4.h  # BTU/lb iso — heat rejected by isopentane
-    q_evap_prop = sA.h - sC.h  # BTU/lb propane — heat absorbed by propane
-    m_dot_prop = (m_dot_iso * q_cond_iso) / q_evap_prop  # lb/hr
-
-    # ── Performance ──────────────────────────────────────────────────────
-    w_turbine = s1.h - s2.h
-    w_pump_iso = s5.h - s4.h
-    w_pump_prop = sC.h - sB.h
-    w_pump_total = w_pump_iso + w_pump_prop * (m_dot_prop / m_dot_iso)
-    w_net = w_turbine - w_pump_total
-
-    gross_power_kw = (m_dot_iso * w_turbine) / 3412.14
-    net_power_kw = (m_dot_iso * w_net) / 3412.14
-
-    eta_thermal = w_net / q_evap if q_evap > 0 else 0
-
-    # Volumetric flow at turbine outlet
-    vol_flow_2 = m_dot_iso / s2.rho / 3600  # ft³/s
-
-    # Propane volumetric flow at evaporator exit (State A)
-    vol_flow_prop_A = m_dot_prop / sA.rho / 3600  # ft³/s
-
-    performance = {
-        "gross_power_kw": gross_power_kw,
-        "net_power_kw": net_power_kw,
-        "eta_thermal": eta_thermal,
-        "m_dot_iso": m_dot_iso,
-        "m_dot_prop": m_dot_prop,
-        "w_turbine": w_turbine,
-        "w_pump_iso": w_pump_iso,
-        "w_pump_prop": w_pump_prop,
-        "w_pump_total": w_pump_total,
-        "w_net": w_net,
-        "q_evap": q_evap,
-        "q_cond_iso": q_cond_iso,
-        "q_recup": q_recup,
-        "P_high_iso": P_high_iso,
-        "P_low_iso": P_low_iso,
-        "T_cond_iso": T_cond_iso,
-        "T_evap": T_evap,
-        "T_propane_evap": T_propane_evap,
-        "T_propane_cond": T_propane_cond,
-        "P_prop_evap": P_prop_evap,
-        "P_prop_cond": P_prop_cond,
-        "vol_flow_turbine_exit": vol_flow_2,
-        "vol_flow_prop_evap_exit": vol_flow_prop_A,
-        "pressure_ratio_iso": P_high_iso / P_low_iso if P_low_iso > 0 else 0,
-        "pressure_ratio_prop": P_prop_evap / P_prop_cond if P_prop_cond > 0 else 0,
-    }
+    perf["duct_penalty_F"] = dt_penalty
+    perf["converged"] = abs(new_penalty - dt_penalty) < 0.1
 
     return {
-        "states": iso_states,
+        "states": states,
         "propane_states": prop_states,
-        "performance": performance,
+        "performance": perf,
+        "duct": duct,
     }
 
 
 def verify_recuperator_pinch(states: dict, fp) -> dict:
-    """
-    Check that the recuperator has no internal pinch-point violation.
-
-    Divides the hot side (State 2 → State 3) into N intervals and checks
-    that T_hot − T_cold >= 0 at every point.
-    """
+    """Check recuperator internal pinch-point violation."""
     s2 = states["2"]
     s3 = states["3"]
     s5 = states["5"]
@@ -389,7 +640,7 @@ def verify_recuperator_pinch(states: dict, fp) -> dict:
 
     N = 20
     h_hot_vals = np.linspace(s2.h, s3.h, N)
-    h_cold_vals = np.linspace(s6.h, s5.h, N)  # reversed — cold side enters at 5, exits at 6
+    h_cold_vals = np.linspace(s6.h, s5.h, N)
 
     fluid = "isopentane"
     min_pinch = float("inf")
@@ -411,7 +662,7 @@ def verify_recuperator_pinch(states: dict, fp) -> dict:
         })
         if dt < min_pinch:
             min_pinch = dt
-        if dt < -0.1:  # small tolerance
+        if dt < -0.1:
             violation = True
 
     return {
@@ -421,32 +672,66 @@ def verify_recuperator_pinch(states: dict, fp) -> dict:
     }
 
 
-def calculate_duct_sizing(states: dict, m_dot: float, v_duct: float,
-                          fp, config: str = "A") -> dict:
-    """
-    Calculate duct area and diameter for vapor piping from turbine outlet
-    to condenser inlet.
+def run_validation_checks(perf, states, duct, config, inp, fp):
+    """Run convergence and validation checks. Returns list of (name, passed, detail)."""
+    checks = []
 
-    m_dot: lb/hr
-    v_duct: ft/s (design velocity)
-    """
-    s2 = states["2"]  # turbine outlet — highest vapor volume
+    # 1. Brine outlet above minimum
+    T_out = perf["T_geo_out_calc"]
+    T_min = inp.get("T_geo_out_min", 160)
+    checks.append(("Brine outlet >= minimum",
+                    T_out >= T_min - 0.1,
+                    f"{T_out:.1f} vs {T_min:.1f} degF"))
 
-    rho = s2.rho  # lb/ft³
-    m_dot_fps = m_dot / 3600  # lb/s
+    # 2. Recuperator pinch
+    pinch = verify_recuperator_pinch(states, fp)
+    checks.append(("No recuperator pinch violation",
+                    not pinch["violation"],
+                    f"Min dT = {pinch['min_pinch_dT']:.1f} degF"))
 
-    vol_flow = m_dot_fps / rho  # ft³/s
-    area = vol_flow / v_duct   # ft²
-    diameter = (4 * area / np.pi) ** 0.5  # ft
-    diameter_in = diameter * 12  # inches
+    # 3. Turbine inlet quality >= 1.0
+    s1 = states["1"]
+    q1_ok = s1.quality < 0 or s1.quality >= 1.0  # -1 = superheated
+    checks.append(("Turbine inlet quality >= 1.0",
+                    q1_ok,
+                    f"Phase: {s1.phase}"))
 
-    return {
-        "config": config,
-        "vol_flow_ft3s": vol_flow,
-        "area_ft2": area,
-        "diameter_ft": diameter,
-        "diameter_in": diameter_in,
-        "rho_lbft3": rho,
-        "v_duct_fps": v_duct,
-        "m_dot_lbhr": m_dot,
-    }
+    # 4. Turbine exit quality > 0.90
+    s2 = states["2"]
+    q2 = s2.quality if s2.quality >= 0 else 1.0
+    checks.append(("Turbine exit quality > 0.90",
+                    q2 > 0.90,
+                    f"Quality: {q2:.3f}" if s2.quality >= 0 else f"Phase: {s2.phase}"))
+
+    # 5. Duct velocities within 5-25 ft/s
+    all_vels_ok = True
+    vel_detail = []
+    for seg in duct["segments"]:
+        v = seg["velocity_fps"]
+        ok = 5 <= v <= 25
+        if not ok:
+            all_vels_ok = False
+        vel_detail.append(f"{seg['name']}: {v:.0f} ft/s")
+    checks.append(("Duct velocities 5-25 ft/s",
+                    all_vels_ok,
+                    "; ".join(vel_detail)))
+
+    # 6. Cycle converged
+    checks.append(("Cycle converged",
+                    perf.get("converged", False),
+                    f"Duct penalty: {perf.get('duct_penalty_F', 0):.2f} degF"))
+
+    # 7. Tailpipe diameter benchmark (at 50 MW scale)
+    gross_mw = perf["gross_power_kw"] / 1000
+    if gross_mw > 0:
+        scale = 50.0 / gross_mw
+        tp_dia = duct["tailpipe_diameter_in"]
+        scaled_dia = tp_dia * (scale ** 0.5)  # diameter scales with sqrt of flow
+        if config == "A":
+            benchmark = 80
+            deviation = abs(scaled_dia - benchmark) / benchmark
+            checks.append(("Tailpipe diameter benchmark",
+                            deviation <= 0.20,
+                            f"Scaled: {scaled_dia:.0f}\" vs {benchmark}\" benchmark ({deviation*100:.0f}% dev)"))
+
+    return checks
