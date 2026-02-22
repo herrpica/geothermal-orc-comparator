@@ -1006,39 +1006,60 @@ with tab6:
     # 2. dT/dP sensitivity curves
     st.subheader("dT/dP Sensitivity: Isopentane vs Propane")
 
-    T_range = np.linspace(90, 140, 30)
-    dTdP_iso_curve = []
-    dTdP_prop_curve = []
-    for T in T_range:
+    # Compute dT/dP numerically from CoolProp at 20 evenly spaced pressure points
+    P_iso_range = np.linspace(20, 80, 20)    # psia
+    P_prop_range = np.linspace(100, 300, 20)  # psia
+
+    T_iso_curve, dTdP_iso_curve = [], []
+    for P in P_iso_range:
         try:
-            dTdP_iso_curve.append(calc_dT_dP("isopentane", T, fp))
+            sat = fp.saturation_props("isopentane", P=P)
+            T_sat = sat["T_sat"]
+            dp = 0.01
+            sat_hi = fp.saturation_props("isopentane", P=P + dp)
+            sat_lo = fp.saturation_props("isopentane", P=P - dp)
+            dTdP = abs((sat_hi["T_sat"] - sat_lo["T_sat"]) / (2 * dp))
+            T_iso_curve.append(T_sat)
+            dTdP_iso_curve.append(dTdP)
         except Exception:
+            T_iso_curve.append(float("nan"))
             dTdP_iso_curve.append(float("nan"))
+
+    T_prop_curve, dTdP_prop_curve = [], []
+    for P in P_prop_range:
         try:
-            dTdP_prop_curve.append(calc_dT_dP("propane", T, fp))
+            sat = fp.saturation_props("propane", P=P)
+            T_sat = sat["T_sat"]
+            dp = 0.01
+            sat_hi = fp.saturation_props("propane", P=P + dp)
+            sat_lo = fp.saturation_props("propane", P=P - dp)
+            dTdP = abs((sat_hi["T_sat"] - sat_lo["T_sat"]) / (2 * dp))
+            T_prop_curve.append(T_sat)
+            dTdP_prop_curve.append(dTdP)
         except Exception:
+            T_prop_curve.append(float("nan"))
             dTdP_prop_curve.append(float("nan"))
 
     fig_sens = go.Figure()
     fig_sens.add_trace(go.Scatter(
-        x=list(T_range), y=dTdP_iso_curve, name="Isopentane (~20 psia)",
+        x=T_iso_curve, y=dTdP_iso_curve, name="Isopentane (20-80 psia)",
         line=dict(color="blue", width=2.5),
     ))
     fig_sens.add_trace(go.Scatter(
-        x=list(T_range), y=dTdP_prop_curve, name="Propane (~230 psia)",
+        x=T_prop_curve, y=dTdP_prop_curve, name="Propane (100-300 psia)",
         line=dict(color="red", width=2.5),
     ))
 
     # Mark operating points
     fig_sens.add_trace(go.Scatter(
         x=[perf_a["T_cond"]], y=[hydraulic_a["dT_dP_FperPsi"]],
-        mode="markers", name="Config A operating point",
-        marker=dict(size=14, color="blue", symbol="star"),
+        mode="markers", name=f"Config A ({perf_a['T_cond']:.0f}degF, {perf_a['P_low']:.0f} psia)",
+        marker=dict(size=14, color="blue", symbol="circle"),
     ))
     fig_sens.add_trace(go.Scatter(
         x=[perf_b["T_propane_cond"]], y=[hydraulic_b["prop_dT_dP_FperPsi"]],
-        mode="markers", name="Config B propane operating point",
-        marker=dict(size=14, color="red", symbol="star"),
+        mode="markers", name=f"Config B propane ({perf_b['T_propane_cond']:.0f}degF, {perf_b['P_prop_cond']:.0f} psia)",
+        marker=dict(size=14, color="red", symbol="circle"),
     ))
 
     ratio_val = hydraulic_a["dT_dP_FperPsi"] / hydraulic_b["prop_dT_dP_FperPsi"] if hydraulic_b["prop_dT_dP_FperPsi"] > 0 else 0
