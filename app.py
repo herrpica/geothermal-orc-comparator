@@ -782,6 +782,7 @@ def _svg_style():
       .eq-label { font-size: 10.5px; font-weight: bold; fill: #222; font-family: sans-serif; }
       .eq-duty { font-size: 8.5px; fill: #555; font-family: sans-serif; }
       .state-label { font-size: 8px; fill: #444; font-family: monospace; }
+      .state-box { fill: #fff; stroke: #bbb; stroke-width: 0.7; rx: 3; ry: 3; }
       .flow-hot { stroke: #c0392b; stroke-width: 2.5; fill: none; }
       .flow-cold { stroke: #2980b9; stroke-width: 2.5; fill: none; }
       .flow-green { stroke: #27ae60; stroke-width: 2.5; fill: none; }
@@ -808,11 +809,23 @@ def _eq_box(x, y, w, h, fill, name, duty_str):
     )
 
 
-def _state_tag(x, y, num, T, P, anchor="start"):
-    """State point annotation: number, T, P."""
+def _state_tag(x, y, num, T, P, side="left"):
+    """State point label with white background box, offset 15px from anchor."""
+    label = f"{num}: {T:.0f}F / {P:.0f} psia"
+    bw, bh = 115, 16
+    if side == "right":
+        bx = x + 15
+        tx = bx + 4
+        anc = "start"
+    else:
+        bx = x - 15 - bw
+        tx = bx + bw - 4
+        anc = "end"
+    by = y - bh / 2
+    ty = y + 3
     return (
-        f'<text x="{x}" y="{y}" text-anchor="{anchor}" class="state-label">'
-        f'{num}: {T:.0f}F / {P:.0f} psia</text>'
+        f'<rect x="{bx}" y="{by}" width="{bw}" height="{bh}" class="state-box"/>'
+        f'<text x="{tx}" y="{ty}" text-anchor="{anc}" class="state-label">{label}</text>'
     )
 
 
@@ -833,84 +846,83 @@ def _generate_pfd_a(states, perf, duct, inputs):
     L_run = inputs.get("L_tailpipe_a", 30) + inputs.get("L_long_header", 120)
 
     svg = f"""<div style="background:#fafafa;border:1px solid #ddd;border-radius:8px;padding:4px;">
-<svg viewBox="0 0 580 500" xmlns="http://www.w3.org/2000/svg">
+<svg viewBox="0 0 754 650" xmlns="http://www.w3.org/2000/svg">
 {_svg_style()}
 {_svg_defs()}
 
 <!-- Title -->
-<text x="290" y="20" text-anchor="middle" class="title-text">Config A -- Direct ACC</text>
+<text x="377" y="26" text-anchor="middle" class="title-text">Config A -- Direct ACC</text>
 
 <!-- Equipment boxes -->
-{_eq_box(140, 45, 150, 44, '#fff3e0', 'VAPORIZER', f'{vap_duty:.2f} MMBtu/hr')}
-{_eq_box(420, 80, 120, 48, '#fce4ec', 'TURBINE', f'{turb_kw:.0f} kW')}
-{_eq_box(235, 195, 145, 68, '#f3e5f5', 'RECUPERATOR', f'{recup_duty:.2f} MMBtu/hr')}
-{_eq_box(370, 340, 145, 50, '#e3f2fd', 'ACC', f'{rej_duty:.2f} MMBtu/hr')}
-{_eq_box(55, 345, 125, 40, '#e8f5e9', 'ISO PUMP', f'{pump_kw:.0f} kW')}
-{_eq_box(35, 165, 145, 44, '#fff3e0', 'PREHEATER', f'{pre_duty:.2f} MMBtu/hr')}
+{_eq_box(185, 55, 150, 44, '#fff3e0', 'VAPORIZER', f'{vap_duty:.2f} MMBtu/hr')}
+{_eq_box(540, 80, 120, 48, '#fce4ec', 'TURBINE', f'{turb_kw:.0f} kW')}
+{_eq_box(45, 205, 145, 44, '#fff3e0', 'PREHEATER', f'{pre_duty:.2f} MMBtu/hr')}
+{_eq_box(300, 250, 145, 68, '#f3e5f5', 'RECUPERATOR', f'{recup_duty:.2f} MMBtu/hr')}
+{_eq_box(470, 460, 145, 50, '#e3f2fd', 'ACC', f'{rej_duty:.2f} MMBtu/hr')}
+{_eq_box(70, 465, 125, 40, '#e8f5e9', 'ISO PUMP', f'{pump_kw:.0f} kW')}
 
 <!-- Recuperator internal divider -->
-<line x1="245" y1="229" x2="370" y2="229" stroke="#999" stroke-width="0.8" stroke-dasharray="3,2"/>
+<line x1="310" y1="284" x2="435" y2="284" stroke="#999" stroke-width="0.8" stroke-dasharray="3,2"/>
 
 <!-- ============ FLOW LINES ============ -->
 
 <!-- State 1: Vaporizer -> Turbine (hot vapor, red, right across top) -->
-<polyline points="290,67 355,67 355,104 420,104"
+<polyline points="335,77 438,77 438,104 540,104"
   class="flow-hot" marker-end="url(#arr-red)"/>
-{_state_tag(300, 62, 1, s['1'].T, s['1'].P)}
+{_state_tag(438, 85, 1, s['1'].T, s['1'].P, 'right')}
 
 <!-- State 2: Turbine -> Recuperator hot in (red, down right side) -->
-<polyline points="480,128 480,175 380,175 380,195"
+<polyline points="600,128 600,220 445,220 445,250"
   class="flow-hot" marker-end="url(#arr-red)"/>
-<!-- Big pipe halo on state 2-3 path -->
-<polyline points="480,128 480,175 380,175 380,195"
+<polyline points="600,128 600,220 445,220 445,250"
   class="halo"/>
-{_state_tag(485, 155, 2, s['2'].T, s['2'].P)}
+{_state_tag(600, 175, 2, s['2'].T, s['2'].P, 'right')}
 
 <!-- State 3: Recuperator hot out -> ACC (red, down) -->
-<polyline points="380,263 380,310 442,310 442,340"
+<polyline points="445,318 445,395 542,395 542,460"
   class="flow-hot" marker-end="url(#arr-red)"/>
-<polyline points="380,263 380,310 442,310 442,340"
+<polyline points="445,318 445,395 542,395 542,460"
   class="halo"/>
-{_state_tag(387, 300, 3, s['3'].T, s['3'].P)}
+{_state_tag(450, 360, 3, s['3'].T, s['3'].P, 'right')}
 
 <!-- State 4: ACC -> Pump (blue, left across bottom) -->
-<polyline points="370,365 210,365 210,420 180,420 180,365"
+<polyline points="470,485 280,485 280,530 250,530 250,485 195,485"
   class="flow-cold" marker-end="url(#arr-blue)"/>
-{_state_tag(210, 440, 4, s['4'].T, s['4'].P)}
+{_state_tag(265, 540, 4, s['4'].T, s['4'].P, 'right')}
 
 <!-- State 5: Pump -> Recuperator cold in (blue, up) -->
-<polyline points="55,345 55,260 235,260"
+<polyline points="70,465 70,310 300,310"
   class="flow-cold" marker-end="url(#arr-blue)"/>
-{_state_tag(15, 300, 5, s['5'].T, s['5'].P, 'start')}
+{_state_tag(75, 390, 5, s['5'].T, s['5'].P, 'right')}
 
 <!-- State 6: Recuperator cold out -> Preheater (blue, left) -->
-<polyline points="235,215 190,215 180,187 180,209"
+<polyline points="300,270 240,270 240,227 190,227"
   class="flow-cold" marker-end="url(#arr-blue)"/>
-{_state_tag(182, 215, 6, s['6'].T, s['6'].P, 'end')}
+{_state_tag(240, 255, 6, s['6'].T, s['6'].P, 'left')}
 
 <!-- State 7: Preheater -> Vaporizer (warm, up left side) -->
-<polyline points="107,165 107,110 107,89 140,67"
+<polyline points="117,205 117,130 117,99 185,77"
   class="flow-cold" marker-end="url(#arr-red)"/>
-{_state_tag(15, 140, 7, s['7'].T, s['7'].P)}
+{_state_tag(117, 165, 7, s['7'].T, s['7'].P, 'right')}
 
 <!-- ============ BRINE PATH (orange dashed) ============ -->
-<polyline points="215,30 215,45"
+<polyline points="260,38 260,55"
   class="flow-brine" marker-end="url(#arr-orange)"/>
-<text x="218" y="28" class="brine-label">Brine In {inputs['T_geo_in']:.0f}F</text>
+<text x="265" y="33" class="brine-label">Brine In {inputs['T_geo_in']:.0f}F</text>
 
-<polyline points="215,89 107,89 107,165"
+<polyline points="260,99 117,99 117,205"
   class="flow-brine" marker-end="url(#arr-orange)"/>
-<text x="155" y="100" class="brine-label">T_mid {perf['T_brine_mid']:.0f}F</text>
+<text x="170" y="112" class="brine-label">T_mid {perf['T_brine_mid']:.0f}F</text>
 
-<polyline points="107,209 107,230"
+<polyline points="117,249 117,275"
   class="flow-brine"/>
-<text x="60" y="245" class="brine-label">Brine Out {perf['T_geo_out_calc']:.0f}F</text>
+<text x="65" y="290" class="brine-label">Brine Out {perf['T_geo_out_calc']:.0f}F</text>
 
-<!-- Big Pipe annotation box -->
-<rect x="420" y="135" width="150" height="48" class="annot-box"/>
-<text x="495" y="152" text-anchor="middle" class="annot-text">LOW-PRESSURE VAPOR PATH</text>
-<text x="495" y="164" text-anchor="middle" class="annot-text">{tp_dia:.0f}" dia x {L_run:.0f} ft run</text>
-<text x="495" y="176" text-anchor="middle" style="font-size:7.5px;fill:#c0392b;font-family:sans-serif;">
+<!-- Annotation box (bottom) -->
+<rect x="190" y="575" width="370" height="55" class="annot-box"/>
+<text x="375" y="595" text-anchor="middle" class="annot-text">LOW-PRESSURE VAPOR PATH</text>
+<text x="375" y="607" text-anchor="middle" class="annot-text">{tp_dia:.0f}" dia x {L_run:.0f} ft run</text>
+<text x="375" y="619" text-anchor="middle" style="font-size:7.5px;fill:#c0392b;font-family:sans-serif;">
   (field-routed isopentane vapor)</text>
 
 </svg></div>"""
@@ -937,106 +949,105 @@ def _generate_pfd_b(states, prop_states, perf, duct, duct_a, inputs):
     tp_a_dia = duct_a["tailpipe_diameter_in"]
 
     svg = f"""<div style="background:#fafafa;border:1px solid #ddd;border-radius:8px;padding:4px;">
-<svg viewBox="0 0 580 500" xmlns="http://www.w3.org/2000/svg">
+<svg viewBox="0 0 754 650" xmlns="http://www.w3.org/2000/svg">
 {_svg_style()}
 {_svg_defs()}
 
 <!-- Title -->
-<text x="290" y="20" text-anchor="middle" class="title-text">Config B -- Propane Intermediate Loop</text>
+<text x="377" y="26" text-anchor="middle" class="title-text">Config B -- Propane Intermediate Loop</text>
 
 <!-- Equipment boxes -->
-{_eq_box(55, 45, 140, 44, '#fff3e0', 'VAPORIZER', f'{vap_duty:.2f} MMBtu/hr')}
-{_eq_box(295, 80, 110, 48, '#fce4ec', 'TURBINE', f'{turb_kw:.0f} kW')}
-{_eq_box(140, 195, 135, 62, '#f3e5f5', 'RECUPERATOR', f'{recup_duty:.2f} MMBtu/hr')}
-{_eq_box(140, 320, 135, 50, '#fffde7', 'IHX', f'{ihx_duty:.2f} MMBtu/hr')}
-{_eq_box(10, 325, 105, 38, '#e8f5e9', 'ISO PUMP', f'{pump_iso_kw:.0f} kW')}
-{_eq_box(10, 155, 115, 44, '#fff3e0', 'PREHEATER', f'{pre_duty:.2f} MMBtu/hr')}
-{_eq_box(400, 175, 140, 50, '#e3f2fd', 'PROPANE ACC', f'{rej_duty:.2f} MMBtu/hr')}
-{_eq_box(410, 320, 120, 38, '#e8f5e9', 'PROP PUMP', f'{pump_prop_kw:.0f} kW')}
+{_eq_box(72, 55, 140, 44, '#fff3e0', 'VAPORIZER', f'{vap_duty:.2f} MMBtu/hr')}
+{_eq_box(385, 80, 110, 48, '#fce4ec', 'TURBINE', f'{turb_kw:.0f} kW')}
+{_eq_box(13, 205, 115, 44, '#fff3e0', 'PREHEATER', f'{pre_duty:.2f} MMBtu/hr')}
+{_eq_box(182, 255, 135, 68, '#f3e5f5', 'RECUPERATOR', f'{recup_duty:.2f} MMBtu/hr')}
+{_eq_box(182, 435, 135, 50, '#fffde7', 'IHX', f'{ihx_duty:.2f} MMBtu/hr')}
+{_eq_box(13, 440, 105, 38, '#e8f5e9', 'ISO PUMP', f'{pump_iso_kw:.0f} kW')}
+{_eq_box(520, 230, 140, 50, '#e3f2fd', 'PROPANE ACC', f'{rej_duty:.2f} MMBtu/hr')}
+{_eq_box(533, 435, 120, 38, '#e8f5e9', 'PROP PUMP', f'{pump_prop_kw:.0f} kW')}
 
 <!-- Recuperator internal divider -->
-<line x1="150" y1="226" x2="265" y2="226" stroke="#999" stroke-width="0.8" stroke-dasharray="3,2"/>
+<line x1="192" y1="289" x2="307" y2="289" stroke="#999" stroke-width="0.8" stroke-dasharray="3,2"/>
 
 <!-- ============ ISOPENTANE LOOP ============ -->
 
 <!-- State 1: Vaporizer -> Turbine (hot vapor, red) -->
-<polyline points="195,67 245,67 245,104 295,104"
+<polyline points="212,77 300,77 300,104 385,104"
   class="flow-hot" marker-end="url(#arr-red)"/>
-{_state_tag(200, 58, 1, s['1'].T, s['1'].P)}
+{_state_tag(300, 85, 1, s['1'].T, s['1'].P, 'right')}
 
 <!-- State 2: Turbine -> Recuperator hot in (red) -->
-<polyline points="350,128 350,175 275,175 275,195"
+<polyline points="440,128 440,220 317,220 317,255"
   class="flow-hot" marker-end="url(#arr-red)"/>
-{_state_tag(355, 155, 2, s['2'].T, s['2'].P)}
+{_state_tag(445, 175, 2, s['2'].T, s['2'].P, 'right')}
 
 <!-- State 3: Recuperator hot out -> IHX (red, down) -->
-<polyline points="275,257 275,290 207,290 207,320"
+<polyline points="317,323 317,385 249,385 249,435"
   class="flow-hot" marker-end="url(#arr-red)"/>
-{_state_tag(280, 286, 3, s['3'].T, s['3'].P)}
+{_state_tag(322, 360, 3, s['3'].T, s['3'].P, 'right')}
 
 <!-- State 4: IHX -> Pump (blue, left) -->
-<polyline points="140,345 115,345 115,400 62,400 62,363"
+<polyline points="182,460 150,460 150,505 80,505 80,478"
   class="flow-cold" marker-end="url(#arr-blue)"/>
-{_state_tag(70, 415, 4, s['4'].T, s['4'].P)}
+{_state_tag(90, 510, 4, s['4'].T, s['4'].P, 'right')}
 
 <!-- State 5: Pump -> Recuperator cold in (blue, up) -->
-<polyline points="10,325 10,250 140,250"
+<polyline points="13,440 13,315 182,315"
   class="flow-cold" marker-end="url(#arr-blue)"/>
-{_state_tag(4, 275, 5, s['5'].T, s['5'].P, 'start')}
+{_state_tag(18, 380, 5, s['5'].T, s['5'].P, 'right')}
 
 <!-- State 6: Recuperator cold out -> Preheater (blue, left) -->
-<polyline points="140,210 130,210 125,190 125,199"
+<polyline points="182,275 155,275 155,227 128,227"
   class="flow-cold" marker-end="url(#arr-blue)"/>
-{_state_tag(72, 218, 6, s['6'].T, s['6'].P, 'start')}
+{_state_tag(155, 260, 6, s['6'].T, s['6'].P, 'left')}
 
 <!-- State 7: Preheater -> Vaporizer (warm, up) -->
-<polyline points="67,155 67,110 67,89 55,67"
+<polyline points="70,205 70,130 70,99 72,77"
   class="flow-cold" marker-end="url(#arr-red)"/>
-{_state_tag(4, 135, 7, s['7'].T, s['7'].P)}
+{_state_tag(70, 165, 7, s['7'].T, s['7'].P, 'right')}
 
 <!-- ============ PROPANE LOOP (green) ============ -->
 
 <!-- State A: IHX -> Propane ACC (green, right) -->
-<polyline points="275,345 340,345 340,215 400,215"
+<polyline points="317,460 420,460 420,255 520,255"
   class="flow-green" marker-end="url(#arr-green)"/>
-<text x="342" y="280" text-anchor="start" class="state-label">A: {ps['A'].T:.0f}F / {ps['A'].P:.0f} psia</text>
+{_state_tag(425, 360, 'A', ps['A'].T, ps['A'].P, 'right')}
 
 <!-- State B: Propane ACC -> Prop Pump (green, down) -->
-<polyline points="470,225 470,260 470,320"
+<polyline points="590,280 590,370 593,435"
   class="flow-green" marker-end="url(#arr-green)"/>
-<text x="475" y="275" text-anchor="start" class="state-label">B: {ps['B'].T:.0f}F / {ps['B'].P:.0f} psia</text>
+{_state_tag(595, 340, 'B', ps['B'].T, ps['B'].P, 'right')}
 
 <!-- State C: Prop Pump -> IHX (green, left) -->
-<polyline points="410,339 340,339 340,365 275,365 275,370"
+<polyline points="533,454 430,454 430,485 317,485"
   class="flow-green" marker-end="url(#arr-green)"/>
-<text x="350" y="380" text-anchor="start" class="state-label">C: {ps['C'].T:.0f}F / {ps['C'].P:.0f} psia</text>
+{_state_tag(430, 498, 'C', ps['C'].T, ps['C'].P, 'right')}
 
 <!-- ============ BRINE PATH (orange dashed) ============ -->
-<polyline points="125,30 125,45"
+<polyline points="142,38 142,55"
   class="flow-brine" marker-end="url(#arr-orange)"/>
-<text x="128" y="28" class="brine-label">Brine In {inputs['T_geo_in']:.0f}F</text>
+<text x="148" y="33" class="brine-label">Brine In {inputs['T_geo_in']:.0f}F</text>
 
-<polyline points="125,89 67,89 67,155"
+<polyline points="142,99 70,99 70,205"
   class="flow-brine" marker-end="url(#arr-orange)"/>
-<text x="80" y="100" class="brine-label">T_mid {perf['T_brine_mid']:.0f}F</text>
+<text x="90" y="112" class="brine-label">T_mid {perf['T_brine_mid']:.0f}F</text>
 
-<polyline points="67,199 67,220"
+<polyline points="70,249 70,275"
   class="flow-brine"/>
-<text x="4" y="235" class="brine-label">Brine Out {perf['T_geo_out_calc']:.0f}F</text>
+<text x="10" y="290" class="brine-label">Brine Out {perf['T_geo_out_calc']:.0f}F</text>
 
-<!-- Short iso runs annotation -->
-<rect x="140" y="380" width="130" height="30" rx="4"
+<!-- Annotation boxes (bottom) -->
+<rect x="40" y="575" width="170" height="35" rx="4"
   fill="none" stroke="#666" stroke-width="0.8" stroke-dasharray="3,2"/>
-<text x="205" y="398" text-anchor="middle"
+<text x="125" y="597" text-anchor="middle"
   style="font-size:8px;fill:#555;font-weight:bold;font-family:sans-serif;">
   SHORT ISO RUNS (all indoor)</text>
 
-<!-- Propane loop annotation -->
-<rect x="395" y="265" width="150" height="48" rx="4"
+<rect x="280" y="565" width="380" height="55" rx="4"
   fill="none" stroke="#27ae60" stroke-width="1" stroke-dasharray="4,2"/>
-<text x="470" y="280" text-anchor="middle" class="annot-green">HIGH-P PROPANE LOOP</text>
-<text x="470" y="292" text-anchor="middle" class="annot-green">{prop_dia:.0f}" dia vs {tp_a_dia:.0f}" (Config A)</text>
-<text x="470" y="304" text-anchor="middle"
+<text x="470" y="583" text-anchor="middle" class="annot-green">HIGH-P PROPANE LOOP</text>
+<text x="470" y="595" text-anchor="middle" class="annot-green">{prop_dia:.0f}" dia vs {tp_a_dia:.0f}" (Config A)</text>
+<text x="470" y="607" text-anchor="middle"
   style="font-size:7.5px;fill:#27ae60;font-family:sans-serif;">
   (small-bore, high-pressure piping)</text>
 
