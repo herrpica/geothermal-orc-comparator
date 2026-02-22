@@ -151,7 +151,8 @@ checks_a = run_validation_checks(perf_a, states_a, duct_a, "A", inputs, fp)
 checks_b = run_validation_checks(perf_b, states_b, duct_b, "B", inputs, fp)
 
 # Schedule
-sched_delta = construction_schedule_delta(duct_a)
+sched_info = construction_schedule_delta(duct_a)
+sched_delta = sched_info["net_delta"]
 
 # Payback
 payback_yrs = simple_payback(
@@ -244,12 +245,12 @@ with left_col:
 
     # Construction schedule
     if sched_delta < 0:
-        sched_str = f"{abs(sched_delta)} weeks faster"
+        sched_str = f"**{abs(sched_delta)} weeks faster**"
     elif sched_delta > 0:
-        sched_str = f"+{sched_delta} weeks"
+        sched_str = f"+{sched_delta} weeks slower"
     else:
         sched_str = "Same"
-    table_md += f"| Schedule delta (Config B vs A) | | {sched_str} |\n"
+    table_md += f"| **Schedule delta (Config B vs A)** | | {sched_str} |\n"
     table_md += f"| Equipment item count | {costs_a['equipment_count']} | {costs_b['equipment_count']} |\n"
 
     # Winner callout
@@ -259,6 +260,26 @@ with left_col:
     table_md += f"| **Winner** | Perf: **{perf_winner}** | Cost: **{cost_winner}** / Sched: **{sched_winner}** |\n"
 
     st.markdown(table_md)
+
+    # Schedule breakdown detail
+    with st.expander("Schedule Breakdown"):
+        si = sched_info
+        st.markdown(f"""
+**Config B savings** (tailpipe = {si['tailpipe_diameter_in']:.0f}\"):
+- Duct fabrication & erection: **-{si['duct_fab_savings']} weeks**
+- Welding vs flanged connections: **-{si['weld_savings']} weeks**
+- Structural steel: **-{si['steel_savings']} weeks**
+- **Total savings: -{si['total_savings']} weeks**
+
+**Config B adders** (fixed):
+- Intermediate HX installation: +{si['ihx_install']} weeks
+- Propane pressure test & leak check: +{si['propane_pressure_test']} weeks
+- Propane safety review & commissioning: +{si['propane_safety_commissioning']} week
+- **Total adder: +{si['total_adder']} weeks**
+
+**Net: {si['net_delta']:+d} weeks** ({sched_str})
+""")
+
 
     # Validation checks
     with st.expander("Validation Checks"):

@@ -266,14 +266,57 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
 def construction_schedule_delta(duct_a):
     """
     Config B construction schedule delta relative to Config A (weeks).
-    +3 weeks for IHX and propane system.
-    -4 weeks if tailpipe > 60 inches (saves large duct fab/erection).
+    Returns dict with savings breakdown, adders, and net delta.
+    Negative net = Config B is faster.
     """
     tp_dia = duct_a.get("tailpipe_diameter_in", 0)
-    delta = 3  # IHX and propane system
+
+    # Duct fabrication and erection savings
+    if tp_dia > 72:
+        duct_fab_savings = 6
+    elif tp_dia > 60:
+        duct_fab_savings = 4
+    elif tp_dia > 48:
+        duct_fab_savings = 3
+    else:
+        duct_fab_savings = 1
+
+    # Welding vs flanged connection savings
     if tp_dia > 60:
-        delta -= 4  # saves on large duct
-    return delta
+        weld_savings = 3
+    elif tp_dia > 48:
+        weld_savings = 2
+    else:
+        weld_savings = 1
+
+    # Structural steel savings
+    if tp_dia > 60:
+        steel_savings = 2
+    else:
+        steel_savings = 1
+
+    total_savings = duct_fab_savings + weld_savings + steel_savings
+
+    # Fixed adders for Config B
+    ihx_install = 2
+    propane_pressure_test = 2
+    propane_safety_commissioning = 1
+    total_adder = ihx_install + propane_pressure_test + propane_safety_commissioning
+
+    net_delta = total_adder - total_savings
+
+    return {
+        "duct_fab_savings": duct_fab_savings,
+        "weld_savings": weld_savings,
+        "steel_savings": steel_savings,
+        "total_savings": total_savings,
+        "ihx_install": ihx_install,
+        "propane_pressure_test": propane_pressure_test,
+        "propane_safety_commissioning": propane_safety_commissioning,
+        "total_adder": total_adder,
+        "net_delta": net_delta,
+        "tailpipe_diameter_in": tp_dia,
+    }
 
 
 def lifecycle_cost(installed_cost, net_power_kw, inputs) -> dict:
