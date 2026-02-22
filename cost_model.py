@@ -32,7 +32,7 @@ COST_FACTORS = {
 }
 
 U_VALUES = {
-    "acc": 8,
+    "acc": 80,               # effective U incl. fin enhancement (bare-tube basis)
     "intermediate_hx": 150,
     "recuperator": 40,
     "vaporizer": 150,
@@ -88,18 +88,20 @@ def _lmtd(dT1, dT2):
     return (dT1 - dT2) / np.log(dT1 / dT2)
 
 
-def _acc_face_area(Q_reject_btu_hr, T_cond, T_ambient, U=None):
+def _acc_face_area(Q_mmbtu_hr, T_cond, T_ambient, U=None):
+    """ACC face area.  Q in MMBtu/hr, U in BTU/(hr·ft2·°F), returns ft2."""
     U = U or U_VALUES["acc"]
     dT = T_cond - T_ambient
     if dT <= 0:
         dT = 1
-    return Q_reject_btu_hr / (U * dT)
+    return Q_mmbtu_hr * 1e6 / (U * dT)
 
 
-def _hx_area(Q_btu_hr, lmtd_val, U):
+def _hx_area(Q_mmbtu_hr, lmtd_val, U):
+    """HX area.  Q in MMBtu/hr, U in BTU/(hr·ft2·°F), returns ft2."""
     if lmtd_val <= 0:
         lmtd_val = 0.1
-    return Q_btu_hr / (U * lmtd_val)
+    return Q_mmbtu_hr * 1e6 / (U * lmtd_val)
 
 
 def _duct_segment_cost(segment, inp=None):
@@ -215,7 +217,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     costs["iso_pump"] = pump_hp * COST_FACTORS["iso_pump_per_hp"]
 
     # Vaporizer (State 7 -> 1)
-    Q_vap = m_dot * perf["q_vaporizer"]
+    Q_vap = m_dot * perf["q_vaporizer"] / 1e6          # MMBtu/hr
     dT1_vap = inp["T_geo_in"] - states["1"].T
     dT2_vap = perf["T_brine_mid"] - states["7"].T
     lmtd_vap = _lmtd(dT1_vap, dT2_vap)
@@ -225,7 +227,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     costs["vaporizer_area_ft2"] = vap_area
 
     # Preheater (State 6 -> 7)
-    Q_pre = m_dot * perf["q_preheater"]
+    Q_pre = m_dot * perf["q_preheater"] / 1e6          # MMBtu/hr
     dT1_pre = perf["T_brine_mid"] - states["7"].T
     dT2_pre = perf["T_geo_out_calc"] - states["6"].T
     lmtd_pre = _lmtd(dT1_pre, dT2_pre)
@@ -235,7 +237,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     costs["preheater_area_ft2"] = pre_area
 
     # Recuperator
-    Q_recup = m_dot * perf["q_recup"]
+    Q_recup = m_dot * perf["q_recup"] / 1e6            # MMBtu/hr
     if Q_recup > 0:
         dT1_r = states["2"].T - states["6"].T
         dT2_r = states["3"].T - states["5"].T
@@ -249,7 +251,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
         costs["recuperator_area_ft2"] = 0
 
     # ACC
-    Q_cond = m_dot * perf["q_cond"]
+    Q_cond = m_dot * perf["q_cond"] / 1e6              # MMBtu/hr
     acc_area = _acc_face_area(Q_cond, perf["T_cond"], inp["T_ambient"])
     uc_acc = inp.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"])
     costs["acc"] = acc_area * uc_acc
@@ -313,7 +315,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     costs["iso_pump"] = pump_hp_iso * COST_FACTORS["iso_pump_per_hp"]
 
     # Vaporizer
-    Q_vap = m_dot_iso * perf["q_vaporizer"]
+    Q_vap = m_dot_iso * perf["q_vaporizer"] / 1e6          # MMBtu/hr
     dT1_vap = inp["T_geo_in"] - states["1"].T
     dT2_vap = perf["T_brine_mid"] - states["7"].T
     lmtd_vap = _lmtd(dT1_vap, dT2_vap)
@@ -323,7 +325,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     costs["vaporizer_area_ft2"] = vap_area
 
     # Preheater
-    Q_pre = m_dot_iso * perf["q_preheater"]
+    Q_pre = m_dot_iso * perf["q_preheater"] / 1e6          # MMBtu/hr
     dT1_pre = perf["T_brine_mid"] - states["7"].T
     dT2_pre = perf["T_geo_out_calc"] - states["6"].T
     lmtd_pre = _lmtd(dT1_pre, dT2_pre)
@@ -333,7 +335,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     costs["preheater_area_ft2"] = pre_area
 
     # Recuperator
-    Q_recup = m_dot_iso * perf["q_recup"]
+    Q_recup = m_dot_iso * perf["q_recup"] / 1e6            # MMBtu/hr
     if Q_recup > 0:
         dT1_r = states["2"].T - states["6"].T
         dT2_r = states["3"].T - states["5"].T
@@ -347,7 +349,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
         costs["recuperator_area_ft2"] = 0
 
     # Intermediate HX
-    Q_intermediate = m_dot_iso * perf["q_cond_iso"]
+    Q_intermediate = m_dot_iso * perf["q_cond_iso"] / 1e6  # MMBtu/hr
     lmtd_int = inp.get("dt_approach_intermediate", 10)
     int_area = _hx_area(Q_intermediate, lmtd_int, U_VALUES["intermediate_hx"])
     uc_ihx = inp.get("uc_ihx_per_ft2", COST_FACTORS["hx_per_ft2"])
@@ -355,7 +357,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     costs["intermediate_hx_area_ft2"] = int_area
 
     # Propane ACC
-    Q_prop_cond = m_dot_prop * (propane_states["A"].h - propane_states["B"].h)
+    Q_prop_cond = m_dot_prop * (propane_states["A"].h - propane_states["B"].h) / 1e6  # MMBtu/hr
     T_propane_cond = perf["T_propane_cond"]
     acc_area = _acc_face_area(Q_prop_cond, T_propane_cond, inp["T_ambient"])
     uc_acc = inp.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"])
@@ -638,22 +640,16 @@ ACC_TUBE_DEFAULTS = {
 }
 
 
-def hx_area_vs_pinch(Q_btu_hr, U, T_hot_in, T_hot_out, T_cold_in, T_cold_out,
+def hx_area_vs_pinch(Q_mmbtu_hr, U, T_hot_in, T_hot_out, T_cold_in, T_cold_out,
                      pinch_range=None, cost_per_ft2=100):
     """
     Sweep pinch temperature for a heat exchanger and return area + cost curve.
 
+    Q in MMBtu/hr, U in BTU/(hr·ft2·°F).
+
     The exchanger has fixed duty Q.  As pinch tightens, LMTD shrinks so area
     grows.  We model the HX as counter-flow with the given terminal temps as
     baseline, then scale LMTD proportionally to the pinch variation.
-
-    For each pinch value, we recompute LMTD from the hot/cold profile where
-    the minimum approach (pinch) is forced to the sweep value.  The simplest
-    correct approach: hold Q constant, hold one side's profile, and adjust the
-    other side's outlet so the minimum dT equals the sweep pinch.
-
-    In practice the ORC cycle changes when pinch changes, so this is an
-    approximation at constant duty - good enough for the trade-off visual.
 
     Returns list of dicts: [{pinch, lmtd, area_ft2, cost}]
     """
@@ -677,7 +673,7 @@ def hx_area_vs_pinch(Q_btu_hr, U, T_hot_in, T_hot_out, T_cold_in, T_cold_out,
         dT2 = max(dT2_base * scale, 0.1)
         lmtd_val = _lmtd(dT1, dT2)
 
-        area = _hx_area(Q_btu_hr, lmtd_val, U) if lmtd_val > 0 else 0
+        area = _hx_area(Q_mmbtu_hr, lmtd_val, U) if lmtd_val > 0 else 0
         cost = area * cost_per_ft2
         results.append({
             "pinch": float(pinch),
@@ -689,10 +685,11 @@ def hx_area_vs_pinch(Q_btu_hr, U, T_hot_in, T_hot_out, T_cold_in, T_cold_out,
     return results
 
 
-def acc_area_vs_pinch(Q_reject_btu_hr, T_ambient, pinch_range=None,
+def acc_area_vs_pinch(Q_reject_mmbtu_hr, T_ambient, pinch_range=None,
                       cost_per_ft2=None):
     """
     ACC area and cost vs ACC pinch (condensing approach to ambient).
+    Q in MMBtu/hr.
     """
     if pinch_range is None:
         pinch_range = np.linspace(5, 25, 21)
@@ -702,7 +699,7 @@ def acc_area_vs_pinch(Q_reject_btu_hr, T_ambient, pinch_range=None,
     results = []
     for pinch in pinch_range:
         dT = max(pinch, 0.1)
-        area = Q_reject_btu_hr / (U_VALUES["acc"] * dT)
+        area = Q_reject_mmbtu_hr * 1e6 / (U_VALUES["acc"] * dT)
         cost = area * cost_per_ft2
         results.append({
             "pinch": float(pinch),

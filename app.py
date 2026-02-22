@@ -74,6 +74,8 @@ st.caption("Config A (Direct ACC) vs Config B (Propane Intermediate Loop) -- Geo
 # ============================================================================
 
 with st.sidebar:
+    if st.button("💬 Ask Claude", use_container_width=True, type="secondary"):
+        _claude_chat_dialog()
     st.header("Inputs")
 
     with st.form("input_form"):
@@ -710,11 +712,6 @@ def _claude_chat_dialog():
     st.rerun(scope="fragment")
 
 
-# --- Sidebar button to open chat ---
-with st.sidebar:
-    st.divider()
-    if st.button("💬 Ask Claude", use_container_width=True, type="secondary"):
-        _claude_chat_dialog()
 
 
 # ============================================================================
@@ -1356,12 +1353,16 @@ with wf_col1:
         text=[f"${v:.2f}M" for v in vals_a] + [f"${costs_a['total_installed']/1e6:.2f}M"],
         textposition="outside",
     ))
+    max_y_a = costs_a['total_installed'] / 1e6 * 1.25
     fig_wf_a.update_layout(
         title="Config A Installed Cost ($MM)",
         yaxis_title="Cost ($MM)",
+        yaxis_range=[0, max_y_a],
         height=450,
         showlegend=False,
     )
+    fig_wf_a.update_traces(textfont_size=10, textangle=-45,
+                           cliponaxis=False)
     st.plotly_chart(fig_wf_a, width="stretch")
 
 # Config B waterfall
@@ -1378,12 +1379,16 @@ with wf_col2:
         text=[f"${v:.2f}M" for v in vals_b] + [f"${costs_b['total_installed']/1e6:.2f}M"],
         textposition="outside",
     ))
+    max_y_b = costs_b['total_installed'] / 1e6 * 1.25
     fig_wf_b.update_layout(
         title="Config B Installed Cost ($MM)",
         yaxis_title="Cost ($MM)",
+        yaxis_range=[0, max_y_b],
         height=450,
         showlegend=False,
     )
+    fig_wf_b.update_traces(textfont_size=10, textangle=-45,
+                           cliponaxis=False)
     st.plotly_chart(fig_wf_b, width="stretch")
 
 # Delta chart (full width)
@@ -1400,6 +1405,8 @@ fig_delta.update_layout(
     yaxis_title="Delta ($MM)",
     height=400,
 )
+fig_delta.update_traces(textfont_size=10, textangle=-45,
+                        cliponaxis=False)
 st.plotly_chart(fig_delta, width="stretch")
 
 # Duct segment cost breakdown
@@ -2004,11 +2011,11 @@ with tab7:
     m_a = perf_a["m_dot_iso"]
     m_b = perf_b["m_dot_iso"]
 
-    # -- Config A heat exchangers --
-    Q_vap_a = m_a * perf_a["q_vaporizer"]
-    Q_pre_a = m_a * perf_a["q_preheater"]
-    Q_rec_a = m_a * perf_a["q_recup"]
-    Q_cond_a = m_a * perf_a["q_cond"]
+    # -- Config A heat exchangers (MMBtu/hr) --
+    Q_vap_a = m_a * perf_a["q_vaporizer"] / 1e6
+    Q_pre_a = m_a * perf_a["q_preheater"] / 1e6
+    Q_rec_a = m_a * perf_a["q_recup"] / 1e6
+    Q_cond_a = m_a * perf_a["q_cond"] / 1e6
 
     hx_sweeps_a = {
         "Vaporizer": hx_area_vs_pinch(
@@ -2030,13 +2037,13 @@ with tab7:
     acc_sweep_a = acc_area_vs_pinch(Q_cond_a, inputs["T_ambient"], pinch_sweep,
                                     inputs.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"]))
 
-    # -- Config B heat exchangers --
-    Q_vap_b = m_b * perf_b["q_vaporizer"]
-    Q_pre_b = m_b * perf_b["q_preheater"]
-    Q_rec_b = m_b * perf_b["q_recup"]
-    Q_ihx_b = m_b * perf_b["q_cond_iso"]
+    # -- Config B heat exchangers (MMBtu/hr) --
+    Q_vap_b = m_b * perf_b["q_vaporizer"] / 1e6
+    Q_pre_b = m_b * perf_b["q_preheater"] / 1e6
+    Q_rec_b = m_b * perf_b["q_recup"] / 1e6
+    Q_ihx_b = m_b * perf_b["q_cond_iso"] / 1e6
     m_prop = perf_b["m_dot_prop"]
-    Q_acc_b = m_prop * (prop_states["A"].h - prop_states["B"].h)
+    Q_acc_b = m_prop * (prop_states["A"].h - prop_states["B"].h) / 1e6
 
     hx_sweeps_b = {
         "Vaporizer": hx_area_vs_pinch(
