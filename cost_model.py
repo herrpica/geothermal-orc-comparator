@@ -57,6 +57,17 @@ def _default_inputs():
         "discount_rate": 0.08,
         "project_life": 30,
         "capacity_factor": 0.95,
+        # Hydraulic parameters (mirrored from thermodynamics.py)
+        "f_darcy": 0.02,
+        "dp_acc_tubes_a": 0.5,
+        "dp_acc_headers_a": 0.3,
+        "dp_recup_a": 0.3,
+        "dp_ihx_iso": 0.5,
+        "dp_recup_b": 0.3,
+        "dp_tailpipe_iso_b": 0.3,
+        "dp_acc_tubes_prop": 1.0,
+        "dp_prop_headers": 0.5,
+        "dp_ihx_prop": 0.5,
     }
 
 
@@ -352,6 +363,38 @@ def lifecycle_cost(installed_cost, net_power_kw, inputs) -> dict:
         "annuity_factor": annuity_factor,
         "specific_cost_per_kw": specific_cost,
     }
+
+
+def schedule_savings_npv(sched_info, net_power_kw, inputs):
+    """
+    NPV of early startup revenue from schedule savings.
+    If Config B is faster by N weeks, the plant earns revenue N weeks earlier.
+    Discount that revenue back to construction midpoint.
+    """
+    inp = {**_default_inputs(), **inputs}
+    weeks_saved = -sched_info["net_delta"]  # positive = B is faster
+    if weeks_saved <= 0:
+        return 0.0
+
+    price_per_mwh = inp["electricity_price"]
+    cf = inp["capacity_factor"]
+    r = inp["discount_rate"]
+    n = inp["project_life"]
+
+    # Revenue per week
+    annual_energy_mwh = net_power_kw / 1000 * 8760 * cf
+    weekly_revenue = annual_energy_mwh * price_per_mwh / 52
+
+    # NPV of the extra weeks of revenue at the END of plant life
+    # (plant starts earlier, so it generates revenue for weeks_saved extra weeks)
+    # Discount from end of plant life back to start
+    if r > 0:
+        discount_factor = 1 / (1 + r) ** n
+    else:
+        discount_factor = 1.0
+
+    npv = weeks_saved * weekly_revenue * discount_factor
+    return npv
 
 
 def simple_payback(cost_a, cost_b, net_power_a_kw, net_power_b_kw, inputs):

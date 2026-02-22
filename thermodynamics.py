@@ -66,6 +66,20 @@ def _default_inputs():
         "discount_rate": 0.08,
         "project_life": 30,         # years
         "capacity_factor": 0.95,
+        # Hydraulic parameters
+        "f_darcy": 0.02,
+        # Config A equipment dP (psi)
+        "dp_acc_tubes_a": 0.5,
+        "dp_acc_headers_a": 0.3,
+        "dp_recup_a": 0.3,
+        # Config B isopentane side equipment dP (psi)
+        "dp_ihx_iso": 0.5,
+        "dp_recup_b": 0.3,
+        "dp_tailpipe_iso_b": 0.3,
+        # Config B propane side equipment dP (psi)
+        "dp_acc_tubes_prop": 1.0,
+        "dp_prop_headers": 0.5,
+        "dp_ihx_prop": 0.5,
     }
 
 
@@ -92,10 +106,31 @@ def validate_inputs(inputs: dict) -> list:
 
 
 # ---------------------------------------------------------------------------
+# Hydraulic helpers
+# ---------------------------------------------------------------------------
+
+def calc_dT_dP(fluid, T_sat, fp):
+    """
+    Central finite difference on CoolProp saturation curve.
+    Returns dT/dP in degF/psi.  Fallback: 1.0 if CoolProp fails.
+    """
+    try:
+        sat = fp.saturation_props(fluid, T=T_sat)
+        P_center = sat["P_sat"]
+        dp = 0.01  # psi perturbation
+        sat_hi = fp.saturation_props(fluid, P=P_center + dp)
+        sat_lo = fp.saturation_props(fluid, P=P_center - dp)
+        dT_dP = (sat_hi["T_sat"] - sat_lo["T_sat"]) / (2 * dp)
+        return abs(dT_dP)
+    except Exception:
+        return 1.0
+
+
+# ---------------------------------------------------------------------------
 # Duct sizing helpers
 # ---------------------------------------------------------------------------
 
-def _duct_segment(m_dot_lbs, rho, velocity, length, fluid, T_sat, fp):
+def _duct_segment(m_dot_lbs, rho, velocity, length, fluid, T_sat, fp, f_darcy=0.02):
     """
     Calculate a single duct segment: diameter, pressure drop, condensing
     temperature penalty.
@@ -117,7 +152,7 @@ def _duct_segment(m_dot_lbs, rho, velocity, length, fluid, T_sat, fp):
     diameter_in = diameter_ft * 12
 
     # Darcy-Weisbach: dP = f * L/D * 0.5 * rho * v^2
-    f = 0.02
+    f = f_darcy
     if diameter_ft > 0:
         dp_lbft2 = f * (length / diameter_ft) * 0.5 * rho * velocity ** 2
         dp_psi = dp_lbft2 / 144.0
@@ -162,25 +197,26 @@ def calculate_duct_segments_a(states, perf, inp, fp):
     """
     m_dot_lbs = perf["m_dot_iso"] / 3600  # lb/hr -> lb/s
     T_cond = perf["T_cond"]
+    f_darcy = inp.get("f_darcy", 0.02)
 
     s2 = states["2"]
     s3 = states["3"]
 
     seg1 = _duct_segment(
         m_dot_lbs, s2.rho, inp["v_tailpipe"], inp["L_tailpipe_a"],
-        "isopentane", T_cond, fp,
+        "isopentane", T_cond, fp, f_darcy=f_darcy,
     )
     seg1["name"] = "Tailpipe (turbine-recup)"
 
     seg2 = _duct_segment(
         m_dot_lbs, s3.rho, inp["v_tailpipe"], inp["L_long_header"],
-        "isopentane", T_cond, fp,
+        "isopentane", T_cond, fp, f_darcy=f_darcy,
     )
     seg2["name"] = "Recup exit header"
 
     seg3 = _duct_segment(
         m_dot_lbs, s3.rho, inp["v_acc_header"], inp["L_acc_header"],
-        "isopentane", T_cond, fp,
+        "isopentane", T_cond, fp, f_darcy=f_darcy,
     )
     seg3["name"] = "ACC distribution"
 
@@ -211,6 +247,7 @@ def calculate_duct_segments_b(states, prop_states, perf, inp, fp):
     T_cond_iso = perf["T_cond_iso"]
     T_propane_evap = perf["T_propane_evap"]
     T_propane_cond = perf["T_propane_cond"]
+    f_darcy = inp.get("f_darcy", 0.02)
 
     s2 = states["2"]
     s3 = states["3"]
@@ -218,25 +255,25 @@ def calculate_duct_segments_b(states, prop_states, perf, inp, fp):
 
     seg1 = _duct_segment(
         m_dot_iso_lbs, s2.rho, inp["v_tailpipe"], inp["L_tailpipe_a"],
-        "isopentane", T_cond_iso, fp,
+        "isopentane", T_cond_iso, fp, f_darcy=f_darcy,
     )
     seg1["name"] = "ISO tailpipe (turbine-recup)"
 
     seg2 = _duct_segment(
         m_dot_iso_lbs, s3.rho, inp["v_tailpipe"], inp.get("L_iso_to_ihx", 40),
-        "isopentane", T_cond_iso, fp,
+        "isopentane", T_cond_iso, fp, f_darcy=f_darcy,
     )
     seg2["name"] = "ISO recup exit to IHX"
 
     seg3 = _duct_segment(
         m_dot_prop_lbs, sA.rho, inp["v_tailpipe"], inp["L_long_header"],
-        "propane", T_propane_cond, fp,
+        "propane", T_propane_cond, fp, f_darcy=f_darcy,
     )
     seg3["name"] = "Propane vapor header"
 
     seg4 = _duct_segment(
         m_dot_prop_lbs, sA.rho, inp["v_acc_header"], inp["L_acc_header"],
-        "propane", T_propane_cond, fp,
+        "propane", T_propane_cond, fp, f_darcy=f_darcy,
     )
     seg4["name"] = "Propane ACC distribution"
 
@@ -258,6 +295,113 @@ def calculate_duct_segments_b(states, prop_states, perf, inp, fp):
         "propane_header_diameter_in": seg3["diameter_in"],
         "total_vol_flow_ft3s": seg1["vol_flow_ft3s"],
         "propane_vol_flow_ft3s": seg3["vol_flow_ft3s"],
+    }
+
+
+# ---------------------------------------------------------------------------
+# Hydraulic penalty calculations
+# ---------------------------------------------------------------------------
+
+def calculate_hydraulic_penalty_a(duct, inp, T_cond, fp):
+    """
+    Config A hydraulic penalty: pipe friction + equipment dP.
+    Returns breakdown dict with per-component dP, dT, and totals.
+    """
+    segs = duct["segments"]
+    # Pipe friction dP from Darcy-Weisbach (segments 0=tailpipe, 1=long header)
+    pipe_dP_tailpipe = segs[0]["delta_P_psi"]
+    pipe_dP_header = segs[1]["delta_P_psi"]
+    pipe_dP_acc_dist = segs[2]["delta_P_psi"]
+    pipe_dP = pipe_dP_tailpipe + pipe_dP_header + pipe_dP_acc_dist
+
+    # Equipment dP from user inputs
+    dp_recup = inp.get("dp_recup_a", 0.3)
+    dp_acc_headers = inp.get("dp_acc_headers_a", 0.3)
+    dp_acc_tubes = inp.get("dp_acc_tubes_a", 0.5)
+    equip_dP = dp_recup + dp_acc_headers + dp_acc_tubes
+
+    total_dP = pipe_dP + equip_dP
+
+    # dT/dP sensitivity
+    dT_dP_val = calc_dT_dP("isopentane", T_cond, fp)
+    total_dT = total_dP * dT_dP_val
+
+    return {
+        "pipe_dP_psi": pipe_dP,
+        "equip_dP_psi": equip_dP,
+        "total_dP_psi": total_dP,
+        "dT_dP_FperPsi": dT_dP_val,
+        "total_dT_penalty_F": total_dT,
+        "components": {
+            "Tailpipe (D-W)": {"dP_psi": pipe_dP_tailpipe, "dT_F": pipe_dP_tailpipe * dT_dP_val, "type": "pipe"},
+            "Long header (D-W)": {"dP_psi": pipe_dP_header, "dT_F": pipe_dP_header * dT_dP_val, "type": "pipe"},
+            "ACC distribution (D-W)": {"dP_psi": pipe_dP_acc_dist, "dT_F": pipe_dP_acc_dist * dT_dP_val, "type": "pipe"},
+            "Recuperator": {"dP_psi": dp_recup, "dT_F": dp_recup * dT_dP_val, "type": "equipment"},
+            "ACC vapor headers": {"dP_psi": dp_acc_headers, "dT_F": dp_acc_headers * dT_dP_val, "type": "equipment"},
+            "ACC tube bundle": {"dP_psi": dp_acc_tubes, "dT_F": dp_acc_tubes * dT_dP_val, "type": "equipment"},
+        },
+        "fluid": "isopentane",
+    }
+
+
+def calculate_hydraulic_penalty_b(duct, inp, T_cond_iso, T_propane_cond, fp):
+    """
+    Config B hydraulic penalty: two decoupled circuits.
+    Isopentane side: all user inputs (short runs).
+    Propane side: pipe D-W + equipment inputs.
+    Returns breakdown dict with per-circuit and per-component details.
+    """
+    segs = duct["segments"]
+
+    # --- Isopentane side (all user inputs — short runs, direct control) ---
+    dp_tailpipe_iso = inp.get("dp_tailpipe_iso_b", 0.3)
+    dp_recup_b = inp.get("dp_recup_b", 0.3)
+    dp_ihx_iso = inp.get("dp_ihx_iso", 0.5)
+    iso_dP = dp_tailpipe_iso + dp_recup_b + dp_ihx_iso
+
+    dT_dP_iso = calc_dT_dP("isopentane", T_cond_iso, fp)
+    iso_dT = iso_dP * dT_dP_iso
+
+    # --- Propane side (pipe D-W + equipment inputs) ---
+    # Segments 2,3 are propane header and propane ACC distribution
+    pipe_dP_prop_header = segs[2]["delta_P_psi"]
+    pipe_dP_prop_acc_dist = segs[3]["delta_P_psi"]
+    pipe_dP_prop = pipe_dP_prop_header + pipe_dP_prop_acc_dist
+
+    dp_acc_tubes_prop = inp.get("dp_acc_tubes_prop", 1.0)
+    dp_ihx_prop = inp.get("dp_ihx_prop", 0.5)
+    equip_dP_prop = dp_acc_tubes_prop + dp_ihx_prop
+
+    prop_dP = pipe_dP_prop + equip_dP_prop
+
+    dT_dP_prop = calc_dT_dP("propane", T_propane_cond, fp)
+    prop_dT = prop_dP * dT_dP_prop
+
+    # Combined: propane penalty passes through 1:1
+    total_dT = iso_dT + prop_dT
+
+    return {
+        "iso_dP_psi": iso_dP,
+        "iso_dT_F": iso_dT,
+        "iso_dT_dP_FperPsi": dT_dP_iso,
+        "prop_pipe_dP_psi": pipe_dP_prop,
+        "prop_equip_dP_psi": equip_dP_prop,
+        "prop_dP_psi": prop_dP,
+        "prop_dT_F": prop_dT,
+        "prop_dT_dP_FperPsi": dT_dP_prop,
+        "total_dP_psi": iso_dP + prop_dP,
+        "total_dT_penalty_F": total_dT,
+        "components": {
+            "ISO tailpipe": {"dP_psi": dp_tailpipe_iso, "dT_F": dp_tailpipe_iso * dT_dP_iso, "type": "equipment", "circuit": "iso"},
+            "ISO recuperator": {"dP_psi": dp_recup_b, "dT_F": dp_recup_b * dT_dP_iso, "type": "equipment", "circuit": "iso"},
+            "IHX iso side": {"dP_psi": dp_ihx_iso, "dT_F": dp_ihx_iso * dT_dP_iso, "type": "equipment", "circuit": "iso"},
+            "Propane header (D-W)": {"dP_psi": pipe_dP_prop_header, "dT_F": pipe_dP_prop_header * dT_dP_prop, "type": "pipe", "circuit": "propane"},
+            "Propane ACC dist (D-W)": {"dP_psi": pipe_dP_prop_acc_dist, "dT_F": pipe_dP_prop_acc_dist * dT_dP_prop, "type": "pipe", "circuit": "propane"},
+            "ACC tube bundle (prop)": {"dP_psi": dp_acc_tubes_prop, "dT_F": dp_acc_tubes_prop * dT_dP_prop, "type": "equipment", "circuit": "propane"},
+            "IHX propane side": {"dP_psi": dp_ihx_prop, "dT_F": dp_ihx_prop * dT_dP_prop, "type": "equipment", "circuit": "propane"},
+        },
+        "fluid_iso": "isopentane",
+        "fluid_prop": "propane",
     }
 
 
@@ -521,16 +665,18 @@ def solve_config_a(inputs: dict, fp) -> dict:
         perf["T_cond"] = T_cond
 
         duct = calculate_duct_segments_a(states, perf, inp, fp)
-        new_penalty = duct["total_delta_T_cond_F"]
+        hydraulic = calculate_hydraulic_penalty_a(duct, inp, T_cond, fp)
+        new_penalty = hydraulic["total_dT_penalty_F"]
 
         if abs(new_penalty - dt_penalty) < 0.1:
             break
         dt_penalty = new_penalty
 
     perf["duct_penalty_F"] = dt_penalty
+    perf["hydraulic_penalty_F"] = dt_penalty
     perf["converged"] = abs(new_penalty - dt_penalty) < 0.1
 
-    return {"states": states, "performance": perf, "duct": duct}
+    return {"states": states, "performance": perf, "duct": duct, "hydraulic": hydraulic}
 
 
 def solve_config_b(inputs: dict, fp) -> dict:
@@ -615,13 +761,17 @@ def solve_config_b(inputs: dict, fp) -> dict:
 
         # Duct segments
         duct = calculate_duct_segments_b(states, prop_states, perf, inp, fp)
-        new_penalty = duct["total_delta_T_cond_F"]
+        hydraulic = calculate_hydraulic_penalty_b(duct, inp, T_cond_iso, T_propane_cond, fp)
+        new_penalty = hydraulic["total_dT_penalty_F"]
 
         if abs(new_penalty - dt_penalty) < 0.1:
             break
         dt_penalty = new_penalty
 
     perf["duct_penalty_F"] = dt_penalty
+    perf["hydraulic_penalty_F"] = dt_penalty
+    perf["iso_hydraulic_dT_F"] = hydraulic["iso_dT_F"]
+    perf["prop_hydraulic_dT_F"] = hydraulic["prop_dT_F"]
     perf["converged"] = abs(new_penalty - dt_penalty) < 0.1
 
     return {
@@ -629,6 +779,7 @@ def solve_config_b(inputs: dict, fp) -> dict:
         "propane_states": prop_states,
         "performance": perf,
         "duct": duct,
+        "hydraulic": hydraulic,
     }
 
 

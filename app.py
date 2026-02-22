@@ -15,11 +15,12 @@ import pandas as pd
 from fluid_properties import FluidProperties
 from thermodynamics import (
     solve_config_a, solve_config_b, verify_recuperator_pinch,
-    run_validation_checks, validate_inputs,
+    run_validation_checks, validate_inputs, calc_dT_dP,
 )
 from cost_model import (
     calculate_costs_a, calculate_costs_b, lifecycle_cost,
     optimize_approach_temp, construction_schedule_delta, simple_payback,
+    schedule_savings_npv, COST_FACTORS, U_VALUES,
 )
 
 st.set_page_config(page_title="ORC Comparator", layout="wide")
@@ -33,56 +34,73 @@ def get_fluid_props():
 fp = get_fluid_props()
 
 # ============================================================================
-# LAYOUT: Left (30%) + Right (70%)
+# PAGE TITLE
 # ============================================================================
 
-left_col, right_col = st.columns([3, 7])
+st.title("ORC Configuration Comparator")
+st.caption("Config A (Direct ACC) vs Config B (Propane Intermediate Loop) -- Geothermal Binary Cycle")
 
 # ============================================================================
-# LEFT COLUMN -- INPUTS
+# SIDEBAR -- INPUTS
 # ============================================================================
 
-with left_col:
-    st.header("ORC Comparator")
-    st.caption("Config A (Direct ACC) vs Config B (Propane Loop)")
+with st.sidebar:
+    st.header("Inputs")
 
-    with st.expander("Brine Inputs", expanded=True):
-        T_geo_in = st.number_input("Brine inlet temperature (degF)", 200, 400, 300, 5)
-        m_dot_geo = st.number_input("Brine mass flow rate (lb/s)", 10, 2000, 200, 10)
-        cp_brine = st.number_input("Brine specific heat (BTU/lb-degF)", 0.5, 1.5, 1.0, 0.05)
-        T_geo_out_min = st.number_input("Min brine outlet temperature (degF)", 80, 250, 160, 5,
-                                        help="Silica/scaling constraint")
+    with st.form("input_form"):
+        with st.expander("Brine Inputs", expanded=True):
+            T_geo_in = st.number_input("Brine inlet temperature (degF)", 200, 500, 300, 5)
+            m_dot_geo = st.number_input("Brine mass flow rate (lb/s)", 10, 2000, 200, 10)
+            cp_brine = st.number_input("Brine specific heat (BTU/lb-degF)", 0.5, 1.5, 1.0, 0.05)
+            T_geo_out_min = st.number_input("Min brine outlet temperature (degF)", 80, 250, 160, 5,
+                                            help="Silica/scaling constraint")
 
-    with st.expander("Cycle Parameters"):
-        eta_turbine = st.slider("Turbine isentropic efficiency", 0.60, 0.95, 0.82, 0.01)
-        eta_pump = st.slider("Pump isentropic efficiency", 0.50, 0.95, 0.75, 0.01)
-        superheat = st.number_input("Turbine inlet superheat (degF above sat)", 0, 50, 0, 1)
-        st.info("Isopentane circulation rate is solved from brine energy balance.")
+        with st.expander("Cycle Parameters"):
+            eta_turbine = st.slider("Turbine isentropic efficiency", 0.60, 0.95, 0.82, 0.01)
+            eta_pump = st.slider("Pump isentropic efficiency", 0.50, 0.95, 0.75, 0.01)
+            superheat = st.number_input("Turbine inlet superheat (degF above sat)", 0, 50, 0, 1)
+            st.info("Isopentane circulation rate is solved from brine energy balance.")
 
-    with st.expander("Ambient Conditions"):
-        T_ambient = st.number_input("Ambient dry bulb temperature (degF)", 50, 130, 95, 5)
+        with st.expander("Ambient Conditions"):
+            T_ambient = st.number_input("Ambient dry bulb temperature (degF)", 50, 130, 95, 5)
 
-    with st.expander("Pinch Points"):
-        dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)", 5, 50, 15, 1)
-        dt_pinch_acc_b = st.number_input("ACC pinch Config B (degF)", 5, 50, 15, 1)
-        dt_pinch_vaporizer = st.number_input("Vaporizer pinch (degF)", 3, 30, 10, 1)
-        dt_pinch_preheater = st.number_input("Preheater pinch (degF)", 3, 30, 10, 1)
-        dt_pinch_recup = st.number_input("Recuperator pinch (degF)", 5, 40, 15, 1)
-        dt_approach_intermediate = st.number_input(
-            "Intermediate HX approach (degF, Config B)", 5, 25, 10, 1)
+        with st.expander("Pinch Points"):
+            dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)", 5, 50, 15, 1)
+            dt_pinch_acc_b = st.number_input("ACC pinch Config B (degF)", 5, 50, 15, 1)
+            dt_pinch_vaporizer = st.number_input("Vaporizer pinch (degF)", 3, 30, 10, 1)
+            dt_pinch_preheater = st.number_input("Preheater pinch (degF)", 3, 30, 10, 1)
+            dt_pinch_recup = st.number_input("Recuperator pinch (degF)", 5, 40, 15, 1)
+            dt_approach_intermediate = st.number_input(
+                "Intermediate HX approach (degF, Config B)", 5, 25, 10, 1)
 
-    with st.expander("Duct Parameters"):
-        v_tailpipe = st.number_input("Tailpipe vapor velocity (ft/s)", 5, 25, 10, 1)
-        v_acc_header = st.number_input("ACC header vapor velocity (ft/s)", 5, 25, 15, 1)
-        L_tailpipe_a = st.number_input("Tailpipe length Config A (ft)", 10, 100, 30, 5)
-        L_long_header = st.number_input("Long vapor header length (ft)", 50, 500, 120, 10)
-        L_acc_header = st.number_input("ACC distribution header length (ft)", 50, 500, 200, 10)
+        with st.expander("Duct Parameters"):
+            v_tailpipe = st.number_input("Tailpipe vapor velocity (ft/s)", 5, 25, 10, 1)
+            v_acc_header = st.number_input("ACC header vapor velocity (ft/s)", 5, 25, 15, 1)
+            L_tailpipe_a = st.number_input("Tailpipe length Config A (ft)", 10, 100, 30, 5)
+            L_long_header = st.number_input("Long vapor header length (ft)", 50, 500, 120, 10)
+            L_acc_header = st.number_input("ACC distribution header length (ft)", 50, 500, 200, 10)
 
-    with st.expander("Economic Parameters"):
-        electricity_price = st.number_input("Electricity price ($/MWh)", 10, 200, 35, 5)
-        capacity_factor = st.slider("Capacity factor (%)", 70, 100, 95, 1)
-        discount_rate = st.slider("Discount rate (%)", 3, 15, 8, 1)
-        project_life = st.number_input("Plant life (years)", 10, 40, 30, 1)
+        with st.expander("Hydraulic Parameters"):
+            f_darcy = st.number_input("Darcy friction factor f", 0.015, 0.030, 0.020, 0.001, format="%.3f")
+            st.markdown("**Config A Equipment dP (psi)**")
+            dp_acc_tubes_a = st.number_input("ACC tube bundle dP", 0.0, 3.0, 0.5, 0.1, key="dp_acc_tubes_a")
+            dp_acc_headers_a = st.number_input("ACC vapor headers dP", 0.0, 3.0, 0.3, 0.1, key="dp_acc_headers_a")
+            dp_recup_a = st.number_input("Recuperator dP (A)", 0.0, 3.0, 0.3, 0.1, key="dp_recup_a")
+            st.markdown("**Config B Isopentane Side dP (psi)**")
+            dp_ihx_iso = st.number_input("IHX iso side dP", 0.0, 3.0, 0.5, 0.1, key="dp_ihx_iso")
+            dp_recup_b = st.number_input("Recuperator dP (B)", 0.0, 3.0, 0.3, 0.1, key="dp_recup_b")
+            dp_tailpipe_iso_b = st.number_input("ISO tailpipe dP (B)", 0.0, 3.0, 0.3, 0.1, key="dp_tailpipe_iso_b")
+            st.markdown("**Config B Propane Side dP (psi)**")
+            dp_acc_tubes_prop = st.number_input("ACC tube bundle dP (prop)", 0.0, 5.0, 1.0, 0.1, key="dp_acc_tubes_prop")
+            dp_ihx_prop = st.number_input("IHX propane side dP", 0.0, 3.0, 0.5, 0.1, key="dp_ihx_prop")
+
+        with st.expander("Economic Parameters"):
+            electricity_price = st.number_input("Electricity price ($/MWh)", 10, 200, 35, 5)
+            capacity_factor = st.slider("Capacity factor (%)", 70, 100, 95, 1)
+            discount_rate = st.slider("Discount rate (%)", 3, 15, 8, 1)
+            project_life = st.number_input("Plant life (years)", 10, 40, 30, 1)
+
+        submitted = st.form_submit_button("Run Calculation", type="primary", use_container_width=True)
 
 inputs = {
     "T_geo_in": T_geo_in,
@@ -108,13 +126,21 @@ inputs = {
     "discount_rate": discount_rate / 100,
     "project_life": project_life,
     "capacity_factor": capacity_factor / 100,
+    "f_darcy": f_darcy,
+    "dp_acc_tubes_a": dp_acc_tubes_a,
+    "dp_acc_headers_a": dp_acc_headers_a,
+    "dp_recup_a": dp_recup_a,
+    "dp_ihx_iso": dp_ihx_iso,
+    "dp_recup_b": dp_recup_b,
+    "dp_tailpipe_iso_b": dp_tailpipe_iso_b,
+    "dp_acc_tubes_prop": dp_acc_tubes_prop,
+    "dp_ihx_prop": dp_ihx_prop,
 }
 
 # Validate
 warns = validate_inputs(inputs)
 for w in warns:
-    with left_col:
-        st.warning(w)
+    st.sidebar.warning(w)
 
 # ============================================================================
 # SOLVE CYCLES
@@ -124,8 +150,7 @@ try:
     result_a = solve_config_a(inputs, fp)
     result_b = solve_config_b(inputs, fp)
 except Exception as e:
-    with left_col:
-        st.error(f"Cycle solver error: {e}")
+    st.error(f"Cycle solver error: {e}")
     st.stop()
 
 perf_a = result_a["performance"]
@@ -135,6 +160,23 @@ states_b = result_b["states"]
 prop_states = result_b["propane_states"]
 duct_a = result_a["duct"]
 duct_b = result_b["duct"]
+hydraulic_a = result_a["hydraulic"]
+hydraulic_b = result_b["hydraulic"]
+
+# Power sensitivity: perturb ACC pinch by +1 degF, re-solve each config
+try:
+    inp_pert_a = {**inputs, "dt_pinch_acc_a": inputs["dt_pinch_acc_a"] + 1}
+    result_a_pert = solve_config_a(inp_pert_a, fp)
+    dW_dT_a = perf_a["net_power_kw"] - result_a_pert["performance"]["net_power_kw"]  # kW per degF
+except Exception:
+    dW_dT_a = 0.0
+
+try:
+    inp_pert_b = {**inputs, "dt_pinch_acc_b": inputs["dt_pinch_acc_b"] + 1}
+    result_b_pert = solve_config_b(inp_pert_b, fp)
+    dW_dT_b = perf_b["net_power_kw"] - result_b_pert["performance"]["net_power_kw"]  # kW per degF
+except Exception:
+    dW_dT_b = 0.0
 
 # Costs
 costs_a = calculate_costs_a(states_a, perf_a, inputs, duct_a)
@@ -160,29 +202,36 @@ payback_yrs = simple_payback(
     perf_a["net_power_kw"], perf_b["net_power_kw"], inputs
 )
 
+# NPV of schedule savings
+sched_npv = schedule_savings_npv(sched_info, perf_b["net_power_kw"], inputs)
+
 # Volumetric flow ratio
 vol_a = duct_a["total_vol_flow_ft3s"]
 vol_b = duct_b.get("propane_vol_flow_ft3s", duct_b["total_vol_flow_ft3s"])
 vol_ratio = vol_a / vol_b if vol_b > 0 else float("inf")
 
-# ============================================================================
-# LEFT COLUMN -- EXECUTIVE SUMMARY CARD
-# ============================================================================
+# Total economic advantage: NPV delta + schedule NPV
+npv_delta = lc_b["net_npv"] - lc_a["net_npv"]
+total_economic_advantage = npv_delta + sched_npv
 
 
-def _color_cell(val_a, val_b, lower_better=True):
-    """Return (color_a, color_b) -- green for better, red for worse."""
+# ============================================================================
+# HELPERS
+# ============================================================================
+
+def _winner(val_a, val_b, lower_better=True):
+    """Return winner string."""
     if lower_better:
-        if val_a < val_b:
-            return "green", "red"
-        elif val_b < val_a:
-            return "red", "green"
+        if val_a < val_b - 0.001:
+            return "A"
+        elif val_b < val_a - 0.001:
+            return "B"
     else:
-        if val_a > val_b:
-            return "green", "red"
-        elif val_b > val_a:
-            return "red", "green"
-    return "gray", "gray"
+        if val_a > val_b + 0.001:
+            return "A"
+        elif val_b > val_a + 0.001:
+            return "B"
+    return "Tie"
 
 
 def _fmt(val, fmt_str=".1f", prefix="", suffix=""):
@@ -192,80 +241,222 @@ def _fmt(val, fmt_str=".1f", prefix="", suffix=""):
         return str(val)
 
 
-with left_col:
-    st.subheader("Executive Summary")
+def _color_winner(winner):
+    if winner == "A":
+        return ":blue[**A**]"
+    elif winner == "B":
+        return ":red[**B**]"
+    return "Tie"
 
-    # Build table rows: (label, val_a, val_b, lower_better)
-    rows = []
 
-    # -- Thermodynamic Performance --
-    rows.append(("**Thermodynamic Performance**", "", "", None))
-    rows.append(("Net power output (kW)", perf_a["net_power_kw"], perf_b["net_power_kw"], False))
-    rows.append(("Gross turbine power (kW)", perf_a["gross_power_kw"], perf_b["gross_power_kw"], False))
-    rows.append(("Cycle thermal efficiency (%)", perf_a["eta_thermal"]*100, perf_b["eta_thermal"]*100, False))
-    rows.append(("Brine effectiveness (kW/lb/s)", perf_a["brine_effectiveness"], perf_b["brine_effectiveness"], False))
-    rows.append(("Iso circulation rate (lb/s)", perf_a["m_dot_iso"]/3600, perf_b["m_dot_iso"]/3600, None))
-    rows.append(("Iso condensing pressure (psia)", perf_a["P_low"], perf_b.get("P_low_iso", perf_b["P_low"]), None))
-    rows.append(("Turbine pressure ratio", perf_a["pressure_ratio"], perf_b.get("pressure_ratio_iso", perf_b["pressure_ratio"]), None))
-    rows.append(("Heat rejection duty (MMBtu/hr)", perf_a["Q_reject_mmbtu_hr"], perf_b["Q_reject_mmbtu_hr"], True))
-    rows.append(("Recuperator duty (MMBtu/hr)", perf_a["Q_recup_mmbtu_hr"], perf_b["Q_recup_mmbtu_hr"], None))
+# ============================================================================
+# SECTION 1: EXECUTIVE SUMMARY
+# ============================================================================
 
-    # -- Physical Scale --
-    rows.append(("**Physical Scale**", "", "", None))
-    rows.append(("Tailpipe diameter (in)", duct_a["tailpipe_diameter_in"], duct_b["tailpipe_diameter_in"], True))
-    rows.append(("ACC vapor header diameter (in)", duct_a["acc_header_diameter_in"], duct_b["acc_header_diameter_in"], True))
-    rows.append(("Vapor volumetric flow (ft3/s)", vol_a, vol_b, True))
+st.header("Executive Summary")
 
-    # -- Economics --
-    rows.append(("**Economics**", "", "", None))
-    rows.append(("Total installed cost ($MM)", costs_a["total_installed"]/1e6, costs_b["total_installed"]/1e6, True))
-    rows.append(("Specific capital cost ($/kW)", lc_a["specific_cost_per_kw"], lc_b["specific_cost_per_kw"], True))
-    rows.append(("Net NPV ($MM)", lc_a["net_npv"]/1e6, lc_b["net_npv"]/1e6, False))
-    rows.append(("LCOE ($/MWh)", lc_a["lcoe"], lc_b["lcoe"], True))
+# Build comparison rows: (label, val_a, val_b, fmt, lower_better_or_None)
+summary_rows = []
 
-    # Build markdown table
-    table_md = "| Metric | Config A | Config B |\n|--------|----------|----------|\n"
-    for label, va, vb, lower_better in rows:
-        if lower_better is None:
-            # Header row or neutral
-            if isinstance(va, str) and va == "":
-                table_md += f"| {label} | | |\n"
-            else:
-                table_md += f"| {label} | {_fmt(va)} | {_fmt(vb)} |\n"
-        else:
-            ca, cb = _color_cell(va, vb, lower_better)
-            table_md += f"| {label} | :{ca}[**{_fmt(va)}**] | :{cb}[**{_fmt(vb)}**] |\n"
+# -- Power Performance --
+summary_rows.append(("group", "Power Performance", "", "", "", "", ""))
+summary_rows.append(("row", "Net power output",
+                      _fmt(perf_a["net_power_kw"], ".0f"), "kW",
+                      _fmt(perf_b["net_power_kw"], ".0f"), "kW",
+                      _winner(perf_a["net_power_kw"], perf_b["net_power_kw"], lower_better=False)))
+summary_rows.append(("row", "Gross turbine power",
+                      _fmt(perf_a["gross_power_kw"], ".0f"), "kW",
+                      _fmt(perf_b["gross_power_kw"], ".0f"), "kW",
+                      _winner(perf_a["gross_power_kw"], perf_b["gross_power_kw"], lower_better=False)))
+summary_rows.append(("row", "Cycle thermal efficiency",
+                      _fmt(perf_a["eta_thermal"]*100, ".1f"), "%",
+                      _fmt(perf_b["eta_thermal"]*100, ".1f"), "%",
+                      _winner(perf_a["eta_thermal"], perf_b["eta_thermal"], lower_better=False)))
+summary_rows.append(("row", "Brine effectiveness",
+                      _fmt(perf_a["brine_effectiveness"], ".2f"), "kW/(lb/s)",
+                      _fmt(perf_b["brine_effectiveness"], ".2f"), "kW/(lb/s)",
+                      _winner(perf_a["brine_effectiveness"], perf_b["brine_effectiveness"], lower_better=False)))
+summary_rows.append(("row", "Heat rejection duty",
+                      _fmt(perf_a["Q_reject_mmbtu_hr"], ".2f"), "MMBtu/hr",
+                      _fmt(perf_b["Q_reject_mmbtu_hr"], ".2f"), "MMBtu/hr",
+                      _winner(perf_a["Q_reject_mmbtu_hr"], perf_b["Q_reject_mmbtu_hr"], lower_better=True)))
 
-    # Vol ratio highlight
-    table_md += f"| **Vol flow ratio (A/B)** | | **{vol_ratio:.1f}x** |\n"
+# -- Physical Scale --
+summary_rows.append(("group", "Physical Scale", "", "", "", "", ""))
+summary_rows.append(("row", "Tailpipe diameter",
+                      _fmt(duct_a["tailpipe_diameter_in"], ".0f"), "in",
+                      _fmt(duct_b["tailpipe_diameter_in"], ".0f"), "in",
+                      _winner(duct_a["tailpipe_diameter_in"], duct_b["tailpipe_diameter_in"], lower_better=True)))
+summary_rows.append(("row", "ACC header diameter",
+                      _fmt(duct_a["acc_header_diameter_in"], ".0f"), "in",
+                      _fmt(duct_b["acc_header_diameter_in"], ".0f"), "in",
+                      _winner(duct_a["acc_header_diameter_in"], duct_b["acc_header_diameter_in"], lower_better=True)))
+summary_rows.append(("row", "Vapor vol. flow",
+                      _fmt(vol_a, ".0f"), "ft3/s",
+                      _fmt(vol_b, ".0f"), "ft3/s",
+                      _winner(vol_a, vol_b, lower_better=True)))
+summary_rows.append(("row", "Vol. flow ratio (A/B)",
+                      "", "",
+                      _fmt(vol_ratio, ".1f"), "x",
+                      ""))
 
-    # Payback
-    payback_str = f"{payback_yrs:.1f} years" if payback_yrs is not None and payback_yrs < 1e6 else "N/A"
-    table_md += f"| Simple payback on cost delta | | {payback_str} |\n"
+hyd_penalty_a = hydraulic_a["total_dT_penalty_F"]
+hyd_penalty_b = hydraulic_b["total_dT_penalty_F"]
+net_hyd_advantage = hyd_penalty_a - hyd_penalty_b
+power_from_hyd = net_hyd_advantage * dW_dT_a if net_hyd_advantage > 0 else net_hyd_advantage * dW_dT_b
 
-    # Construction schedule
-    if sched_delta < 0:
-        sched_str = f"**{abs(sched_delta)} weeks faster**"
-    elif sched_delta > 0:
-        sched_str = f"+{sched_delta} weeks slower"
+summary_rows.append(("row", "Total hydraulic penalty",
+                      _fmt(hyd_penalty_a, ".2f"), "degF",
+                      _fmt(hyd_penalty_b, ".2f"), "degF",
+                      _winner(hyd_penalty_a, hyd_penalty_b, lower_better=True)))
+summary_rows.append(("row", "Net hydraulic advantage (B)",
+                      "", "",
+                      _fmt(net_hyd_advantage, ".2f"), "degF",
+                      "B" if net_hyd_advantage > 0 else ("A" if net_hyd_advantage < 0 else "Tie")))
+summary_rows.append(("row", "Power from lower backpressure",
+                      "", "",
+                      _fmt(abs(power_from_hyd), ".0f"), "kW",
+                      "B" if power_from_hyd > 0 else ("A" if power_from_hyd < 0 else "Tie")))
+
+# -- Capital Cost --
+summary_rows.append(("group", "Capital Cost", "", "", "", "", ""))
+summary_rows.append(("row", "Total installed cost",
+                      _fmt(costs_a["total_installed"]/1e6, ".2f"), "$MM",
+                      _fmt(costs_b["total_installed"]/1e6, ".2f"), "$MM",
+                      _winner(costs_a["total_installed"], costs_b["total_installed"], lower_better=True)))
+summary_rows.append(("row", "Specific capital cost",
+                      _fmt(lc_a["specific_cost_per_kw"], ".0f"), "$/kW",
+                      _fmt(lc_b["specific_cost_per_kw"], ".0f"), "$/kW",
+                      _winner(lc_a["specific_cost_per_kw"], lc_b["specific_cost_per_kw"], lower_better=True)))
+summary_rows.append(("row", "Equipment count",
+                      str(costs_a["equipment_count"]), "",
+                      str(costs_b["equipment_count"]), "",
+                      _winner(costs_a["equipment_count"], costs_b["equipment_count"], lower_better=True)))
+
+# -- Economics --
+summary_rows.append(("group", "Economics", "", "", "", "", ""))
+summary_rows.append(("row", "Net NPV",
+                      _fmt(lc_a["net_npv"]/1e6, ".2f"), "$MM",
+                      _fmt(lc_b["net_npv"]/1e6, ".2f"), "$MM",
+                      _winner(lc_a["net_npv"], lc_b["net_npv"], lower_better=False)))
+summary_rows.append(("row", "LCOE",
+                      _fmt(lc_a["lcoe"], ".1f"), "$/MWh",
+                      _fmt(lc_b["lcoe"], ".1f"), "$/MWh",
+                      _winner(lc_a["lcoe"], lc_b["lcoe"], lower_better=True)))
+
+payback_str = f"{payback_yrs:.1f}" if payback_yrs is not None and payback_yrs < 1e6 else "N/A"
+summary_rows.append(("row", "Simple payback on cost delta",
+                      "", "",
+                      payback_str, "yr",
+                      ""))
+
+summary_rows.append(("row", "NPV of schedule savings",
+                      "", "",
+                      _fmt(sched_npv/1e3, ".0f"), "$k",
+                      ""))
+
+total_adv_str = _fmt(total_economic_advantage/1e6, ".2f")
+adv_winner = "B" if total_economic_advantage > 0 else ("A" if total_economic_advantage < 0 else "Tie")
+summary_rows.append(("row", "Total economic advantage",
+                      "", "",
+                      total_adv_str, "$MM",
+                      adv_winner))
+
+# -- Schedule --
+summary_rows.append(("group", "Schedule", "", "", "", "", ""))
+if sched_delta < 0:
+    sched_str = f"{abs(sched_delta)} weeks faster"
+    sched_winner_val = "B"
+elif sched_delta > 0:
+    sched_str = f"+{sched_delta} weeks slower"
+    sched_winner_val = "A"
+else:
+    sched_str = "Same"
+    sched_winner_val = "Tie"
+summary_rows.append(("row", "Schedule delta (B vs A)",
+                      "", "",
+                      sched_str, "",
+                      sched_winner_val))
+
+# -- Validation --
+all_a_pass = all(passed for _, passed, _ in checks_a)
+all_b_pass = all(passed for _, passed, _ in checks_b)
+summary_rows.append(("group", "Validation", "", "", "", "", ""))
+summary_rows.append(("row", "Config A checks",
+                      "PASS" if all_a_pass else "FAIL", "",
+                      "", "",
+                      ""))
+summary_rows.append(("row", "Config B checks",
+                      "", "",
+                      "PASS" if all_b_pass else "FAIL", "",
+                      ""))
+
+# Render as markdown table
+table_md = "| Metric | Config A | Config B | Delta (B-A) | Winner |\n"
+table_md += "|--------|----------|----------|-------------|--------|\n"
+
+for row in summary_rows:
+    rtype = row[0]
+    if rtype == "group":
+        table_md += f"| **{row[1]}** | | | | |\n"
     else:
-        sched_str = "Same"
-    table_md += f"| **Schedule delta (Config B vs A)** | | {sched_str} |\n"
-    table_md += f"| Equipment item count | {costs_a['equipment_count']} | {costs_b['equipment_count']} |\n"
+        label = row[1]
+        va_str = f"{row[2]} {row[3]}".strip() if row[2] else ""
+        vb_str = f"{row[4]} {row[5]}".strip() if row[4] else ""
 
-    # Winner callout
-    perf_winner = "A" if perf_a["net_power_kw"] >= perf_b["net_power_kw"] else "B"
-    cost_winner = "A" if costs_a["total_installed"] <= costs_b["total_installed"] else "B"
-    sched_winner = "A" if sched_delta >= 0 else "B"
-    table_md += f"| **Winner** | Perf: **{perf_winner}** | Cost: **{cost_winner}** / Sched: **{sched_winner}** |\n"
+        # Compute delta for numeric rows
+        delta_str = ""
+        try:
+            va_num = float(row[2].replace(",", ""))
+            vb_num = float(row[4].replace(",", ""))
+            d = vb_num - va_num
+            unit = row[3] or row[5]
+            if abs(d) < 0.005:
+                delta_str = "0"
+            elif d > 0:
+                delta_str = f"+{d:.1f} {unit}".strip()
+            else:
+                delta_str = f"{d:.1f} {unit}".strip()
+        except (ValueError, IndexError):
+            delta_str = ""
 
-    st.markdown(table_md)
+        winner = row[6]
+        winner_display = _color_winner(winner) if winner else ""
 
-    # Schedule breakdown detail
-    with st.expander("Schedule Breakdown"):
-        si = sched_info
-        st.markdown(f"""
-**Config B savings** (tailpipe = {si['tailpipe_diameter_in']:.0f}\"):
+        table_md += f"| {label} | {va_str} | {vb_str} | {delta_str} | {winner_display} |\n"
+
+st.markdown(table_md)
+
+# Auto-generated summary sentence
+power_winner = "A" if perf_a["net_power_kw"] >= perf_b["net_power_kw"] else "B"
+cost_winner = "A" if costs_a["total_installed"] <= costs_b["total_installed"] else "B"
+power_diff_kw = abs(perf_a["net_power_kw"] - perf_b["net_power_kw"])
+cost_diff_mm = abs(costs_a["total_installed"] - costs_b["total_installed"]) / 1e6
+
+summary_sentence = (
+    f"Config **{power_winner}** produces **{power_diff_kw:.0f} kW** more net power. "
+    f"Config **{cost_winner}** costs **${cost_diff_mm:.2f}MM** less to build. "
+)
+if sched_delta < 0:
+    summary_sentence += f"Config B is **{abs(sched_delta)} weeks** faster to construct"
+    if sched_npv > 0:
+        summary_sentence += f" (NPV of early revenue: **${sched_npv/1e3:.0f}k**)"
+    summary_sentence += ". "
+elif sched_delta > 0:
+    summary_sentence += f"Config A is **{sched_delta} weeks** faster to construct. "
+
+if total_economic_advantage > 0:
+    summary_sentence += f"Total economic advantage for B: **${total_economic_advantage/1e6:.2f}MM**."
+elif total_economic_advantage < 0:
+    summary_sentence += f"Total economic advantage for A: **${abs(total_economic_advantage)/1e6:.2f}MM**."
+
+st.markdown(summary_sentence)
+
+# Schedule breakdown detail
+with st.expander("Schedule Breakdown"):
+    si = sched_info
+    st.markdown(f"""
+**Config B savings** (tailpipe = {si['tailpipe_diameter_in']:.0f}"):
 - Duct fabrication & erection: **-{si['duct_fab_savings']} weeks**
 - Welding vs flanged connections: **-{si['weld_savings']} weeks**
 - Structural steel: **-{si['steel_savings']} weeks**
@@ -280,409 +471,729 @@ with left_col:
 **Net: {si['net_delta']:+d} weeks** ({sched_str})
 """)
 
-
-    # Validation checks
-    with st.expander("Validation Checks"):
+# Validation checks detail
+with st.expander("Validation Checks"):
+    col_chk_a, col_chk_b = st.columns(2)
+    with col_chk_a:
+        st.markdown("**Config A**")
         for name, passed, detail in checks_a:
             icon = "PASS" if passed else "FAIL"
             color = "green" if passed else "red"
-            st.markdown(f":{color}[{icon}] **A**: {name} -- {detail}")
+            st.markdown(f":{color}[{icon}] {name} -- {detail}")
+    with col_chk_b:
+        st.markdown("**Config B**")
         for name, passed, detail in checks_b:
             icon = "PASS" if passed else "FAIL"
             color = "green" if passed else "red"
-            st.markdown(f":{color}[{icon}] **B**: {name} -- {detail}")
+            st.markdown(f":{color}[{icon}] {name} -- {detail}")
 
-    # Calibration warning
-    gross_mw_a = perf_a["gross_power_kw"] / 1000
-    if gross_mw_a > 0:
-        scale_a = 50.0 / gross_mw_a
-        scaled_tp_a = duct_a["tailpipe_diameter_in"] * (scale_a ** 0.5)
-        if abs(scaled_tp_a - 80) / 80 > 0.20:
-            st.warning(f"Calibration: At 50 MW scale, Config A tailpipe would be ~{scaled_tp_a:.0f}\" (benchmark 80\")")
-
-    gross_mw_b = perf_b["gross_power_kw"] / 1000
-    if gross_mw_b > 0 and "propane_header_diameter_in" in duct_b:
-        scale_b = 50.0 / gross_mw_b
-        scaled_prop_b = duct_b["propane_header_diameter_in"] * (scale_b ** 0.5)
-        if abs(scaled_prop_b - 34) / 34 > 0.20:
-            st.warning(f"Calibration: At 50 MW scale, Config B propane header would be ~{scaled_prop_b:.0f}\" (benchmark 34\")")
 
 # ============================================================================
-# RIGHT COLUMN -- TABBED CHARTS
+# SECTION 2: COST WATERFALL CHARTS
 # ============================================================================
 
-with right_col:
-    tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
-        "T-s Diagram", "Duct Comparison", "Approach dT Sweep",
-        "Cost Waterfall", "Brine Utilization", "Sensitivity Tornado",
-    ])
+st.header("Cost Breakdown")
 
-    # -- Tab 1: T-s Diagram ---------------------------------------------------
-    with tab1:
-        fig_ts = go.Figure()
+comp_list = [
+    ("Turbine/Generator", "turbine_generator"),
+    ("Isopentane Pump", "iso_pump"),
+    ("Vaporizer", "vaporizer"),
+    ("Preheater", "preheater"),
+    ("Recuperator", "recuperator"),
+    ("Air-Cooled Condensers", "acc"),
+    ("Vapor Ductwork", "ductwork"),
+    ("Intermediate HX", "intermediate_hx"),
+    ("Propane Pump", "propane_pump"),
+    ("Propane Loop Piping", "propane_loop_piping"),
+]
 
-        # Saturation dome
+comp_names = [c[0] for c in comp_list]
+vals_a = [costs_a[c[1]] / 1e6 for c in comp_list]
+vals_b = [costs_b[c[1]] / 1e6 for c in comp_list]
+deltas = [vb - va for va, vb in zip(vals_a, vals_b)]
+
+wf_col1, wf_col2 = st.columns(2)
+
+# Config A waterfall
+with wf_col1:
+    fig_wf_a = go.Figure(go.Waterfall(
+        name="Config A",
+        orientation="v",
+        x=comp_names + ["Total"],
+        y=vals_a + [None],
+        measure=["relative"] * len(vals_a) + ["total"],
+        connector=dict(line=dict(color="rgb(63, 63, 63)")),
+        increasing=dict(marker=dict(color="steelblue")),
+        totals=dict(marker=dict(color="darkblue")),
+        text=[f"${v:.2f}M" for v in vals_a] + [f"${costs_a['total_installed']/1e6:.2f}M"],
+        textposition="outside",
+    ))
+    fig_wf_a.update_layout(
+        title="Config A Installed Cost ($MM)",
+        yaxis_title="Cost ($MM)",
+        height=450,
+        showlegend=False,
+    )
+    st.plotly_chart(fig_wf_a, width="stretch")
+
+# Config B waterfall
+with wf_col2:
+    fig_wf_b = go.Figure(go.Waterfall(
+        name="Config B",
+        orientation="v",
+        x=comp_names + ["Total"],
+        y=vals_b + [None],
+        measure=["relative"] * len(vals_b) + ["total"],
+        connector=dict(line=dict(color="rgb(63, 63, 63)")),
+        increasing=dict(marker=dict(color="indianred")),
+        totals=dict(marker=dict(color="darkred")),
+        text=[f"${v:.2f}M" for v in vals_b] + [f"${costs_b['total_installed']/1e6:.2f}M"],
+        textposition="outside",
+    ))
+    fig_wf_b.update_layout(
+        title="Config B Installed Cost ($MM)",
+        yaxis_title="Cost ($MM)",
+        height=450,
+        showlegend=False,
+    )
+    st.plotly_chart(fig_wf_b, width="stretch")
+
+# Delta chart (full width)
+delta_colors = ["green" if d < 0 else "goldenrod" for d in deltas]
+fig_delta = go.Figure(go.Bar(
+    x=comp_names,
+    y=deltas,
+    marker_color=delta_colors,
+    text=[f"{d:+.2f}M" for d in deltas],
+    textposition="outside",
+))
+fig_delta.update_layout(
+    title="Cost Delta (Config B - Config A, $MM) -- Green = B saves money",
+    yaxis_title="Delta ($MM)",
+    height=400,
+)
+st.plotly_chart(fig_delta, width="stretch")
+
+# Duct segment cost breakdown
+with st.expander("Duct Segment Cost Detail"):
+    from cost_model import _duct_segment_cost
+    duct_seg_data = []
+    for seg in duct_a["segments"]:
+        duct_seg_data.append({"Config": "A", "Segment": seg["name"],
+                              "Diameter (in)": f"{seg['diameter_in']:.1f}",
+                              "Length (ft)": f"{seg['length_ft']:.0f}",
+                              "Cost ($)": f"${_duct_segment_cost(seg):,.0f}"})
+    for seg in duct_b["segments"]:
+        duct_seg_data.append({"Config": "B", "Segment": seg["name"],
+                              "Diameter (in)": f"{seg['diameter_in']:.1f}",
+                              "Length (ft)": f"{seg['length_ft']:.0f}",
+                              "Cost ($)": f"${_duct_segment_cost(seg):,.0f}"})
+    st.dataframe(pd.DataFrame(duct_seg_data).set_index("Config"), width="stretch")
+
+
+# ============================================================================
+# SECTION 3: POWER OUTPUT COMPARISON
+# ============================================================================
+
+st.header("Power Output Comparison")
+
+fig_power = make_subplots(specs=[[{"secondary_y": True}]])
+
+# Bar chart: gross and net power
+categories = ["Gross Power", "Net Power"]
+power_a_vals = [perf_a["gross_power_kw"], perf_a["net_power_kw"]]
+power_b_vals = [perf_b["gross_power_kw"], perf_b["net_power_kw"]]
+
+fig_power.add_trace(
+    go.Bar(x=categories, y=power_a_vals, name="Config A", marker_color="steelblue"),
+    secondary_y=False,
+)
+fig_power.add_trace(
+    go.Bar(x=categories, y=power_b_vals, name="Config B", marker_color="indianred"),
+    secondary_y=False,
+)
+
+# Efficiency line on secondary axis
+eta_categories = ["Config A", "Config B"]
+eta_vals = [perf_a["eta_thermal"]*100, perf_b["eta_thermal"]*100]
+fig_power.add_trace(
+    go.Scatter(x=eta_categories, y=eta_vals, name="Thermal Efficiency",
+               mode="lines+markers", marker=dict(size=12, color="orange"),
+               line=dict(color="orange", width=2, dash="dot")),
+    secondary_y=True,
+)
+
+fig_power.update_layout(
+    title="Power Output and Thermal Efficiency",
+    barmode="group",
+    height=450,
+)
+fig_power.update_yaxes(title_text="Power (kW)", secondary_y=False)
+fig_power.update_yaxes(title_text="Thermal Efficiency (%)", secondary_y=True)
+
+st.plotly_chart(fig_power, width="stretch")
+
+# Key metrics below chart
+pwr_col1, pwr_col2, pwr_col3, pwr_col4 = st.columns(4)
+pwr_col1.metric("Net Power A", f"{perf_a['net_power_kw']:.0f} kW")
+pwr_col2.metric("Net Power B", f"{perf_b['net_power_kw']:.0f} kW")
+pwr_col3.metric("Delta (B-A)", f"{perf_b['net_power_kw'] - perf_a['net_power_kw']:.0f} kW")
+pwr_col4.metric("Vol. Flow Ratio (A/B)", f"{vol_ratio:.1f}x")
+
+
+# ============================================================================
+# SECTION 4: TECHNICAL CHARTS (TABS)
+# ============================================================================
+
+st.header("Technical Analysis")
+
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+    "T-s Diagram", "Duct Sizing", "Approach Optimization",
+    "Brine Utilization", "Sensitivity Analysis", "Hydraulic Analysis",
+])
+
+# -- Tab 1: T-s Diagram ---------------------------------------------------
+with tab1:
+    fig_ts = go.Figure()
+
+    # Saturation dome
+    try:
+        T_dome = np.linspace(60, states_a["1"].T + 30, 60)
+        s_f_dome, s_g_dome, T_f_dome = [], [], []
+        for T in T_dome:
+            try:
+                sat = fp.saturation_props("isopentane", T=T)
+                s_f_dome.append(sat["s_f"])
+                s_g_dome.append(sat["s_g"])
+                T_f_dome.append(sat["T_sat"])
+            except Exception:
+                pass
+        s_dome = s_f_dome + s_g_dome[::-1]
+        T_dome_plot = T_f_dome + T_f_dome[::-1]
+        fig_ts.add_trace(go.Scatter(
+            x=s_dome, y=T_dome_plot, mode="lines",
+            name="Sat Dome (Isopentane)", line=dict(color="lightgray", width=1),
+            fill="toself", fillcolor="rgba(200,200,200,0.15)",
+        ))
+    except Exception:
+        pass
+
+    # Config A cycle
+    pts = ["1", "2", "3", "4", "5", "6", "7", "1"]
+    s_a = [states_a[p].s for p in pts]
+    T_a = [states_a[p].T for p in pts]
+    fig_ts.add_trace(go.Scatter(
+        x=s_a, y=T_a, mode="lines+markers",
+        name="Config A", line=dict(color="blue", width=2.5),
+        marker=dict(size=8),
+    ))
+
+    # Config B cycle
+    s_b = [states_b[p].s for p in pts]
+    T_b = [states_b[p].T for p in pts]
+    fig_ts.add_trace(go.Scatter(
+        x=s_b, y=T_b, mode="lines+markers",
+        name="Config B", line=dict(color="red", width=2.5, dash="dash"),
+        marker=dict(size=8),
+    ))
+
+    # State point labels
+    for label, st_pt in states_a.items():
+        fig_ts.add_annotation(
+            x=st_pt.s, y=st_pt.T, text=label,
+            showarrow=True, arrowhead=2, ax=15, ay=-15,
+            font=dict(color="blue", size=10),
+        )
+
+    # Condensing lines
+    fig_ts.add_hline(y=perf_a["T_cond"], line_dash="dot", line_color="blue",
+                     annotation_text=f"A cond: {perf_a['T_cond']:.0f}degF")
+    fig_ts.add_hline(y=perf_b["T_cond_iso"], line_dash="dot", line_color="red",
+                     annotation_text=f"B cond: {perf_b['T_cond_iso']:.0f}degF")
+
+    fig_ts.update_layout(
+        title="T-s Diagram -- Isopentane ORC Cycles",
+        xaxis_title="Entropy s (BTU/lb-R)",
+        yaxis_title="Temperature T (degF)",
+        legend=dict(x=0.01, y=0.99),
+        height=550,
+    )
+    st.plotly_chart(fig_ts, width="stretch")
+
+# -- Tab 2: Duct Sizing ---------------------------------------------------
+with tab2:
+    fig_duct = make_subplots(rows=2, cols=1,
+                             subplot_titles=["Duct Diameters by Segment",
+                                             "Volumetric Flow Rates by Segment"],
+                             vertical_spacing=0.15)
+
+    seg_names_a = [s["name"] for s in duct_a["segments"]]
+    seg_dia_a = [s["diameter_in"] for s in duct_a["segments"]]
+    seg_vol_a = [s["vol_flow_ft3s"] for s in duct_a["segments"]]
+
+    seg_names_b = [s["name"] for s in duct_b["segments"]]
+    seg_dia_b = [s["diameter_in"] for s in duct_b["segments"]]
+    seg_vol_b = [s["vol_flow_ft3s"] for s in duct_b["segments"]]
+
+    all_names = list(dict.fromkeys(seg_names_a + seg_names_b))
+    dia_a_padded = [seg_dia_a[seg_names_a.index(n)] if n in seg_names_a else 0 for n in all_names]
+    dia_b_padded = [seg_dia_b[seg_names_b.index(n)] if n in seg_names_b else 0 for n in all_names]
+    vol_a_padded = [seg_vol_a[seg_names_a.index(n)] if n in seg_names_a else 0 for n in all_names]
+    vol_b_padded = [seg_vol_b[seg_names_b.index(n)] if n in seg_names_b else 0 for n in all_names]
+
+    fig_duct.add_trace(go.Bar(x=all_names, y=dia_a_padded, name="Config A",
+                              marker_color="steelblue"), row=1, col=1)
+    fig_duct.add_trace(go.Bar(x=all_names, y=dia_b_padded, name="Config B",
+                              marker_color="indianred"), row=1, col=1)
+
+    fig_duct.add_hline(y=80, line_dash="dash", line_color="orange",
+                       annotation_text="80\" ref", row=1, col=1)
+    fig_duct.add_hline(y=66, line_dash="dash", line_color="gray",
+                       annotation_text="66\" ref", row=1, col=1)
+
+    fig_duct.add_trace(go.Bar(x=all_names, y=vol_a_padded, name="Config A",
+                              marker_color="steelblue", showlegend=False), row=2, col=1)
+    fig_duct.add_trace(go.Bar(x=all_names, y=vol_b_padded, name="Config B",
+                              marker_color="indianred", showlegend=False), row=2, col=1)
+
+    fig_duct.update_layout(
+        title=f"Vapor Duct Sizing -- Config A vs Config B (Vol ratio: {vol_ratio:.1f}x)",
+        barmode="group", height=700,
+    )
+    fig_duct.update_yaxes(title_text="Diameter (inches)", row=1, col=1)
+    fig_duct.update_yaxes(title_text="Vol Flow (ft3/s)", row=2, col=1)
+
+    st.plotly_chart(fig_duct, width="stretch")
+
+    # Segment detail table
+    seg_table = []
+    for seg in duct_a["segments"]:
+        seg_table.append({
+            "Config": "A", "Segment": seg["name"],
+            "Diameter (in)": f"{seg['diameter_in']:.1f}",
+            "Velocity (ft/s)": f"{seg['velocity_fps']:.0f}",
+            "dP (psia)": f"{seg['delta_P_psi']:.4f}",
+            "dT penalty (degF)": f"{seg['delta_T_cond_F']:.2f}",
+        })
+    for seg in duct_b["segments"]:
+        seg_table.append({
+            "Config": "B", "Segment": seg["name"],
+            "Diameter (in)": f"{seg['diameter_in']:.1f}",
+            "Velocity (ft/s)": f"{seg['velocity_fps']:.0f}",
+            "dP (psia)": f"{seg['delta_P_psi']:.4f}",
+            "dT penalty (degF)": f"{seg['delta_T_cond_F']:.2f}",
+        })
+    st.dataframe(pd.DataFrame(seg_table).set_index("Config"), width="stretch")
+
+# -- Tab 3: Approach dT Sweep ----------------------------------------------
+with tab3:
+    with st.spinner("Running approach temperature sweep..."):
+        opt_result = optimize_approach_temp(inputs, fp)
+
+    sweep = opt_result["sweep"]
+    dts = [s["dt_approach"] for s in sweep]
+    powers_b_sweep = [s["net_power_kw"] for s in sweep]
+    inst_costs_b_sweep = [s["installed_cost"] / 1e6 for s in sweep]
+    ihx_costs = [s["intermediate_hx_cost"] / 1e6 for s in sweep]
+    lcoes = [s["lcoe"] for s in sweep]
+
+    fig_sweep = make_subplots(rows=2, cols=1,
+                              subplot_titles=["Net Power & Installed Cost",
+                                              "LCOE"],
+                              vertical_spacing=0.12)
+
+    fig_sweep.add_trace(go.Scatter(x=dts, y=powers_b_sweep, name="Config B Net Power (kW)",
+                                   line=dict(color="red", width=2)), row=1, col=1)
+    fig_sweep.add_hline(y=opt_result["ref_power_a"], line_dash="dot",
+                        line_color="blue", annotation_text="Config A ref",
+                        row=1, col=1)
+
+    fig_sweep.add_trace(go.Scatter(x=dts, y=inst_costs_b_sweep, name="Config B Total Cost ($MM)",
+                                   line=dict(color="orange", width=2, dash="dash"),
+                                   yaxis="y3"), row=1, col=1)
+    fig_sweep.add_trace(go.Scatter(x=dts, y=ihx_costs, name="IHX Cost ($MM)",
+                                   line=dict(color="gray", width=1, dash="dot"),
+                                   yaxis="y3"), row=1, col=1)
+
+    fig_sweep.add_trace(go.Scatter(x=dts, y=lcoes, name="Config B LCOE ($/MWh)",
+                                   line=dict(color="purple", width=2)), row=2, col=1)
+    if opt_result["ref_lcoe_a"] > 0:
+        fig_sweep.add_hline(y=opt_result["ref_lcoe_a"], line_dash="dot",
+                            line_color="blue", annotation_text="Config A LCOE",
+                            row=2, col=1)
+
+    fig_sweep.add_vline(x=opt_result["optimal_dt"], line_dash="dash",
+                        annotation_text=f"Optimal: {opt_result['optimal_dt']:.1f}degF")
+
+    if len(powers_b_sweep) >= 3:
+        dp_per_dt = (powers_b_sweep[0] - powers_b_sweep[-1]) / (dts[-1] - dts[0])
+        fig_sweep.add_annotation(
+            x=15, y=max(powers_b_sweep) * 0.95,
+            text=f"Power penalty: {abs(dp_per_dt):.1f} kW/degF",
+            showarrow=False, font=dict(size=11), row=1, col=1,
+        )
+
+    fig_sweep.update_layout(height=650,
+                            yaxis3=dict(overlaying="y", side="right",
+                                        title="Cost ($MM)"))
+    fig_sweep.update_xaxes(title_text="Approach dT (degF)")
+    fig_sweep.update_yaxes(title_text="Net Power (kW)", row=1, col=1)
+    fig_sweep.update_yaxes(title_text="LCOE ($/MWh)", row=2, col=1)
+
+    st.plotly_chart(fig_sweep, width="stretch")
+
+# -- Tab 4: Brine Utilization ----------------------------------------------
+with tab4:
+    fig_brine = go.Figure()
+
+    m_dot_a_hr = perf_a["m_dot_iso"]  # lb/hr
+    Q_pre_a = m_dot_a_hr * perf_a["q_preheater"] / 1e6
+    Q_vap_a = m_dot_a_hr * perf_a["q_vaporizer"] / 1e6
+
+    brine_q_a = [0, Q_pre_a, Q_pre_a + Q_vap_a]
+    brine_T_a = [perf_a["T_geo_out_calc"], perf_a["T_brine_mid"], T_geo_in]
+
+    iso_q_a = [0, Q_pre_a, Q_pre_a + Q_vap_a]
+    iso_T_a = [states_a["6"].T, states_a["7"].T, states_a["1"].T]
+
+    fig_brine.add_trace(go.Scatter(x=brine_q_a, y=brine_T_a,
+                                   name="A: Brine", mode="lines+markers",
+                                   line=dict(color="blue", width=2)))
+    fig_brine.add_trace(go.Scatter(x=iso_q_a, y=iso_T_a,
+                                   name="A: Isopentane", mode="lines+markers",
+                                   line=dict(color="blue", width=2, dash="dash")))
+
+    m_dot_b_hr = perf_b["m_dot_iso"]
+    Q_pre_b = m_dot_b_hr * perf_b["q_preheater"] / 1e6
+    Q_vap_b = m_dot_b_hr * perf_b["q_vaporizer"] / 1e6
+
+    brine_q_b = [0, Q_pre_b, Q_pre_b + Q_vap_b]
+    brine_T_b = [perf_b["T_geo_out_calc"], perf_b["T_brine_mid"], T_geo_in]
+
+    iso_q_b = [0, Q_pre_b, Q_pre_b + Q_vap_b]
+    iso_T_b = [states_b["6"].T, states_b["7"].T, states_b["1"].T]
+
+    fig_brine.add_trace(go.Scatter(x=brine_q_b, y=brine_T_b,
+                                   name="B: Brine", mode="lines+markers",
+                                   line=dict(color="red", width=2)))
+    fig_brine.add_trace(go.Scatter(x=iso_q_b, y=iso_T_b,
+                                   name="B: Isopentane", mode="lines+markers",
+                                   line=dict(color="red", width=2, dash="dash")))
+
+    fig_brine.add_annotation(x=Q_pre_a, y=perf_a["T_brine_mid"],
+                             text=f"A pinch: {perf_a['vaporizer_pinch']:.1f}degF",
+                             showarrow=True, arrowhead=2, font=dict(color="blue"))
+    fig_brine.add_annotation(x=Q_pre_b, y=perf_b["T_brine_mid"],
+                             text=f"B pinch: {perf_b['vaporizer_pinch']:.1f}degF",
+                             showarrow=True, arrowhead=2, font=dict(color="red"))
+
+    fig_brine.add_hline(y=T_geo_out_min, line_dash="dash", line_color="orange",
+                        annotation_text=f"Min brine outlet: {T_geo_out_min}degF")
+
+    fig_brine.update_layout(
+        title="Brine Utilization -- Temperature vs Cumulative Heat Duty",
+        xaxis_title="Cumulative Heat Duty (MMBtu/hr)",
+        yaxis_title="Temperature (degF)",
+        height=550,
+    )
+    st.plotly_chart(fig_brine, width="stretch")
+
+# -- Tab 5: Sensitivity Tornado --------------------------------------------
+with tab5:
+    st.markdown("Impact on **Config B total cost premium over Config A** ($MM) from +/-20% parameter changes")
+
+    base_premium = (costs_b["total_installed"] - costs_a["total_installed"]) / 1e6
+
+    sensitivity_params = [
+        ("T_ambient", T_ambient, "Ambient Temp"),
+        ("electricity_price", electricity_price, "Elec Price"),
+        ("dt_approach_intermediate", dt_approach_intermediate, "Approach dT"),
+        ("v_tailpipe", v_tailpipe, "Duct Velocity"),
+        ("T_geo_in", T_geo_in, "Brine Inlet T"),
+    ]
+
+    tornado_data = []
+    for key, base_val, label in sensitivity_params:
+        low_val = base_val * 0.8
+        high_val = base_val * 1.2
+        premiums = []
+        for v in [low_val, high_val]:
+            try:
+                inp_mod = {**inputs, key: v}
+                ra = solve_config_a(inp_mod, fp)
+                rb = solve_config_b(inp_mod, fp)
+                ca = calculate_costs_a(ra["states"], ra["performance"],
+                                       inp_mod, ra.get("duct"))
+                cb = calculate_costs_b(rb["states"], rb["propane_states"],
+                                       rb["performance"], inp_mod, rb.get("duct"))
+                premiums.append((cb["total_installed"] - ca["total_installed"]) / 1e6)
+            except Exception:
+                premiums.append(base_premium)
+
+        tornado_data.append({
+            "param": label,
+            "low": premiums[0] - base_premium,
+            "high": premiums[1] - base_premium,
+        })
+
+    tornado_data.sort(key=lambda d: abs(d["high"] - d["low"]))
+    params = [d["param"] for d in tornado_data]
+    lows = [d["low"] for d in tornado_data]
+    highs = [d["high"] for d in tornado_data]
+
+    fig_tornado = go.Figure()
+    fig_tornado.add_trace(go.Bar(y=params, x=lows, orientation="h",
+                                 name="-20%", marker_color="steelblue"))
+    fig_tornado.add_trace(go.Bar(y=params, x=highs, orientation="h",
+                                 name="+20%", marker_color="indianred"))
+    fig_tornado.update_layout(
+        title=f"Sensitivity Tornado -- Config B Cost Premium (base: ${base_premium:.2f}MM)",
+        xaxis_title="Change in Premium ($MM)",
+        barmode="overlay",
+        height=450,
+    )
+    st.plotly_chart(fig_tornado, width="stretch")
+
+
+# -- Tab 6: Hydraulic Analysis -----------------------------------------------
+with tab6:
+    st.subheader("Hydraulic Pressure Drop & Condensing Penalty")
+
+    # 1. Side-by-side bar chart: dP contributions by component
+    comp_a = hydraulic_a["components"]
+    comp_b = hydraulic_b["components"]
+
+    hyd_col1, hyd_col2 = st.columns(2)
+
+    with hyd_col1:
+        names_a = list(comp_a.keys())
+        dps_a = [comp_a[n]["dP_psi"] for n in names_a]
+        types_a = [comp_a[n]["type"] for n in names_a]
+        colors_a = ["steelblue" if t == "pipe" else "cornflowerblue" for t in types_a]
+
+        fig_dp_a = go.Figure(go.Bar(
+            x=names_a, y=dps_a, marker_color=colors_a,
+            text=[f"{v:.3f}" for v in dps_a], textposition="outside",
+        ))
+        fig_dp_a.update_layout(
+            title=f"Config A dP Components (total: {hydraulic_a['total_dP_psi']:.3f} psi)",
+            yaxis_title="Pressure Drop (psi)", height=400,
+        )
+        st.plotly_chart(fig_dp_a, width="stretch")
+
+    with hyd_col2:
+        names_b = list(comp_b.keys())
+        dps_b = [comp_b[n]["dP_psi"] for n in names_b]
+        circuit_b = [comp_b[n].get("circuit", "iso") for n in names_b]
+        colors_b = []
+        for n in names_b:
+            c = comp_b[n]
+            if c.get("circuit") == "propane":
+                colors_b.append("indianred" if c["type"] == "pipe" else "salmon")
+            else:
+                colors_b.append("steelblue" if c["type"] == "pipe" else "cornflowerblue")
+
+        fig_dp_b = go.Figure(go.Bar(
+            x=names_b, y=dps_b, marker_color=colors_b,
+            text=[f"{v:.3f}" for v in dps_b], textposition="outside",
+        ))
+        fig_dp_b.update_layout(
+            title=f"Config B dP Components (total: {hydraulic_b['total_dP_psi']:.3f} psi)",
+            yaxis_title="Pressure Drop (psi)", height=400,
+        )
+        st.plotly_chart(fig_dp_b, width="stretch")
+
+    # 2. dT/dP sensitivity curves
+    st.subheader("dT/dP Sensitivity: Isopentane vs Propane")
+
+    T_range = np.linspace(90, 140, 30)
+    dTdP_iso_curve = []
+    dTdP_prop_curve = []
+    for T in T_range:
         try:
-            T_dome = np.linspace(60, states_a["1"].T + 30, 60)
-            s_f_dome, s_g_dome, T_f_dome = [], [], []
-            for T in T_dome:
-                try:
-                    sat = fp.saturation_props("isopentane", T=T)
-                    s_f_dome.append(sat["s_f"])
-                    s_g_dome.append(sat["s_g"])
-                    T_f_dome.append(sat["T_sat"])
-                except Exception:
-                    pass
-            s_dome = s_f_dome + s_g_dome[::-1]
-            T_dome_plot = T_f_dome + T_f_dome[::-1]
-            fig_ts.add_trace(go.Scatter(
-                x=s_dome, y=T_dome_plot, mode="lines",
-                name="Sat Dome (Isopentane)", line=dict(color="lightgray", width=1),
-                fill="toself", fillcolor="rgba(200,200,200,0.15)",
-            ))
+            dTdP_iso_curve.append(calc_dT_dP("isopentane", T, fp))
         except Exception:
-            pass
+            dTdP_iso_curve.append(float("nan"))
+        try:
+            dTdP_prop_curve.append(calc_dT_dP("propane", T, fp))
+        except Exception:
+            dTdP_prop_curve.append(float("nan"))
 
-        # Config A cycle
-        pts = ["1", "2", "3", "4", "5", "6", "7", "1"]
-        s_a = [states_a[p].s for p in pts]
-        T_a = [states_a[p].T for p in pts]
-        fig_ts.add_trace(go.Scatter(
-            x=s_a, y=T_a, mode="lines+markers",
-            name="Config A", line=dict(color="blue", width=2.5),
-            marker=dict(size=8),
-        ))
+    fig_sens = go.Figure()
+    fig_sens.add_trace(go.Scatter(
+        x=list(T_range), y=dTdP_iso_curve, name="Isopentane (~20 psia)",
+        line=dict(color="blue", width=2.5),
+    ))
+    fig_sens.add_trace(go.Scatter(
+        x=list(T_range), y=dTdP_prop_curve, name="Propane (~230 psia)",
+        line=dict(color="red", width=2.5),
+    ))
 
-        # Config B cycle
-        s_b = [states_b[p].s for p in pts]
-        T_b = [states_b[p].T for p in pts]
-        fig_ts.add_trace(go.Scatter(
-            x=s_b, y=T_b, mode="lines+markers",
-            name="Config B", line=dict(color="red", width=2.5, dash="dash"),
-            marker=dict(size=8),
-        ))
+    # Mark operating points
+    fig_sens.add_trace(go.Scatter(
+        x=[perf_a["T_cond"]], y=[hydraulic_a["dT_dP_FperPsi"]],
+        mode="markers", name="Config A operating point",
+        marker=dict(size=14, color="blue", symbol="star"),
+    ))
+    fig_sens.add_trace(go.Scatter(
+        x=[perf_b["T_propane_cond"]], y=[hydraulic_b["prop_dT_dP_FperPsi"]],
+        mode="markers", name="Config B propane operating point",
+        marker=dict(size=14, color="red", symbol="star"),
+    ))
 
-        # State point labels
-        for label, st_pt in states_a.items():
-            fig_ts.add_annotation(
-                x=st_pt.s, y=st_pt.T, text=label,
-                showarrow=True, arrowhead=2, ax=15, ay=-15,
-                font=dict(color="blue", size=10),
-            )
+    ratio_val = hydraulic_a["dT_dP_FperPsi"] / hydraulic_b["prop_dT_dP_FperPsi"] if hydraulic_b["prop_dT_dP_FperPsi"] > 0 else 0
+    fig_sens.update_layout(
+        title=f"Saturation Curve Sensitivity -- Isopentane is {ratio_val:.1f}x more sensitive than propane",
+        xaxis_title="Condensing Temperature (degF)",
+        yaxis_title="dT/dP (degF per psi)",
+        height=450,
+    )
+    st.plotly_chart(fig_sens, width="stretch")
 
-        # Condensing pressure annotation
-        fig_ts.add_hline(y=perf_a["T_cond"], line_dash="dot", line_color="blue",
-                         annotation_text=f"A cond: {perf_a['T_cond']:.0f}degF")
-        fig_ts.add_hline(y=perf_b["T_cond_iso"], line_dash="dot", line_color="red",
-                         annotation_text=f"B cond: {perf_b['T_cond_iso']:.0f}degF")
+    # 3. Component detail table
+    st.subheader("Component Hydraulic Detail")
+    detail_rows = []
+    for name, c in comp_a.items():
+        pwr_impact = c["dT_F"] * dW_dT_a
+        detail_rows.append({
+            "Config": "A",
+            "Component": name,
+            "Type": c["type"],
+            "dP (psi)": f"{c['dP_psi']:.4f}",
+            "dT penalty (degF)": f"{c['dT_F']:.3f}",
+            "Power impact (kW)": f"{pwr_impact:.1f}",
+        })
+    for name, c in comp_b.items():
+        circuit = c.get("circuit", "iso")
+        sensitivity = dW_dT_b
+        pwr_impact = c["dT_F"] * sensitivity
+        detail_rows.append({
+            "Config": "B",
+            "Component": name,
+            "Type": f"{c['type']} ({circuit})",
+            "dP (psi)": f"{c['dP_psi']:.4f}",
+            "dT penalty (degF)": f"{c['dT_F']:.3f}",
+            "Power impact (kW)": f"{pwr_impact:.1f}",
+        })
+    st.dataframe(pd.DataFrame(detail_rows).set_index("Config"), width="stretch")
 
-        fig_ts.update_layout(
-            title="T-s Diagram -- Isopentane ORC Cycles",
-            xaxis_title="Entropy s (BTU/lb-R)",
-            yaxis_title="Temperature T (degF)",
-            legend=dict(x=0.01, y=0.99),
-            height=550,
+    # Summary metrics
+    hyd_met1, hyd_met2, hyd_met3, hyd_met4 = st.columns(4)
+    hyd_met1.metric("Config A total dT", f"{hydraulic_a['total_dT_penalty_F']:.2f} degF")
+    hyd_met2.metric("Config B total dT", f"{hydraulic_b['total_dT_penalty_F']:.2f} degF")
+    hyd_met3.metric("Net advantage (B)", f"{net_hyd_advantage:.2f} degF")
+    hyd_met4.metric("Power recovered", f"{abs(power_from_hyd):.0f} kW")
+
+    # 4. Interactive ACC dP sweep
+    st.subheader("ACC Tube Bundle dP Sweep")
+    acc_dp_range = st.slider("ACC tube dP range (psi)", 0.0, 3.0, (0.2, 2.5), 0.1, key="acc_dp_sweep")
+
+    acc_dp_vals = np.linspace(acc_dp_range[0], acc_dp_range[1], 15)
+    power_a_sweep = []
+    power_b_sweep_hyd = []
+
+    for dp_val in acc_dp_vals:
+        try:
+            inp_sw_a = {**inputs, "dp_acc_tubes_a": float(dp_val)}
+            r_sw_a = solve_config_a(inp_sw_a, fp)
+            power_a_sweep.append(r_sw_a["performance"]["net_power_kw"])
+        except Exception:
+            power_a_sweep.append(float("nan"))
+        try:
+            inp_sw_b = {**inputs, "dp_acc_tubes_prop": float(dp_val)}
+            r_sw_b = solve_config_b(inp_sw_b, fp)
+            power_b_sweep_hyd.append(r_sw_b["performance"]["net_power_kw"])
+        except Exception:
+            power_b_sweep_hyd.append(float("nan"))
+
+    fig_acc_sweep = go.Figure()
+    fig_acc_sweep.add_trace(go.Scatter(
+        x=list(acc_dp_vals), y=power_a_sweep,
+        name="Config A", line=dict(color="blue", width=2.5),
+    ))
+    fig_acc_sweep.add_trace(go.Scatter(
+        x=list(acc_dp_vals), y=power_b_sweep_hyd,
+        name="Config B", line=dict(color="red", width=2.5),
+    ))
+
+    # Annotate sensitivity slopes
+    valid_a = [(x, y) for x, y in zip(acc_dp_vals, power_a_sweep) if not np.isnan(y)]
+    valid_b = [(x, y) for x, y in zip(acc_dp_vals, power_b_sweep_hyd) if not np.isnan(y)]
+    if len(valid_a) >= 2:
+        slope_a = (valid_a[-1][1] - valid_a[0][1]) / (valid_a[-1][0] - valid_a[0][0])
+        fig_acc_sweep.add_annotation(
+            x=(valid_a[0][0] + valid_a[-1][0]) / 2,
+            y=max(y for _, y in valid_a),
+            text=f"A slope: {slope_a:.1f} kW/psi",
+            showarrow=False, font=dict(color="blue", size=12),
         )
-        st.plotly_chart(fig_ts, use_container_width=True)
-
-    # -- Tab 2: Duct Comparison ------------------------------------------------
-    with tab2:
-        fig_duct = make_subplots(rows=2, cols=1,
-                                 subplot_titles=["Duct Diameters by Segment",
-                                                 "Volumetric Flow Rates by Segment"],
-                                 vertical_spacing=0.15)
-
-        # Gather segment data
-        seg_names_a = [s["name"] for s in duct_a["segments"]]
-        seg_dia_a = [s["diameter_in"] for s in duct_a["segments"]]
-        seg_vol_a = [s["vol_flow_ft3s"] for s in duct_a["segments"]]
-
-        seg_names_b = [s["name"] for s in duct_b["segments"]]
-        seg_dia_b = [s["diameter_in"] for s in duct_b["segments"]]
-        seg_vol_b = [s["vol_flow_ft3s"] for s in duct_b["segments"]]
-
-        # Pad to same length for grouped bars
-        all_names = list(dict.fromkeys(seg_names_a + seg_names_b))  # preserve order
-        dia_a_padded = [seg_dia_a[seg_names_a.index(n)] if n in seg_names_a else 0 for n in all_names]
-        dia_b_padded = [seg_dia_b[seg_names_b.index(n)] if n in seg_names_b else 0 for n in all_names]
-        vol_a_padded = [seg_vol_a[seg_names_a.index(n)] if n in seg_names_a else 0 for n in all_names]
-        vol_b_padded = [seg_vol_b[seg_names_b.index(n)] if n in seg_names_b else 0 for n in all_names]
-
-        fig_duct.add_trace(go.Bar(x=all_names, y=dia_a_padded, name="Config A",
-                                  marker_color="steelblue"), row=1, col=1)
-        fig_duct.add_trace(go.Bar(x=all_names, y=dia_b_padded, name="Config B",
-                                  marker_color="indianred"), row=1, col=1)
-
-        # Reference lines
-        fig_duct.add_hline(y=80, line_dash="dash", line_color="orange",
-                           annotation_text="80\" ref", row=1, col=1)
-        fig_duct.add_hline(y=66, line_dash="dash", line_color="gray",
-                           annotation_text="66\" ref", row=1, col=1)
-
-        fig_duct.add_trace(go.Bar(x=all_names, y=vol_a_padded, name="Config A",
-                                  marker_color="steelblue", showlegend=False), row=2, col=1)
-        fig_duct.add_trace(go.Bar(x=all_names, y=vol_b_padded, name="Config B",
-                                  marker_color="indianred", showlegend=False), row=2, col=1)
-
-        fig_duct.update_layout(
-            title=f"Vapor Duct Sizing -- Config A vs Config B (Vol ratio: {vol_ratio:.1f}x)",
-            barmode="group", height=700,
+    if len(valid_b) >= 2:
+        slope_b = (valid_b[-1][1] - valid_b[0][1]) / (valid_b[-1][0] - valid_b[0][0])
+        fig_acc_sweep.add_annotation(
+            x=(valid_b[0][0] + valid_b[-1][0]) / 2,
+            y=min(y for _, y in valid_b),
+            text=f"B slope: {slope_b:.1f} kW/psi",
+            showarrow=False, font=dict(color="red", size=12),
         )
-        fig_duct.update_yaxes(title_text="Diameter (inches)", row=1, col=1)
-        fig_duct.update_yaxes(title_text="Vol Flow (ft3/s)", row=2, col=1)
 
-        st.plotly_chart(fig_duct, use_container_width=True)
+    fig_acc_sweep.update_layout(
+        title="Net Power vs ACC Tube Bundle dP",
+        xaxis_title="ACC Tube Bundle dP (psi)",
+        yaxis_title="Net Power (kW)",
+        height=450,
+    )
+    st.plotly_chart(fig_acc_sweep, width="stretch")
 
-        # Segment detail table
-        seg_table = []
-        for seg in duct_a["segments"]:
-            seg_table.append({
-                "Config": "A", "Segment": seg["name"],
-                "Diameter (in)": f"{seg['diameter_in']:.1f}",
-                "Velocity (ft/s)": f"{seg['velocity_fps']:.0f}",
-                "dP (psia)": f"{seg['delta_P_psi']:.4f}",
-                "dT penalty (degF)": f"{seg['delta_T_cond_F']:.2f}",
-            })
-        for seg in duct_b["segments"]:
-            seg_table.append({
-                "Config": "B", "Segment": seg["name"],
-                "Diameter (in)": f"{seg['diameter_in']:.1f}",
-                "Velocity (ft/s)": f"{seg['velocity_fps']:.0f}",
-                "dP (psia)": f"{seg['delta_P_psi']:.4f}",
-                "dT penalty (degF)": f"{seg['delta_T_cond_F']:.2f}",
-            })
-        st.dataframe(pd.DataFrame(seg_table).set_index("Config"), use_container_width=True)
 
-    # -- Tab 3: Approach dT Sweep ----------------------------------------------
-    with tab3:
-        with st.spinner("Running approach temperature sweep..."):
-            opt_result = optimize_approach_temp(inputs, fp)
+# ============================================================================
+# SECTION 5: ASSUMPTIONS AND SOFTWARE INFORMATION
+# ============================================================================
 
-        sweep = opt_result["sweep"]
-        dts = [s["dt_approach"] for s in sweep]
-        powers_b = [s["net_power_kw"] for s in sweep]
-        inst_costs_b = [s["installed_cost"] / 1e6 for s in sweep]
-        ihx_costs = [s["intermediate_hx_cost"] / 1e6 for s in sweep]
-        lcoes = [s["lcoe"] for s in sweep]
-
-        fig_sweep = make_subplots(rows=2, cols=1,
-                                  subplot_titles=["Net Power & Installed Cost",
-                                                  "LCOE"],
-                                  vertical_spacing=0.12)
-
-        # Power
-        fig_sweep.add_trace(go.Scatter(x=dts, y=powers_b, name="Config B Net Power (kW)",
-                                       line=dict(color="red", width=2)), row=1, col=1)
-        fig_sweep.add_hline(y=opt_result["ref_power_a"], line_dash="dot",
-                            line_color="blue", annotation_text="Config A ref",
-                            row=1, col=1)
-
-        # Cost on secondary axis -- put on same subplot
-        fig_sweep.add_trace(go.Scatter(x=dts, y=inst_costs_b, name="Config B Total Cost ($MM)",
-                                       line=dict(color="orange", width=2, dash="dash"),
-                                       yaxis="y3"), row=1, col=1)
-        fig_sweep.add_trace(go.Scatter(x=dts, y=ihx_costs, name="IHX Cost ($MM)",
-                                       line=dict(color="gray", width=1, dash="dot"),
-                                       yaxis="y3"), row=1, col=1)
-
-        # LCOE
-        fig_sweep.add_trace(go.Scatter(x=dts, y=lcoes, name="Config B LCOE ($/MWh)",
-                                       line=dict(color="purple", width=2)), row=2, col=1)
-        if opt_result["ref_lcoe_a"] > 0:
-            fig_sweep.add_hline(y=opt_result["ref_lcoe_a"], line_dash="dot",
-                                line_color="blue", annotation_text="Config A LCOE",
-                                row=2, col=1)
-
-        # Optimal line
-        fig_sweep.add_vline(x=opt_result["optimal_dt"], line_dash="dash",
-                            annotation_text=f"Optimal: {opt_result['optimal_dt']:.1f}degF")
-
-        # Power penalty annotation
-        if len(powers_b) >= 3:
-            dp_per_dt = (powers_b[0] - powers_b[-1]) / (dts[-1] - dts[0])
-            fig_sweep.add_annotation(
-                x=15, y=max(powers_b) * 0.95,
-                text=f"Power penalty: {abs(dp_per_dt):.1f} kW/degF",
-                showarrow=False, font=dict(size=11), row=1, col=1,
-            )
-
-        fig_sweep.update_layout(height=650,
-                                yaxis3=dict(overlaying="y", side="right",
-                                            title="Cost ($MM)"))
-        fig_sweep.update_xaxes(title_text="Approach dT (degF)")
-        fig_sweep.update_yaxes(title_text="Net Power (kW)", row=1, col=1)
-        fig_sweep.update_yaxes(title_text="LCOE ($/MWh)", row=2, col=1)
-
-        st.plotly_chart(fig_sweep, use_container_width=True)
-
-    # -- Tab 4: Cost Waterfall -------------------------------------------------
-    with tab4:
-        # Component list matching both configs
-        comp_list = [
-            ("Turbine/Generator", "turbine_generator"),
-            ("Isopentane Pump", "iso_pump"),
-            ("Vaporizer", "vaporizer"),
-            ("Preheater", "preheater"),
-            ("Recuperator", "recuperator"),
-            ("Air-Cooled Condensers", "acc"),
-            ("Vapor Ductwork", "ductwork"),
-            ("Intermediate HX", "intermediate_hx"),
-            ("Propane Pump", "propane_pump"),
-            ("Propane Loop Piping", "propane_loop_piping"),
-        ]
-
-        comp_names = [c[0] for c in comp_list]
-        vals_a = [costs_a[c[1]] / 1e6 for c in comp_list]
-        vals_b = [costs_b[c[1]] / 1e6 for c in comp_list]
-        deltas = [vb - va for va, vb in zip(vals_a, vals_b)]
-
-        fig_wf = go.Figure()
-        fig_wf.add_trace(go.Bar(x=comp_names, y=vals_a, name="Config A",
-                                marker_color="steelblue"))
-        fig_wf.add_trace(go.Bar(x=comp_names, y=vals_b, name="Config B",
-                                marker_color="indianred"))
-        fig_wf.add_trace(go.Bar(x=comp_names, y=deltas, name="Delta (B-A)",
-                                marker_color="goldenrod", opacity=0.6))
-
-        fig_wf.update_layout(
-            title="Installed Cost Breakdown ($MM)",
-            yaxis_title="Cost ($MM)",
-            barmode="group",
-            height=500,
-        )
-        st.plotly_chart(fig_wf, use_container_width=True)
-
-        # Duct segment cost breakdown
-        st.markdown("**Duct segment cost detail:**")
-        duct_seg_data = []
-        for seg in duct_a["segments"]:
-            from cost_model import _duct_segment_cost
-            duct_seg_data.append({"Config": "A", "Segment": seg["name"],
-                                  "Cost ($)": f"${_duct_segment_cost(seg):,.0f}"})
-        for seg in duct_b["segments"]:
-            duct_seg_data.append({"Config": "B", "Segment": seg["name"],
-                                  "Cost ($)": f"${_duct_segment_cost(seg):,.0f}"})
-        st.dataframe(pd.DataFrame(duct_seg_data), use_container_width=True)
-
-    # -- Tab 5: Brine Utilization ----------------------------------------------
-    with tab5:
-        fig_brine = go.Figure()
-
-        # Config A brine and isopentane temperature profiles
-        # Cumulative duty: preheater then vaporizer
-        m_dot_a = perf_a["m_dot_iso"]  # lb/hr
-        Q_pre_a = m_dot_a * perf_a["q_preheater"] / 1e6  # MMBtu/hr
-        Q_vap_a = m_dot_a * perf_a["q_vaporizer"] / 1e6
-
-        # Brine: enters at T_geo_in, exits preheater at T_brine_mid, exits at T_geo_out
-        brine_q_a = [0, Q_pre_a, Q_pre_a + Q_vap_a]
-        brine_T_a = [perf_a["T_geo_out_calc"], perf_a["T_brine_mid"], T_geo_in]
-
-        # Isopentane: enters preheater at T6, exits at T7, then vaporizer to T1
-        iso_q_a = [0, Q_pre_a, Q_pre_a + Q_vap_a]
-        iso_T_a = [states_a["6"].T, states_a["7"].T, states_a["1"].T]
-
-        fig_brine.add_trace(go.Scatter(x=brine_q_a, y=brine_T_a,
-                                       name="A: Brine", mode="lines+markers",
-                                       line=dict(color="blue", width=2)))
-        fig_brine.add_trace(go.Scatter(x=iso_q_a, y=iso_T_a,
-                                       name="A: Isopentane", mode="lines+markers",
-                                       line=dict(color="blue", width=2, dash="dash")))
-
-        # Config B
-        m_dot_b = perf_b["m_dot_iso"]
-        Q_pre_b = m_dot_b * perf_b["q_preheater"] / 1e6
-        Q_vap_b = m_dot_b * perf_b["q_vaporizer"] / 1e6
-
-        brine_q_b = [0, Q_pre_b, Q_pre_b + Q_vap_b]
-        brine_T_b = [perf_b["T_geo_out_calc"], perf_b["T_brine_mid"], T_geo_in]
-
-        iso_q_b = [0, Q_pre_b, Q_pre_b + Q_vap_b]
-        iso_T_b = [states_b["6"].T, states_b["7"].T, states_b["1"].T]
-
-        fig_brine.add_trace(go.Scatter(x=brine_q_b, y=brine_T_b,
-                                       name="B: Brine", mode="lines+markers",
-                                       line=dict(color="red", width=2)))
-        fig_brine.add_trace(go.Scatter(x=iso_q_b, y=iso_T_b,
-                                       name="B: Isopentane", mode="lines+markers",
-                                       line=dict(color="red", width=2, dash="dash")))
-
-        # Pinch point markers
-        fig_brine.add_annotation(x=Q_pre_a, y=perf_a["T_brine_mid"],
-                                 text=f"A pinch: {perf_a['vaporizer_pinch']:.1f}degF",
-                                 showarrow=True, arrowhead=2, font=dict(color="blue"))
-        fig_brine.add_annotation(x=Q_pre_b, y=perf_b["T_brine_mid"],
-                                 text=f"B pinch: {perf_b['vaporizer_pinch']:.1f}degF",
-                                 showarrow=True, arrowhead=2, font=dict(color="red"))
-
-        # Min brine outlet line
-        fig_brine.add_hline(y=T_geo_out_min, line_dash="dash", line_color="orange",
-                            annotation_text=f"Min brine outlet: {T_geo_out_min}degF")
-
-        fig_brine.update_layout(
-            title="Brine Utilization -- Temperature vs Cumulative Heat Duty",
-            xaxis_title="Cumulative Heat Duty (MMBtu/hr)",
-            yaxis_title="Temperature (degF)",
-            height=550,
-        )
-        st.plotly_chart(fig_brine, use_container_width=True)
-
-    # -- Tab 6: Sensitivity Tornado --------------------------------------------
-    with tab6:
-        st.markdown("Impact on **Config B total cost premium over Config A** ($MM) from +/-20% parameter changes")
-
-        base_premium = (costs_b["total_installed"] - costs_a["total_installed"]) / 1e6
-
-        sensitivity_params = [
-            ("T_ambient", T_ambient, "Ambient Temp"),
-            ("electricity_price", electricity_price, "Elec Price"),
-            ("dt_approach_intermediate", dt_approach_intermediate, "Approach dT"),
-            ("v_tailpipe", v_tailpipe, "Duct Velocity"),
-            ("T_geo_in", T_geo_in, "Brine Inlet T"),
-        ]
-
-        tornado_data = []
-        for key, base_val, label in sensitivity_params:
-            low_val = base_val * 0.8
-            high_val = base_val * 1.2
-            premiums = []
-            for v in [low_val, high_val]:
-                try:
-                    inp_mod = {**inputs, key: v}
-                    ra = solve_config_a(inp_mod, fp)
-                    rb = solve_config_b(inp_mod, fp)
-                    ca = calculate_costs_a(ra["states"], ra["performance"],
-                                           inp_mod, ra.get("duct"))
-                    cb = calculate_costs_b(rb["states"], rb["propane_states"],
-                                           rb["performance"], inp_mod, rb.get("duct"))
-                    premiums.append((cb["total_installed"] - ca["total_installed"]) / 1e6)
-                except Exception:
-                    premiums.append(base_premium)
-
-            tornado_data.append({
-                "param": label,
-                "low": premiums[0] - base_premium,
-                "high": premiums[1] - base_premium,
-            })
-
-        tornado_data.sort(key=lambda d: abs(d["high"] - d["low"]))
-        params = [d["param"] for d in tornado_data]
-        lows = [d["low"] for d in tornado_data]
-        highs = [d["high"] for d in tornado_data]
-
-        fig_tornado = go.Figure()
-        fig_tornado.add_trace(go.Bar(y=params, x=lows, orientation="h",
-                                     name="-20%", marker_color="steelblue"))
-        fig_tornado.add_trace(go.Bar(y=params, x=highs, orientation="h",
-                                     name="+20%", marker_color="indianred"))
-        fig_tornado.update_layout(
-            title=f"Sensitivity Tornado -- Config B Cost Premium (base: ${base_premium:.2f}MM)",
-            xaxis_title="Change in Premium ($MM)",
-            barmode="overlay",
-            height=450,
-        )
-        st.plotly_chart(fig_tornado, use_container_width=True)
-
-# Footer
 st.divider()
-st.caption("ORC Comparator v2.0 -- CoolProp backend with optional REFPROP bridge")
+
+with st.expander("Assumptions and Software Information"):
+    assum_col1, assum_col2 = st.columns(2)
+
+    with assum_col1:
+        st.markdown("**Heat Transfer Coefficients (U-values)**")
+        u_table = []
+        for name, val in U_VALUES.items():
+            u_table.append({"Component": name.replace("_", " ").title(), "U (BTU/hr-ft2-degF)": val})
+        st.dataframe(pd.DataFrame(u_table).set_index("Component"), width="stretch")
+
+        st.markdown("**Cost Factors (2024 USD, installed)**")
+        cf_table = []
+        for name, val in COST_FACTORS.items():
+            cf_table.append({"Factor": name.replace("_", " ").title(), "Value": f"${val:,.0f}"})
+        st.dataframe(pd.DataFrame(cf_table).set_index("Factor"), width="stretch")
+
+    with assum_col2:
+        st.markdown("**Key Assumptions**")
+        st.markdown(f"""
+- Working fluid: Isopentane (Config A & B)
+- Heat rejection fluid: Propane (Config B only)
+- Duct friction factor: f = {f_darcy:.3f} (Darcy-Weisbach)
+- Equipment-internal dP modeled for ACC tubes, recuperator, IHX
+- dT/dP from CoolProp saturation curve (central finite difference)
+- Cycle convergence tolerance: 0.1 degF on condensing temperature
+- Brine modeled as constant-cp fluid
+- All costs are installed costs (2024 USD)
+- No parasitic load for ACC fans included
+- Recuperator modeled with constant-dT pinch
+""")
+
+        st.markdown("**Software**")
+        try:
+            import CoolProp
+            cp_version = CoolProp.__version__
+        except Exception:
+            cp_version = "unknown"
+
+        st.markdown(f"""
+- Thermodynamic properties: CoolProp v{cp_version}
+- REFPROP bridge: {'Connected' if fp.use_refprop else 'Not available (using CoolProp)'}
+- UI framework: Streamlit
+- Charts: Plotly
+""")
+
+    st.caption("ORC Comparator v4.0 -- Hydraulic analysis with CoolProp backend")
