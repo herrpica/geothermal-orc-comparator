@@ -557,60 +557,219 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     return costs
 
 
-def construction_schedule_delta(duct_a):
+def construction_schedule(duct_a):
     """
-    Config B construction schedule delta relative to Config A (weeks).
-    Returns dict with savings breakdown, adders, and net delta.
-    Negative net = Config B is faster.
+    Absolute phase-based construction schedules for Config A and Config B.
+
+    Config A is serial: civil -> equip -> duct fab/erect -> ACC -> commissioning.
+    Config B parallelises: civil -> (power block || propane/ACC) -> tie-in -> commissioning.
+
+    Returns Gantt-ready phase dicts with start/end weeks plus schedule savings.
     """
     tp_dia = duct_a.get("tailpipe_diameter_in", 0)
 
-    # Duct fabrication and erection savings
+    # --- Config A: Serial construction ---
+    # Duct phase duration depends on tailpipe diameter
     if tp_dia > 72:
-        duct_fab_savings = 6
+        duct_weeks = 24
     elif tp_dia > 60:
-        duct_fab_savings = 4
+        duct_weeks = 20
     elif tp_dia > 48:
-        duct_fab_savings = 3
+        duct_weeks = 16
     else:
-        duct_fab_savings = 1
+        duct_weeks = 10
 
-    # Welding vs flanged connection savings
-    if tp_dia > 60:
-        weld_savings = 3
-    elif tp_dia > 48:
-        weld_savings = 2
-    else:
-        weld_savings = 1
+    a_phases = []
+    t = 0
 
-    # Structural steel savings
-    if tp_dia > 60:
-        steel_savings = 2
-    else:
-        steel_savings = 1
+    # Phase 1: Civil & foundations
+    a_phases.append({"name": "Civil & foundations", "start": t, "end": t + 16,
+                     "duration": 16, "color": "gray", "critical": True, "track": "main"})
+    t += 16
 
-    total_savings = duct_fab_savings + weld_savings + steel_savings
+    # Phase 2: Equipment delivery & setting
+    a_phases.append({"name": "Equipment delivery & setting", "start": t, "end": t + 12,
+                     "duration": 12, "color": "steelblue", "critical": True, "track": "main"})
+    t += 12
 
-    # Fixed adders for Config B
-    ihx_install = 2
-    propane_pressure_test = 2
-    propane_safety_commissioning = 1
-    total_adder = ihx_install + propane_pressure_test + propane_safety_commissioning
+    # Phase 3: Duct fabrication & erection
+    duct_start = t
+    a_phases.append({"name": "Duct fab & erection", "start": t, "end": t + duct_weeks,
+                     "duration": duct_weeks, "color": "indianred", "critical": True, "track": "main"})
+    t += duct_weeks
 
-    net_delta = total_adder - total_savings
+    # Phase 4: ACC structure & tubes
+    a_phases.append({"name": "ACC structure & tubes", "start": t, "end": t + 10,
+                     "duration": 10, "color": "indianred", "critical": True, "track": "main"})
+
+    # Phase 5: E&I -- 50% overlap with phases 3+4, NOT on critical path
+    ei_start_a = duct_start + (duct_weeks + 10) // 2
+    a_phases.append({"name": "E&I", "start": ei_start_a, "end": ei_start_a + 10,
+                     "duration": 10, "color": "orange", "critical": False, "track": "main"})
+    t += 10  # ACC finishes
+
+    # Phase 6: Commissioning
+    a_phases.append({"name": "Commissioning", "start": t, "end": t + 8,
+                     "duration": 8, "color": "darkblue", "critical": True, "track": "main"})
+    t += 8
+
+    a_total = t  # 16 + 12 + duct_weeks + 10 + 8
+
+    # --- Config B: Parallel construction ---
+    b_phases = []
+    t = 0
+
+    # Civil & foundations
+    b_phases.append({"name": "Civil & foundations", "start": t, "end": t + 16,
+                     "duration": 16, "color": "gray", "critical": True, "track": "main"})
+    t = 16  # end of civil
+
+    # --- Power block track (serial sub-phases, 22 wk total) ---
+    pb_start = t
+    pb_subs = [
+        ("Equipment setting",       10, "steelblue"),
+        ("IHX install & align",      3, "steelblue"),
+        ("Short ISO ductwork",       3, "lightblue"),
+        ("ISO pump & piping",        4, "lightblue"),
+        ("Mechanical completion",    2, "steelblue"),
+    ]
+    pb_t = pb_start
+    for name, dur, clr in pb_subs:
+        b_phases.append({"name": name, "start": pb_t, "end": pb_t + dur,
+                         "duration": dur, "color": clr, "critical": True, "track": "power_block"})
+        pb_t += dur
+    pb_end = pb_t  # 16 + 22 = 38
+
+    # --- Propane / ACC track (parallel with power block) ---
+    acc_t = pb_start  # starts same time as power block
+
+    # ACC structure erection: 8 wk
+    b_phases.append({"name": "ACC structure erection", "start": acc_t, "end": acc_t + 8,
+                     "duration": 8, "color": "green", "critical": False, "track": "propane_acc"})
+    # Propane piping fab: 4 wk concurrent with ACC structure
+    b_phases.append({"name": "Propane piping fab", "start": acc_t, "end": acc_t + 4,
+                     "duration": 4, "color": "lightgreen", "critical": False, "track": "propane_acc"})
+    acc_t += 8  # after structure
+
+    # ACC tube bundle install: 6 wk (after structure)
+    b_phases.append({"name": "ACC tube bundle install", "start": acc_t, "end": acc_t + 6,
+                     "duration": 6, "color": "green", "critical": False, "track": "propane_acc"})
+    acc_t += 6  # wk 30
+
+    # Propane piping erection: 4 wk (after tube bundles)
+    b_phases.append({"name": "Propane piping erection", "start": acc_t, "end": acc_t + 4,
+                     "duration": 4, "color": "lightgreen", "critical": False, "track": "propane_acc"})
+    acc_t += 4  # wk 34
+
+    # Propane pump install: 2 wk
+    b_phases.append({"name": "Propane pump install", "start": acc_t, "end": acc_t + 2,
+                     "duration": 2, "color": "lightgreen", "critical": False, "track": "propane_acc"})
+    acc_t += 2  # wk 36
+
+    parallel_end = max(pb_end, acc_t)  # max(38, 36) = 38
+
+    # E&I: starts 4 wk before parallel ends (40% overlap with parallel), 10 wk total
+    ei_overlap = 4
+    ei_start_b = parallel_end - ei_overlap
+    b_phases.append({"name": "E&I", "start": ei_start_b, "end": ei_start_b + 10,
+                     "duration": 10, "color": "orange", "critical": False, "track": "main"})
+    ei_remaining = 10 - ei_overlap  # 6 wk net contribution to critical path
+
+    # Tie-in & integration: 3 wk after parallel
+    tie_start = parallel_end
+    b_phases.append({"name": "Tie-in & integration", "start": tie_start, "end": tie_start + 3,
+                     "duration": 3, "color": "purple", "critical": True, "track": "main"})
+
+    # Commissioning: after tie-in + E&I remaining (sequential on critical path)
+    # Critical path: parallel(22) -> tie-in(3) -> E&I remaining(6) -> commissioning(8)
+    comm_start = parallel_end + 3 + ei_remaining
+    b_phases.append({"name": "Commissioning", "start": comm_start, "end": comm_start + 8,
+                     "duration": 8, "color": "darkblue", "critical": True, "track": "main"})
+
+    b_total = comm_start + 8  # 16 + 22 + 3 + 6 + 8 = 55
+
+    savings = a_total - b_total
 
     return {
-        "duct_fab_savings": duct_fab_savings,
-        "weld_savings": weld_savings,
-        "steel_savings": steel_savings,
-        "total_savings": total_savings,
-        "ihx_install": ihx_install,
-        "propane_pressure_test": propane_pressure_test,
-        "propane_safety_commissioning": propane_safety_commissioning,
-        "total_adder": total_adder,
-        "net_delta": net_delta,
+        "config_a": {
+            "total_weeks": a_total,
+            "phases": a_phases,
+        },
+        "config_b": {
+            "total_weeks": b_total,
+            "phases": b_phases,
+        },
+        "schedule_savings_weeks": savings,
+        "schedule_savings_months": savings / 4.33,
         "tailpipe_diameter_in": tp_dia,
+        "duct_phase_weeks": duct_weeks,
+        "net_delta": -savings,  # backward compat (negative = B faster)
     }
+
+
+def construction_cost_savings(sched_info, installed_cost_a, installed_cost_b, inputs):
+    """
+    Financial impact of Config B's shorter construction schedule.
+
+    Three components:
+    1. Overhead savings: fewer weeks of PM, CM, QC, safety, rentals
+    2. Craft labor efficiency: parallel execution reduces idle/waiting time
+    3. Financing savings: shorter draw period on construction loan
+
+    Returns dict with component breakdown and total.
+    """
+    inp = {**_default_inputs(), **inputs}
+    a_weeks = sched_info["config_a"]["total_weeks"]
+    b_weeks = sched_info["config_b"]["total_weeks"]
+    savings_weeks = sched_info["schedule_savings_weeks"]
+
+    if savings_weeks <= 0:
+        return {
+            "overhead_savings": 0.0,
+            "craft_labor_savings": 0.0,
+            "financing_savings": 0.0,
+            "total_construction_savings": 0.0,
+            "schedule_savings_weeks": savings_weeks,
+            "weekly_site_overhead": 0.0,
+            "weekly_equip_rental": 0.0,
+        }
+
+    # --- 1. Overhead savings ---
+    weekly_overhead = inp.get("weekly_site_overhead", 20_000)
+    weekly_rental = inp.get("weekly_equip_rental", 15_000)
+    overhead_savings = savings_weeks * (weekly_overhead + weekly_rental)
+
+    # --- 2. Craft labor efficiency ---
+    # Labor budget as fraction of the relevant config's installed cost
+    craft_labor_pct = inp.get("craft_labor_pct", 15) / 100
+    craft_labor_budget = installed_cost_a * craft_labor_pct
+    waiting_pct = inp.get("craft_labor_waiting_pct", 15) / 100
+    # Parallel execution reduces waiting time proportionally to schedule compression
+    craft_labor_savings = craft_labor_budget * waiting_pct * (savings_weeks / a_weeks) if a_weeks > 0 else 0.0
+
+    # --- 3. Financing savings ---
+    loan_pct = inp.get("construction_loan_pct", 60) / 100
+    loan_rate = inp.get("construction_loan_rate", 7) / 100
+    # Use average of both configs' installed cost for loan sizing
+    avg_installed = (installed_cost_a + installed_cost_b) / 2
+    loan_amount = avg_installed * loan_pct
+    financing_savings = loan_amount * loan_rate * (savings_weeks / 52)
+
+    total = overhead_savings + craft_labor_savings + financing_savings
+
+    return {
+        "overhead_savings": overhead_savings,
+        "craft_labor_savings": craft_labor_savings,
+        "financing_savings": financing_savings,
+        "total_construction_savings": total,
+        "schedule_savings_weeks": savings_weeks,
+        "weekly_site_overhead": weekly_overhead,
+        "weekly_equip_rental": weekly_rental,
+    }
+
+
+# Backward-compatible alias
+construction_schedule_delta = construction_schedule
 
 
 def lifecycle_cost(installed_cost, net_power_kw, inputs) -> dict:
@@ -655,7 +814,7 @@ def schedule_savings_npv(sched_info, net_power_kw, inputs):
     Discount that revenue back to construction midpoint.
     """
     inp = {**_default_inputs(), **inputs}
-    weeks_saved = -sched_info["net_delta"]  # positive = B is faster
+    weeks_saved = sched_info["schedule_savings_weeks"]  # positive = B is faster
     if weeks_saved <= 0:
         return 0.0
 

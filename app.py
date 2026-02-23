@@ -29,8 +29,8 @@ from thermodynamics import (
 )
 from cost_model import (
     calculate_costs_a, calculate_costs_b, lifecycle_cost,
-    optimize_approach_temp, construction_schedule_delta, simple_payback,
-    schedule_savings_npv, COST_FACTORS, U_VALUES,
+    optimize_approach_temp, construction_schedule, construction_cost_savings,
+    simple_payback, schedule_savings_npv, COST_FACTORS, U_VALUES,
     hx_area_vs_pinch, acc_area_vs_pinch, duct_diameter_vs_dp,
     acc_tubes_vs_dp, sizing_tradeoff_sweep, ACC_TUBE_DEFAULTS,
     _duct_segment_cost,
@@ -207,6 +207,37 @@ with st.sidebar:
             project_life = st.number_input("Plant life (years)",
                                            min_value=1, value=30, step=1)
 
+            st.markdown("**Construction Overhead**")
+            weekly_site_overhead = st.number_input(
+                "Weekly site overhead ($/wk)",
+                min_value=0, value=20000, step=1000,
+                key="weekly_site_overhead",
+                help="PM, CM, QC, safety, scheduler")
+            weekly_equip_rental = st.number_input(
+                "Weekly equipment rental ($/wk)",
+                min_value=0, value=15000, step=1000,
+                key="weekly_equip_rental",
+                help="Cranes, scaffolding, temporary facilities")
+            craft_labor_pct = st.number_input(
+                "Craft labor budget (% of installed cost)",
+                min_value=0, max_value=50, value=15, step=1,
+                key="craft_labor_pct",
+                help="Used to estimate waiting time cost")
+            craft_labor_waiting_pct = st.number_input(
+                "Craft labor waiting time (%)",
+                min_value=0, max_value=50, value=15, step=1,
+                key="craft_labor_waiting_pct",
+                help="Labor hours lost to schedule dependencies")
+            construction_loan_pct = st.number_input(
+                "Construction loan (% of installed cost)",
+                min_value=0, max_value=100, value=60, step=5,
+                key="construction_loan_pct")
+            construction_loan_rate = st.number_input(
+                "Construction loan interest (%)",
+                min_value=0.0, value=7.0, step=0.5,
+                key="construction_loan_rate",
+                format="%.1f")
+
         with st.expander("Unit Cost Assumptions (2024 USD Installed)"):
             st.markdown("**Heat Exchanger Costs**")
             uc_vaporizer_per_ft2 = st.number_input(
@@ -317,6 +348,13 @@ inputs = {
     "uc_engineering_pct": uc_engineering_pct,
     "uc_construction_mgmt_pct": uc_construction_mgmt_pct,
     "uc_contingency_pct": uc_contingency_pct,
+    # Construction overhead parameters
+    "weekly_site_overhead": weekly_site_overhead,
+    "weekly_equip_rental": weekly_equip_rental,
+    "craft_labor_pct": craft_labor_pct,
+    "craft_labor_waiting_pct": craft_labor_waiting_pct,
+    "construction_loan_pct": construction_loan_pct,
+    "construction_loan_rate": construction_loan_rate,
 }
 
 # Validate
@@ -499,8 +537,10 @@ checks_a = run_validation_checks(perf_a, states_a, duct_a, "A", inputs, fp)
 checks_b = run_validation_checks(perf_b, states_b, duct_b, "B", inputs, fp)
 
 # Schedule
-sched_info = construction_schedule_delta(duct_a)
-sched_delta = sched_info["net_delta"]
+sched_info = construction_schedule(duct_a)
+sched_savings = sched_info["schedule_savings_weeks"]
+a_total_weeks = sched_info["config_a"]["total_weeks"]
+b_total_weeks = sched_info["config_b"]["total_weeks"]
 
 # Payback
 payback_yrs = simple_payback(
@@ -511,14 +551,19 @@ payback_yrs = simple_payback(
 # NPV of schedule savings
 sched_npv = schedule_savings_npv(sched_info, pwr_b["P_net"], inputs)
 
+# Construction cost savings from schedule compression
+constr_savings = construction_cost_savings(
+    sched_info, costs_a["total_installed"], costs_b["total_installed"], inputs)
+
 # Volumetric flow ratio
 vol_a = duct_a["total_vol_flow_ft3s"]
 vol_b = duct_b.get("propane_vol_flow_ft3s", duct_b["total_vol_flow_ft3s"])
 vol_ratio = vol_a / vol_b if vol_b > 0 else float("inf")
 
-# Total economic advantage: NPV delta + schedule NPV
-npv_delta = lc_b["net_npv"] - lc_a["net_npv"]
-total_economic_advantage = npv_delta + sched_npv
+# Total economic advantage: capital delta + NPV power difference + early revenue + construction savings
+capital_delta = costs_a["total_installed"] - costs_b["total_installed"]  # positive = B cheaper
+npv_delta = lc_b["net_npv"] - lc_a["net_npv"]  # includes capital + revenue difference
+total_economic_advantage = npv_delta + sched_npv + constr_savings["total_construction_savings"]
 
 
 # ============================================================================
@@ -727,7 +772,11 @@ def _build_chat_context():
             "cost_delta_B_minus_A": round(costs_b["total_installed"] - costs_a["total_installed"]),
             "power_delta_B_minus_A_kw": round(pwr_b["P_net"] - pwr_a["P_net"], 1),
             "npv_advantage_B": round(total_economic_advantage),
+            "config_a_schedule_weeks": a_total_weeks,
+            "config_b_schedule_weeks": b_total_weeks,
+            "schedule_savings_weeks": sched_savings,
             "schedule_delta_weeks": sched_info["net_delta"],
+            "construction_cost_savings": round(constr_savings["total_construction_savings"]),
             "vol_flow_ratio_A_over_B": round(vol_ratio, 1),
         },
         "validation": {
@@ -1414,25 +1463,54 @@ summary_rows.append(("row", "NPV of schedule savings",
                       _fmt(sched_npv/1e3, ".0f"), "$k",
                       ""))
 
+# -- Construction Cost Impact --
+summary_rows.append(("group", "Construction Cost Impact", "", "", "", "", ""))
+summary_rows.append(("row", "Schedule savings",
+                      "", "",
+                      f"{sched_savings} wk" if sched_savings > 0 else "0 wk", "",
+                      "B" if sched_savings > 0 else ""))
+summary_rows.append(("row", "Site overhead savings",
+                      "", "",
+                      _fmt(constr_savings["overhead_savings"]/1e6, ".2f"), "$MM",
+                      ""))
+summary_rows.append(("row", "Craft labor efficiency savings",
+                      "", "",
+                      _fmt(constr_savings["craft_labor_savings"]/1e6, ".2f"), "$MM",
+                      ""))
+summary_rows.append(("row", "Construction financing savings",
+                      "", "",
+                      _fmt(constr_savings["financing_savings"]/1e6, ".2f"), "$MM",
+                      ""))
+summary_rows.append(("row", "Total construction cost savings",
+                      "", "",
+                      _fmt(constr_savings["total_construction_savings"]/1e6, ".2f"), "$MM",
+                      "B" if constr_savings["total_construction_savings"] > 0 else ""))
+
+# -- Total Economic Advantage --
 total_adv_str = _fmt(total_economic_advantage/1e6, ".2f")
 adv_winner = "B" if total_economic_advantage > 0 else ("A" if total_economic_advantage < 0 else "Tie")
-summary_rows.append(("row", "Total economic advantage",
+summary_rows.append(("group", "Total Economic Comparison", "", "", "", "", ""))
+summary_rows.append(("row", "**Total Config B economic advantage**",
                       "", "",
-                      total_adv_str, "$MM",
+                      f"**{total_adv_str}**", "$MM",
                       adv_winner))
 
 # -- Schedule --
 summary_rows.append(("group", "Schedule", "", "", "", "", ""))
-if sched_delta < 0:
-    sched_str = f"{abs(sched_delta)} weeks faster"
+summary_rows.append(("row", "Construction duration",
+                      f"{a_total_weeks} wk", "",
+                      f"{b_total_weeks} wk", "",
+                      "B" if b_total_weeks < a_total_weeks else ("A" if a_total_weeks < b_total_weeks else "Tie")))
+if sched_savings > 0:
+    sched_str = f"{sched_savings} wk ({sched_savings/4.33:.1f} mo) faster"
     sched_winner_val = "B"
-elif sched_delta > 0:
-    sched_str = f"+{sched_delta} weeks slower"
+elif sched_savings < 0:
+    sched_str = f"{abs(sched_savings)} wk slower"
     sched_winner_val = "A"
 else:
     sched_str = "Same"
     sched_winner_val = "Tie"
-summary_rows.append(("row", "Schedule delta (B vs A)",
+summary_rows.append(("row", "Schedule advantage (B vs A)",
                       "", "",
                       sched_str, "",
                       sched_winner_val))
@@ -1496,18 +1574,22 @@ summary_sentence = (
     f"Config **{power_winner}** produces **{power_diff_kw:.0f} kW** more net power. "
     f"Config **{cost_winner}** costs **${cost_diff_mm:.2f}MM** less to build. "
 )
-if sched_delta < 0:
-    summary_sentence += f"Config B is **{abs(sched_delta)} weeks** faster to construct"
-    if sched_npv > 0:
-        summary_sentence += f" (NPV of early revenue: **${sched_npv/1e3:.0f}k**)"
+if sched_savings > 0:
+    summary_sentence += f"Config B is **{sched_savings} weeks ({sched_savings/4.33:.1f} months)** faster to construct"
+    sched_total_benefit = sched_npv + constr_savings["total_construction_savings"]
+    if sched_total_benefit > 0:
+        summary_sentence += (
+            f" (construction savings: **${constr_savings['total_construction_savings']/1e6:.2f}MM**, "
+            f"early revenue NPV: **${sched_npv/1e3:.0f}k**)"
+        )
     summary_sentence += ". "
-elif sched_delta > 0:
-    summary_sentence += f"Config A is **{sched_delta} weeks** faster to construct. "
+elif sched_savings < 0:
+    summary_sentence += f"Config A is **{abs(sched_savings)} weeks** faster to construct. "
 
 if total_economic_advantage > 0:
-    summary_sentence += f"Total economic advantage for B: **${total_economic_advantage/1e6:.2f}MM**."
+    summary_sentence += f"All-in economic advantage for B: **${total_economic_advantage/1e6:.2f}MM**."
 elif total_economic_advantage < 0:
-    summary_sentence += f"Total economic advantage for A: **${abs(total_economic_advantage)/1e6:.2f}MM**."
+    summary_sentence += f"All-in economic advantage for A: **${abs(total_economic_advantage)/1e6:.2f}MM**."
 
 st.markdown(summary_sentence)
 
@@ -1528,24 +1610,121 @@ with st.expander("Seasonal Fan Power & Net Output"):
     st.dataframe(pd.DataFrame(seasonal_rows).set_index("Season"), use_container_width=True)
     st.caption("Q_rejection held constant at design value; only air density varies with temperature.")
 
-# Schedule breakdown detail
+# Schedule breakdown detail -- Gantt chart
 with st.expander("Schedule Breakdown"):
     si = sched_info
-    st.markdown(f"""
-**Config B savings** (tailpipe = {si['tailpipe_diameter_in']:.0f}"):
-- Duct fabrication & erection: **-{si['duct_fab_savings']} weeks**
-- Welding vs flanged connections: **-{si['weld_savings']} weeks**
-- Structural steel: **-{si['steel_savings']} weeks**
-- **Total savings: -{si['total_savings']} weeks**
+    max_weeks = max(a_total_weeks, b_total_weeks) + 4
 
-**Config B adders** (fixed):
-- Intermediate HX installation: +{si['ihx_install']} weeks
-- Propane pressure test & leak check: +{si['propane_pressure_test']} weeks
-- Propane safety review & commissioning: +{si['propane_safety_commissioning']} week
-- **Total adder: +{si['total_adder']} weeks**
+    def _gantt_fig(phases, total_wk, title, max_x):
+        """Build a horizontal bar Gantt chart for one config."""
+        fig = go.Figure()
+        names = [p["name"] for p in phases]
+        # Reverse so first phase is at top
+        for i, p in enumerate(reversed(phases)):
+            fig.add_trace(go.Bar(
+                y=[p["name"]],
+                x=[p["duration"]],
+                base=[p["start"]],
+                orientation="h",
+                marker_color=p["color"],
+                marker_line_width=2 if p["critical"] else 0,
+                marker_line_color="black" if p["critical"] else p["color"],
+                opacity=1.0 if p["critical"] else 0.7,
+                text=f'{p["duration"]}w',
+                textposition="inside",
+                hovertemplate=f'{p["name"]}<br>Wk {p["start"]}-{p["end"]} ({p["duration"]} wk)<extra></extra>',
+                showlegend=False,
+            ))
+        fig.add_vline(x=total_wk, line_dash="dash", line_color="red", line_width=2,
+                      annotation_text=f"{total_wk} wk", annotation_position="top right")
+        fig.update_layout(
+            title=dict(text=title, font_size=14),
+            xaxis=dict(title="Weeks", range=[0, max_x], dtick=8),
+            yaxis=dict(autorange="reversed"),
+            height=max(250, 40 * len(phases)),
+            margin=dict(l=10, r=10, t=40, b=30),
+            barmode="overlay",
+        )
+        return fig
 
-**Net: {si['net_delta']:+d} weeks** ({sched_str})
-""")
+    col_ga, col_gb = st.columns(2)
+    with col_ga:
+        fig_a = _gantt_fig(si["config_a"]["phases"], a_total_weeks,
+                           f"Config A  --  {a_total_weeks} weeks", max_weeks)
+        st.plotly_chart(fig_a, use_container_width=True)
+    with col_gb:
+        fig_b = _gantt_fig(si["config_b"]["phases"], b_total_weeks,
+                           f"Config B  --  {b_total_weeks} weeks", max_weeks)
+        st.plotly_chart(fig_b, use_container_width=True)
+
+    # Phase detail tables
+    col_ta, col_tb = st.columns(2)
+    with col_ta:
+        st.markdown("**Config A phases**")
+        df_a = pd.DataFrame([
+            {"Phase": p["name"], "Start": f'Wk {p["start"]}', "End": f'Wk {p["end"]}',
+             "Dur": f'{p["duration"]}w', "Critical": "Yes" if p["critical"] else ""}
+            for p in si["config_a"]["phases"]
+        ])
+        st.dataframe(df_a.set_index("Phase"), use_container_width=True)
+    with col_tb:
+        st.markdown("**Config B phases**")
+        df_b = pd.DataFrame([
+            {"Phase": p["name"], "Start": f'Wk {p["start"]}', "End": f'Wk {p["end"]}',
+             "Dur": f'{p["duration"]}w', "Track": p["track"], "Critical": "Yes" if p["critical"] else ""}
+            for p in si["config_b"]["phases"]
+        ])
+        st.dataframe(df_b.set_index("Phase"), use_container_width=True)
+
+    # Summary callout
+    if sched_savings > 0:
+        st.success(
+            f"Config B saves **{sched_savings} weeks ({sched_savings/4.33:.1f} months)** "
+            f"via parallel power-block / propane-ACC construction "
+            f"(tailpipe = {si['tailpipe_diameter_in']:.0f}\", duct phase = {si['duct_phase_weeks']} wk)."
+        )
+    elif sched_savings < 0:
+        st.warning(f"Config A is {abs(sched_savings)} weeks faster at this tailpipe diameter.")
+    else:
+        st.info("Both configs have the same construction duration.")
+
+    # --- Schedule-Related Savings Stacked Bar Chart ---
+    if sched_savings > 0:
+        st.markdown("#### Schedule-Related Economic Savings")
+        cs = constr_savings
+        bar_categories = ["Early Revenue\nNPV", "Site Overhead\nSavings",
+                          "Craft Labor\nSavings", "Financing\nSavings"]
+        bar_values = [sched_npv, cs["overhead_savings"],
+                      cs["craft_labor_savings"], cs["financing_savings"]]
+        bar_colors = ["steelblue", "gray", "orange", "green"]
+        total_sched_benefit = sched_npv + cs["total_construction_savings"]
+
+        fig_sav = go.Figure()
+        fig_sav.add_trace(go.Bar(
+            x=bar_categories + ["Total"],
+            y=bar_values + [total_sched_benefit],
+            marker_color=bar_colors + ["darkblue"],
+            text=[f"${v/1e6:.2f}MM" for v in bar_values] + [f"**${total_sched_benefit/1e6:.2f}MM**"],
+            textposition="outside",
+            hovertemplate="%{x}: $%{y:,.0f}<extra></extra>",
+        ))
+        fig_sav.update_layout(
+            yaxis=dict(title="Savings ($)", tickformat="$,.0f"),
+            height=350,
+            margin=dict(l=10, r=10, t=30, b=10),
+            showlegend=False,
+        )
+        # Separator line before total bar
+        fig_sav.add_vline(x=3.5, line_dash="dot", line_color="gray", line_width=1)
+        st.plotly_chart(fig_sav, use_container_width=True)
+
+        st.caption(
+            "Construction cost savings estimated from schedule compression. "
+            "Craft labor waiting time assumes 15% of labor hours lost to serial "
+            "construction dependencies in Config A — this is reduced proportionally "
+            "by Config B parallel execution. Actual savings depend on contractor "
+            "execution strategy and site conditions."
+        )
 
 # Validation checks detail
 with st.expander("Validation Checks"):
