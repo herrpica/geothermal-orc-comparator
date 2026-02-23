@@ -8,6 +8,8 @@ import math
 import numpy as np
 from scipy.optimize import minimize_scalar, brentq
 
+# Parallel turbine/ACC trains sharing common vaporizer + preheater
+N_TRAINS = 2
 
 # -- Unit cost factor defaults (2024 USD, installed) --------------------------
 # These serve as reference defaults; user overrides via uc_* keys in inputs.
@@ -355,23 +357,29 @@ def _apply_indirect_costs(costs, inp):
 
 
 def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
-    """Component-by-component installed cost for Config A."""
+    """Component-by-component installed cost for Config A.
+
+    Plant layout: 1 vaporizer + 1 preheater (total flow) feeding
+    N_TRAINS parallel turbine/recuperator/ACC trains.
+    Per-train equipment sized at m_dot/N_TRAINS, cost x N_TRAINS.
+    """
     inp = {**_default_inputs(), **inputs}
     perf = performance
     m_dot = perf["m_dot_iso"]
+    m_dot_train = m_dot / N_TRAINS  # per-train mass flow
 
     costs = {}
 
-    # Turbine-generator
+    # Turbine-generator (per-train, x N_TRAINS)
     uc_turb = inp.get("uc_turbine_per_kw", COST_FACTORS["turbine_per_kw"])
-    costs["turbine_generator"] = perf["gross_power_kw"] * uc_turb
+    costs["turbine_generator"] = perf["gross_power_kw"] * uc_turb  # N * (P/N * uc) = P * uc
 
-    # Isopentane pump
-    pump_power_btu_hr = m_dot * perf["w_pump"]
+    # Isopentane pump (per-train, x N_TRAINS)
+    pump_power_btu_hr = m_dot * perf["w_pump"]  # N * (m/N * w) = m * w
     pump_hp = pump_power_btu_hr / 2544.43
     costs["iso_pump"] = pump_hp * COST_FACTORS["iso_pump_per_hp"]
 
-    # Vaporizer (State 7 -> 1)
+    # Vaporizer (State 7 -> 1) -- SHARED, sized at total flow
     Q_vap = m_dot * perf["q_vaporizer"] / 1e6          # MMBtu/hr
     dT1_vap = inp["T_geo_in"] - states["1"].T
     dT2_vap = perf["T_brine_mid"] - states["7"].T
@@ -381,7 +389,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     costs["vaporizer"] = vap_area * uc_vap
     costs["vaporizer_area_ft2"] = vap_area
 
-    # Preheater (State 6 -> 7)
+    # Preheater (State 6 -> 7) -- SHARED, sized at total flow
     Q_pre = m_dot * perf["q_preheater"] / 1e6          # MMBtu/hr
     dT1_pre = perf["T_brine_mid"] - states["7"].T
     dT2_pre = perf["T_geo_out_calc"] - states["6"].T
@@ -391,28 +399,28 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     costs["preheater"] = pre_area * uc_pre
     costs["preheater_area_ft2"] = pre_area
 
-    # Recuperator
-    Q_recup = m_dot * perf["q_recup"] / 1e6            # MMBtu/hr
-    if Q_recup > 0:
+    # Recuperator (per-train, x N_TRAINS)
+    Q_recup_train = m_dot_train * perf["q_recup"] / 1e6  # MMBtu/hr per train
+    if Q_recup_train > 0:
         dT1_r = states["2"].T - states["6"].T
         dT2_r = states["3"].T - states["5"].T
         lmtd_recup = _lmtd(dT1_r, dT2_r)
-        recup_area = _hx_area(Q_recup, lmtd_recup, U_VALUES["recuperator"])
+        recup_area_train = _hx_area(Q_recup_train, lmtd_recup, U_VALUES["recuperator"])
         uc_rec = inp.get("uc_recuperator_per_ft2", COST_FACTORS["recup_per_ft2"])
-        costs["recuperator"] = recup_area * uc_rec
-        costs["recuperator_area_ft2"] = recup_area
+        costs["recuperator"] = recup_area_train * uc_rec * N_TRAINS
+        costs["recuperator_area_ft2"] = recup_area_train * N_TRAINS  # plant total
     else:
         costs["recuperator"] = 0
         costs["recuperator_area_ft2"] = 0
 
-    # ACC
-    Q_cond = m_dot * perf["q_cond"] / 1e6              # MMBtu/hr
-    acc_area = _acc_face_area(Q_cond, perf["T_cond"], inp["T_ambient"])
+    # ACC (per-train, x N_TRAINS)
+    Q_cond_train = m_dot_train * perf["q_cond"] / 1e6   # MMBtu/hr per train
+    acc_area_train = _acc_face_area(Q_cond_train, perf["T_cond"], inp["T_ambient"])
     uc_acc = inp.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"])
-    costs["acc"] = acc_area * uc_acc
-    costs["acc_area_ft2"] = acc_area
+    costs["acc"] = acc_area_train * uc_acc * N_TRAINS
+    costs["acc_area_ft2"] = acc_area_train * N_TRAINS  # plant total
 
-    # Ductwork (segment-level, surface area basis)
+    # Ductwork (segments are per-train from thermo, cost x N_TRAINS)
     costs["ductwork_segments"] = {}
     total_duct_cost = 0
     segments = []
@@ -422,12 +430,12 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
             seg_cost = _duct_segment_cost(seg, inp)
             costs["ductwork_segments"][seg["name"]] = seg_cost
             total_duct_cost += seg_cost
-    costs["ductwork"] = total_duct_cost
+    costs["ductwork"] = total_duct_cost * N_TRAINS
 
-    # Structural steel
-    steel_cost, steel_weight = _structural_steel_cost(segments, inp)
-    costs["structural_steel"] = steel_cost
-    costs["structural_steel_weight_lb"] = steel_weight
+    # Structural steel (per-train segments, cost x N_TRAINS)
+    steel_cost_train, steel_weight_train = _structural_steel_cost(segments, inp)
+    costs["structural_steel"] = steel_cost_train * N_TRAINS
+    costs["structural_steel_weight_lb"] = steel_weight_train * N_TRAINS
 
     # No Config B components
     costs["intermediate_hx"] = 0
@@ -445,31 +453,38 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     # Apply indirect cost layers
     _apply_indirect_costs(costs, inp)
 
-    # Equipment count
-    costs["equipment_count"] = 6  # turbine, pump, vaporizer, preheater, recup, ACC
+    # Equipment count (2 trains: 2 turbines, 2 pumps, 2 recups, 2 ACCs + 1 vap + 1 pre)
+    costs["equipment_count"] = 4 * N_TRAINS + 2  # = 10
 
     return costs
 
 
 def calculate_costs_b(states, propane_states, performance, inputs, duct_result=None) -> dict:
-    """Component-by-component installed cost for Config B."""
+    """Component-by-component installed cost for Config B.
+
+    Plant layout: 1 vaporizer + 1 preheater (total flow) feeding
+    N_TRAINS parallel turbine/recuperator/IHX/ACC trains.
+    Per-train equipment sized at m_dot/N_TRAINS, cost x N_TRAINS.
+    """
     inp = {**_default_inputs(), **inputs}
     perf = performance
     m_dot_iso = perf["m_dot_iso"]
     m_dot_prop = perf["m_dot_prop"]
+    m_dot_iso_train = m_dot_iso / N_TRAINS
+    m_dot_prop_train = m_dot_prop / N_TRAINS
 
     costs = {}
 
-    # Turbine-generator
+    # Turbine-generator (per-train, x N_TRAINS)
     uc_turb = inp.get("uc_turbine_per_kw", COST_FACTORS["turbine_per_kw"])
-    costs["turbine_generator"] = perf["gross_power_kw"] * uc_turb
+    costs["turbine_generator"] = perf["gross_power_kw"] * uc_turb  # N * (P/N * uc) = P * uc
 
-    # Isopentane pump
-    pump_power_iso = m_dot_iso * perf["w_pump_iso"]
+    # Isopentane pump (per-train, x N_TRAINS)
+    pump_power_iso = m_dot_iso * perf["w_pump_iso"]  # N * (m/N * w) = m * w
     pump_hp_iso = pump_power_iso / 2544.43
     costs["iso_pump"] = pump_hp_iso * COST_FACTORS["iso_pump_per_hp"]
 
-    # Vaporizer
+    # Vaporizer -- SHARED, sized at total flow
     Q_vap = m_dot_iso * perf["q_vaporizer"] / 1e6          # MMBtu/hr
     dT1_vap = inp["T_geo_in"] - states["1"].T
     dT2_vap = perf["T_brine_mid"] - states["7"].T
@@ -479,7 +494,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     costs["vaporizer"] = vap_area * uc_vap
     costs["vaporizer_area_ft2"] = vap_area
 
-    # Preheater
+    # Preheater -- SHARED, sized at total flow
     Q_pre = m_dot_iso * perf["q_preheater"] / 1e6          # MMBtu/hr
     dT1_pre = perf["T_brine_mid"] - states["7"].T
     dT2_pre = perf["T_geo_out_calc"] - states["6"].T
@@ -489,41 +504,41 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     costs["preheater"] = pre_area * uc_pre
     costs["preheater_area_ft2"] = pre_area
 
-    # Recuperator
-    Q_recup = m_dot_iso * perf["q_recup"] / 1e6            # MMBtu/hr
-    if Q_recup > 0:
+    # Recuperator (per-train, x N_TRAINS)
+    Q_recup_train = m_dot_iso_train * perf["q_recup"] / 1e6  # MMBtu/hr per train
+    if Q_recup_train > 0:
         dT1_r = states["2"].T - states["6"].T
         dT2_r = states["3"].T - states["5"].T
         lmtd_recup = _lmtd(dT1_r, dT2_r)
-        recup_area = _hx_area(Q_recup, lmtd_recup, U_VALUES["recuperator"])
+        recup_area_train = _hx_area(Q_recup_train, lmtd_recup, U_VALUES["recuperator"])
         uc_rec = inp.get("uc_recuperator_per_ft2", COST_FACTORS["recup_per_ft2"])
-        costs["recuperator"] = recup_area * uc_rec
-        costs["recuperator_area_ft2"] = recup_area
+        costs["recuperator"] = recup_area_train * uc_rec * N_TRAINS
+        costs["recuperator_area_ft2"] = recup_area_train * N_TRAINS  # plant total
     else:
         costs["recuperator"] = 0
         costs["recuperator_area_ft2"] = 0
 
-    # Intermediate HX
-    Q_intermediate = m_dot_iso * perf["q_cond_iso"] / 1e6  # MMBtu/hr
+    # Intermediate HX (per-train, x N_TRAINS)
+    Q_int_train = m_dot_iso_train * perf["q_cond_iso"] / 1e6  # MMBtu/hr per train
     lmtd_int = inp.get("dt_approach_intermediate", 10)
-    int_area = _hx_area(Q_intermediate, lmtd_int, U_VALUES["intermediate_hx"])
+    int_area_train = _hx_area(Q_int_train, lmtd_int, U_VALUES["intermediate_hx"])
     uc_ihx = inp.get("uc_ihx_per_ft2", COST_FACTORS["hx_per_ft2"])
-    costs["intermediate_hx"] = int_area * uc_ihx
-    costs["intermediate_hx_area_ft2"] = int_area
+    costs["intermediate_hx"] = int_area_train * uc_ihx * N_TRAINS
+    costs["intermediate_hx_area_ft2"] = int_area_train * N_TRAINS  # plant total
 
-    # Propane ACC
-    Q_prop_cond = m_dot_prop * (propane_states["A"].h - propane_states["B"].h) / 1e6  # MMBtu/hr
+    # Propane ACC (per-train, x N_TRAINS)
+    Q_prop_train = m_dot_prop_train * (propane_states["A"].h - propane_states["B"].h) / 1e6
     T_propane_cond = perf["T_propane_cond"]
-    acc_area = _acc_face_area(Q_prop_cond, T_propane_cond, inp["T_ambient"])
+    acc_area_train = _acc_face_area(Q_prop_train, T_propane_cond, inp["T_ambient"])
     uc_acc = inp.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"])
-    costs["acc"] = acc_area * uc_acc
-    costs["acc_area_ft2"] = acc_area
+    costs["acc"] = acc_area_train * uc_acc * N_TRAINS
+    costs["acc_area_ft2"] = acc_area_train * N_TRAINS  # plant total
 
-    # Propane system (piping + pump) as % of IHX cost
+    # Propane system (piping + pump) as % of IHX cost -- already plant total
     prop_pct = inp.get("uc_prop_piping_pct", COST_FACTORS["prop_piping_pct"])
     costs["propane_system"] = costs["intermediate_hx"] * prop_pct / 100
 
-    # Ductwork (segment-level, surface area basis)
+    # Ductwork (segments are per-train from thermo, cost x N_TRAINS)
     costs["ductwork_segments"] = {}
     total_duct_cost = 0
     segments = []
@@ -533,12 +548,12 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
             seg_cost = _duct_segment_cost(seg, inp)
             costs["ductwork_segments"][seg["name"]] = seg_cost
             total_duct_cost += seg_cost
-    costs["ductwork"] = total_duct_cost
+    costs["ductwork"] = total_duct_cost * N_TRAINS
 
-    # Structural steel
-    steel_cost, steel_weight = _structural_steel_cost(segments, inp)
-    costs["structural_steel"] = steel_cost
-    costs["structural_steel_weight_lb"] = steel_weight
+    # Structural steel (per-train segments, cost x N_TRAINS)
+    steel_cost_train, steel_weight_train = _structural_steel_cost(segments, inp)
+    costs["structural_steel"] = steel_cost_train * N_TRAINS
+    costs["structural_steel_weight_lb"] = steel_weight_train * N_TRAINS
 
     # Equipment subtotal
     equipment_keys = [
@@ -551,8 +566,9 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     # Apply indirect cost layers
     _apply_indirect_costs(costs, inp)
 
-    # Equipment count
-    costs["equipment_count"] = 9  # turbine, iso pump, vap, pre, recup, ACC, IHX, prop pump, prop piping
+    # Equipment count (2 trains: 2 turbines, 2 iso pumps, 2 recups, 2 IHX, 2 ACC,
+    #                  2 prop pumps + 1 vap + 1 pre + prop piping)
+    costs["equipment_count"] = 6 * N_TRAINS + 3  # = 15
 
     return costs
 

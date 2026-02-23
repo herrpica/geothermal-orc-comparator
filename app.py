@@ -1176,7 +1176,7 @@ def _generate_pfd_a(states, perf, duct, inputs):
 <!-- Annotation box (bottom) -->
 <rect x="190" y="575" width="370" height="55" class="annot-box"/>
 <text x="375" y="595" text-anchor="middle" class="annot-text">LOW-PRESSURE VAPOR PATH</text>
-<text x="375" y="607" text-anchor="middle" class="annot-text">{tp_dia:.0f}" dia x {L_run:.0f} ft run</text>
+<text x="375" y="607" text-anchor="middle" class="annot-text">{tp_dia:.0f}" dia x {L_run:.0f} ft run (per train, 2 trains)</text>
 <text x="375" y="619" text-anchor="middle" style="font-size:7.5px;fill:#c0392b;font-family:sans-serif;">
   (field-routed isopentane vapor)</text>
 
@@ -1304,7 +1304,7 @@ def _generate_pfd_b(states, prop_states, perf, duct, duct_a, inputs):
 <rect x="280" y="565" width="380" height="55" rx="4"
   fill="none" stroke="#27ae60" stroke-width="1" stroke-dasharray="4,2"/>
 <text x="470" y="583" text-anchor="middle" class="annot-green">HIGH-P PROPANE LOOP</text>
-<text x="470" y="595" text-anchor="middle" class="annot-green">{prop_dia:.0f}" dia vs {tp_a_dia:.0f}" (Config A)</text>
+<text x="470" y="595" text-anchor="middle" class="annot-green">{prop_dia:.0f}" dia vs {tp_a_dia:.0f}" (Config A) per train</text>
 <text x="470" y="607" text-anchor="middle"
   style="font-size:7.5px;fill:#27ae60;font-family:sans-serif;">
   (small-bore, high-pressure piping)</text>
@@ -1387,11 +1387,11 @@ summary_rows.append(("row", "= Net power",
 
 # -- Physical Scale --
 summary_rows.append(("group", "Physical Scale", "", "", "", "", ""))
-summary_rows.append(("row", "Tailpipe diameter",
+summary_rows.append(("row", "Tailpipe diameter (per train)",
                       _fmt(duct_a["tailpipe_diameter_in"], ".0f"), "in",
                       _fmt(duct_b["tailpipe_diameter_in"], ".0f"), "in",
                       _winner(duct_a["tailpipe_diameter_in"], duct_b["tailpipe_diameter_in"], lower_better=True)))
-summary_rows.append(("row", "ACC header diameter",
+summary_rows.append(("row", "ACC header diameter (per train)",
                       _fmt(duct_a["acc_header_diameter_in"], ".0f"), "in",
                       _fmt(duct_b["acc_header_diameter_in"], ".0f"), "in",
                       _winner(duct_a["acc_header_diameter_in"], duct_b["acc_header_diameter_in"], lower_better=True)))
@@ -1681,7 +1681,7 @@ with st.expander("Schedule Breakdown"):
         st.success(
             f"Config B saves **{sched_savings} weeks ({sched_savings/4.33:.1f} months)** "
             f"via parallel power-block / propane-ACC construction "
-            f"(tailpipe = {si['tailpipe_diameter_in']:.0f}\", duct phase = {si['duct_phase_weeks']} wk)."
+            f"(tailpipe = {si['tailpipe_diameter_in']:.0f}\" per train, duct phase = {si['duct_phase_weeks']} wk)."
         )
     elif sched_savings < 0:
         st.warning(f"Config A is {abs(sched_savings)} weeks faster at this tailpipe diameter.")
@@ -2085,8 +2085,8 @@ with tab1:
 # -- Tab 2: Duct Sizing ---------------------------------------------------
 with tab2:
     fig_duct = make_subplots(rows=2, cols=1,
-                             subplot_titles=["Duct Diameters by Segment",
-                                             "Volumetric Flow Rates by Segment"],
+                             subplot_titles=["Duct Diameters by Segment (per train)",
+                                             "Volumetric Flow Rates by Segment (per train)"],
                              vertical_spacing=0.15)
 
     seg_names_a = [s["name"] for s in duct_a["segments"]]
@@ -2119,7 +2119,7 @@ with tab2:
                               marker_color="indianred", showlegend=False), row=2, col=1)
 
     fig_duct.update_layout(
-        title=f"Vapor Duct Sizing -- Config A vs Config B (Vol ratio: {vol_ratio:.1f}x)",
+        title=f"Vapor Duct Sizing -- Per Train (2 trains) -- Vol Ratio A/B: {vol_ratio:.1f}x",
         barmode="group", height=700,
     )
     fig_duct.update_yaxes(title_text="Diameter (inches)", row=1, col=1)
@@ -2146,6 +2146,7 @@ with tab2:
             "dT penalty (degF)": f"{seg['delta_T_cond_F']:.2f}",
         })
     st.dataframe(pd.DataFrame(seg_table).set_index("Config"), width="stretch")
+    st.caption("Diameters and flows are per train (2 parallel trains). Plant total flow = 2x per-train values.")
 
 # -- Tab 3: Approach dT Sweep ----------------------------------------------
 with tab3:
