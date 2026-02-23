@@ -488,8 +488,13 @@ def _find_T_evap(inp, fp, fluid, T_cond):
         except Exception:
             return -1e6
 
+    # Clamp search range below critical temperature
+    try:
+        T_crit = fp.critical_point(fluid)["T_crit"]
+    except Exception:
+        T_crit = 369.1  # isopentane fallback
     T_lo = T_cond + 5
-    T_hi = T_geo_in - superheat - 1
+    T_hi = min(T_geo_in - superheat - 1, T_crit - 5)
 
     r_lo = residual(T_lo)
     r_hi = residual(T_hi)
@@ -656,11 +661,40 @@ def solve_config_a(inputs: dict, fp) -> dict:
     inp = {**_default_inputs(), **inputs}
     fluid = "isopentane"
 
+    # Get critical temperature for guard check
+    try:
+        T_crit_iso = fp.critical_point(fluid)["T_crit"]
+    except Exception:
+        T_crit_iso = 369.1  # isopentane critical, degF
+
     T_cond_base = inp["T_ambient"] + inp["dt_pinch_acc_a"]
+
+    # Pre-check: base condensing temperature must be well below critical
+    # Need margin for duct penalty (~5°F) + CoolProp numerical stability near critical
+    if T_cond_base >= T_crit_iso - 20:
+        raise ValueError(
+            f"Isopentane condensing temperature ({T_cond_base:.1f}°F) is too close to its "
+            f"critical temperature ({T_crit_iso:.1f}°F). "
+            f"T_ambient ({inp['T_ambient']:.1f}) + ACC pinch "
+            f"({inp['dt_pinch_acc_a']:.1f}) = {T_cond_base:.1f}°F must be below "
+            f"{T_crit_iso - 20:.0f}°F to allow room for duct pressure penalties."
+        )
+
     dt_penalty = 0.0
 
     for iteration in range(20):
         T_cond = T_cond_base + dt_penalty
+
+        # Guard: isopentane condensing temperature must be below critical
+        if T_cond >= T_crit_iso - 5:
+            raise ValueError(
+                f"Isopentane condensing temperature ({T_cond:.1f}°F) exceeds its "
+                f"critical temperature ({T_crit_iso:.1f}°F). "
+                f"Breakdown: T_ambient ({inp['T_ambient']:.1f}) + ACC pinch "
+                f"({inp['dt_pinch_acc_a']:.1f}) + duct penalty ({dt_penalty:.1f}) = "
+                f"{T_cond:.1f}°F. Reduce T_ambient, dt_pinch_acc_a, or duct velocities."
+            )
+
         states, perf = _solve_cycle_core(inp, fp, fluid, T_cond)
         perf["T_cond"] = T_cond
 
@@ -694,6 +728,37 @@ def solve_config_b(inputs: dict, fp) -> dict:
     T_propane_cond = T_amb + dt_acc
     T_cond_iso_base = T_amb + dt_acc + dt_approach
 
+    # Get critical temperatures for guard checks
+    try:
+        T_crit_prop = fp.critical_point(prop_fluid)["T_crit"]
+    except Exception:
+        T_crit_prop = 206.1  # propane critical, degF
+    try:
+        T_crit_iso = fp.critical_point(fluid)["T_crit"]
+    except Exception:
+        T_crit_iso = 369.1  # isopentane critical, degF
+
+    # Pre-check: propane condensing temperature must be below critical
+    # Need margin for CoolProp numerical stability near critical point
+    if T_propane_cond >= T_crit_prop - 10:
+        raise ValueError(
+            f"Propane condensing temperature ({T_propane_cond:.1f}°F) is too close to its "
+            f"critical temperature ({T_crit_prop:.1f}°F). "
+            f"This is set by T_ambient ({T_amb:.1f}°F) + ACC pinch ({dt_acc:.1f}°F) = "
+            f"{T_propane_cond:.1f}°F. Reduce T_ambient or dt_pinch_acc_b so their sum "
+            f"stays below {T_crit_prop - 10:.0f}°F."
+        )
+
+    # Pre-check: isopentane condensing temperature must be below critical
+    if T_cond_iso_base >= T_crit_iso - 20:
+        raise ValueError(
+            f"Isopentane condensing temperature ({T_cond_iso_base:.1f}°F) is too close to its "
+            f"critical temperature ({T_crit_iso:.1f}°F). "
+            f"T_ambient ({T_amb:.1f}) + ACC pinch ({dt_acc:.1f}) + IHX approach "
+            f"({dt_approach:.1f}) = {T_cond_iso_base:.1f}°F must be below "
+            f"{T_crit_iso - 20:.0f}°F."
+        )
+
     dt_penalty = 0.0
 
     for iteration in range(20):
@@ -701,6 +766,28 @@ def solve_config_b(inputs: dict, fp) -> dict:
         T_propane_evap = T_cond_iso - dt_approach
         if T_propane_evap <= T_propane_cond + 1:
             T_propane_evap = T_propane_cond + 2
+
+        # Guard: propane evaporating temperature must be below critical
+        if T_propane_evap >= T_crit_prop - 5:
+            raise ValueError(
+                f"Propane evaporating temperature ({T_propane_evap:.1f}°F) exceeds its "
+                f"critical temperature ({T_crit_prop:.1f}°F). "
+                f"Breakdown: T_ambient ({T_amb:.1f}) + ACC pinch ({dt_acc:.1f}) + "
+                f"duct penalty ({dt_penalty:.1f}) = {T_propane_evap + dt_approach:.1f}°F "
+                f"iso condensing, minus IHX approach ({dt_approach:.1f}) = "
+                f"{T_propane_evap:.1f}°F propane evaporating. "
+                f"Reduce T_ambient, dt_pinch_acc_b, or duct velocities."
+            )
+
+        # Guard: isopentane condensing temperature must be below critical
+        if T_cond_iso >= T_crit_iso - 5:
+            raise ValueError(
+                f"Isopentane condensing temperature ({T_cond_iso:.1f}°F) exceeds its "
+                f"critical temperature ({T_crit_iso:.1f}°F). "
+                f"Breakdown: T_ambient ({T_amb:.1f}) + ACC pinch ({dt_acc:.1f}) + "
+                f"IHX approach ({dt_approach:.1f}) + duct penalty ({dt_penalty:.1f}) = "
+                f"{T_cond_iso:.1f}°F. Reduce inputs or duct velocities."
+            )
 
         states, perf = _solve_cycle_core(inp, fp, fluid, T_cond_iso)
 

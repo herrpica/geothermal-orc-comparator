@@ -230,6 +230,16 @@ class FluidProperties:
         sp = self.state_point(fluid, "T", T, "P", P)
         return sp["s"]
 
+    def critical_point(self, fluid):
+        """Return critical temperature (°F) and pressure (psia) for a fluid."""
+        name = _coolprop_name(fluid)
+        T_crit_K = CP.PropsSI("Tcrit", name)
+        P_crit_Pa = CP.PropsSI("pcrit", name)
+        return {
+            "T_crit": k_to_f(T_crit_K),
+            "P_crit": pa_to_psia(P_crit_Pa),
+        }
+
     def latent_heat(self, fluid, T):
         """Latent heat of vaporisation at T (°F) → BTU/lb."""
         sat = self.saturation_props(fluid, T=T)
