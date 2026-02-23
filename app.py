@@ -47,6 +47,10 @@ if "chat_messages" not in st.session_state:
     st.session_state.chat_messages = []
 if "pending_apply" not in st.session_state:
     st.session_state.pending_apply = {}
+if "_auto_fan_bays_a" not in st.session_state:
+    st.session_state._auto_fan_bays_a = 0
+if "_auto_fan_bays_b" not in st.session_state:
+    st.session_state._auto_fan_bays_b = 0
 
 # Apply pending unit cost overrides from Claude recommendations.
 # This runs BEFORE widgets render so session_state values take effect.
@@ -167,9 +171,21 @@ with st.sidebar:
             eta_motor = st.number_input("Motor efficiency",
                                         min_value=0.01, value=0.95, step=0.01,
                                         key="eta_motor", format="%.2f")
-            n_fan_bays = st.number_input("Number of fan bays (0=auto)",
-                                         min_value=0, value=0, step=1,
-                                         help="Set to 0 to auto-size from airflow")
+            _auto_a = st.session_state._auto_fan_bays_a
+            _auto_b = st.session_state._auto_fan_bays_b
+            _auto_max = max(_auto_a, _auto_b)
+            _auto_placeholder = str(_auto_max) if _auto_max > 0 else "auto"
+            n_fan_bays_raw = st.number_input(
+                "Number of fan bays (blank = auto)",
+                min_value=1, value=None, step=1,
+                placeholder=_auto_placeholder,
+                help="Leave blank to auto-size from airflow")
+            n_fan_bays = n_fan_bays_raw if n_fan_bays_raw is not None else 0
+            if _auto_a > 0 or _auto_b > 0:
+                _auto_note = f"Auto: {_auto_a} bays (A) / {_auto_b} bays (B) calculated from airflow"
+                if n_fan_bays_raw is not None:
+                    _auto_note += f"  --  override: {n_fan_bays_raw} bays"
+                st.caption(_auto_note)
             fan_diameter_ft = st.number_input("Fan diameter (ft)",
                                               min_value=1, value=28, step=1)
             W_aux_kw = st.number_input("Auxiliary parasitic (kW)",
@@ -387,6 +403,10 @@ try:
         perf_b["P_prop_evap"], perf_b["P_prop_cond"],
         perf_b["w_pump_prop"], inputs["eta_pump"],
     )
+
+    # Update session state so the sidebar placeholder shows the solved fan count
+    st.session_state._auto_fan_bays_a = fan_a["n_fans_required"]
+    st.session_state._auto_fan_bays_b = fan_b["n_fans_required"]
 except Exception as e:
     st.error(f"**Fan/pump sizing error:** {e}\n\n"
              "This is likely caused by an input value that is too large or too small. "
