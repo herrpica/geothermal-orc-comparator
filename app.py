@@ -191,6 +191,10 @@ with st.sidebar:
             W_aux_kw = st.number_input("Auxiliary parasitic (kW)",
                                        min_value=0, value=150, step=10,
                                        help="Lube oil, controls, lighting, instruments")
+            prop_thermosiphon = st.checkbox(
+                "Propane loop thermosiphon (no pump)",
+                value=True,
+                help="ACC elevated above IHX — gravity drives liquid return, no pump required")
 
         with st.expander("Economic Parameters"):
             electricity_price = st.number_input("Electricity price ($/MWh)",
@@ -296,6 +300,7 @@ inputs = {
     "n_fan_bays": n_fan_bays,
     "fan_diameter_ft": fan_diameter_ft,
     "W_aux_kw": W_aux_kw,
+    "prop_thermosiphon": prop_thermosiphon,
     # Unit cost overrides
     "uc_vaporizer_per_ft2": uc_vaporizer_per_ft2,
     "uc_preheater_per_ft2": uc_preheater_per_ft2,
@@ -343,6 +348,17 @@ except Exception as e:
 
 perf_a = result_a["performance"]
 perf_b = result_b["performance"]
+
+# Thermosiphon correction: if no propane pump, add back the propane pump work
+if inputs.get("prop_thermosiphon", True):
+    _prop_pump_kw_cycle = perf_b["m_dot_prop"] * perf_b["w_pump_prop"] / 3412.14
+    perf_b["net_power_kw"] += _prop_pump_kw_cycle
+    # Also correct per-lb values for consistency
+    perf_b["w_pump_total"] = perf_b["w_pump_iso"]
+    perf_b["w_net"] = perf_b["w_turbine"] - perf_b["w_pump_iso"]
+    perf_b["eta_thermal"] = perf_b["w_net"] / perf_b["q_evap"] if perf_b["q_evap"] > 0 else 0
+    perf_b["brine_effectiveness"] = perf_b["net_power_kw"] / inputs["m_dot_geo"] if inputs["m_dot_geo"] > 0 else 0
+
 states_a = result_a["states"]
 states_b = result_b["states"]
 prop_states = result_b["propane_states"]
@@ -418,7 +434,8 @@ except Exception as e:
 # Build parasitic dicts
 iso_pump_kw_a = perf_a["m_dot_iso"] * perf_a["w_pump"] / 3412.14
 iso_pump_kw_b = perf_b["m_dot_iso"] * perf_b["w_pump_iso"] / 3412.14
-prop_pump_kw_b = perf_b["m_dot_prop"] * perf_b["w_pump_prop"] / 3412.14
+prop_pump_kw_b_calc = perf_b["m_dot_prop"] * perf_b["w_pump_prop"] / 3412.14
+prop_pump_kw_b = 0.0 if inputs.get("prop_thermosiphon", True) else prop_pump_kw_b_calc
 aux_kw = inputs["W_aux_kw"]
 
 parasitic_a = {
@@ -431,6 +448,8 @@ parasitic_a = {
 parasitic_b = {
     "iso_pump_kw": iso_pump_kw_b,
     "prop_pump_kw": prop_pump_kw_b,
+    "prop_pump_kw_calc": prop_pump_kw_b_calc,  # always available for display
+    "thermosiphon": inputs.get("prop_thermosiphon", True),
     "acc_fans_kw": fan_b["W_fans_kw"],
     "auxiliary_kw": aux_kw,
     "total_kw": iso_pump_kw_b + prop_pump_kw_b + fan_b["W_fans_kw"] + aux_kw,
@@ -1117,7 +1136,10 @@ def _generate_pfd_b(states, prop_states, perf, duct, duct_a, inputs):
     recup_duty = perf["Q_recup_mmbtu_hr"]
     ihx_duty = m * perf["q_cond_iso"] / 1e6
     pump_iso_kw = m * perf["w_pump_iso"] / 3412.14
-    pump_prop_kw = m_prop * perf["w_pump_prop"] / 3412.14
+    pump_prop_kw_calc = m_prop * perf["w_pump_prop"] / 3412.14
+    pump_prop_kw = 0.0 if inputs.get("prop_thermosiphon", True) else pump_prop_kw_calc
+    prop_pump_label = "THERMOSIPHON" if inputs.get("prop_thermosiphon", True) else "PROP PUMP"
+    prop_pump_detail = "no pump" if inputs.get("prop_thermosiphon", True) else f"{pump_prop_kw:.0f} kW"
     rej_duty = perf["Q_reject_mmbtu_hr"]
 
     s = states
@@ -1141,7 +1163,7 @@ def _generate_pfd_b(states, prop_states, perf, duct, duct_a, inputs):
 {_eq_box(182, 435, 135, 50, '#fffde7', 'IHX', f'{ihx_duty:.2f} MMBtu/hr')}
 {_eq_box(13, 440, 105, 38, '#e8f5e9', 'ISO PUMP', f'{pump_iso_kw:.0f} kW')}
 {_eq_box(520, 230, 140, 50, '#e3f2fd', 'PROPANE ACC', f'{rej_duty:.2f} MMBtu/hr')}
-{_eq_box(533, 435, 120, 38, '#e8f5e9', 'PROP PUMP', f'{pump_prop_kw:.0f} kW')}
+{_eq_box(533, 435, 120, 38, '#e8f5e9', prop_pump_label, prop_pump_detail)}
 
 <!-- Recuperator internal divider -->
 <line x1="192" y1="289" x2="307" y2="289" stroke="#999" stroke-width="0.8" stroke-dasharray="3,2"/>
@@ -1270,9 +1292,11 @@ summary_rows.append(("row", "ISO pump",
                       _fmt(parasitic_a["iso_pump_kw"], ".0f"), "kW",
                       _fmt(parasitic_b["iso_pump_kw"], ".0f"), "kW",
                       _winner(parasitic_a["iso_pump_kw"], parasitic_b["iso_pump_kw"], lower_better=True)))
-summary_rows.append(("row", "Propane pump",
+_prop_pump_label = "Propane pump (thermosiphon)" if parasitic_b["thermosiphon"] else "Propane pump"
+_prop_pump_val = "0 (thermosiphon)" if parasitic_b["thermosiphon"] else _fmt(parasitic_b["prop_pump_kw"], ".0f")
+summary_rows.append(("row", _prop_pump_label,
                       "N/A", "",
-                      _fmt(parasitic_b["prop_pump_kw"], ".0f"), "kW",
+                      _prop_pump_val, "kW",
                       ""))
 summary_rows.append(("row", "ACC fans",
                       _fmt(parasitic_a["acc_fans_kw"], ".0f"), "kW",
@@ -1735,16 +1759,27 @@ with wf_pwr_col1:
     st.plotly_chart(fig_wf_pwr_a, use_container_width=True)
 
 with wf_pwr_col2:
-    wf_b_labels = ["Gross", "ISO Pump", "Prop Pump", "ACC Fans", "Auxiliary", "True Net"]
-    wf_b_values = [
-        perf_b["gross_power_kw"],
-        -parasitic_b["iso_pump_kw"],
-        -parasitic_b["prop_pump_kw"],
-        -parasitic_b["acc_fans_kw"],
-        -parasitic_b["auxiliary_kw"],
-        None,
-    ]
-    wf_b_measures = ["absolute", "relative", "relative", "relative", "relative", "total"]
+    if parasitic_b["thermosiphon"]:
+        wf_b_labels = ["Gross", "ISO Pump", "ACC Fans", "Auxiliary", "True Net"]
+        wf_b_values = [
+            perf_b["gross_power_kw"],
+            -parasitic_b["iso_pump_kw"],
+            -parasitic_b["acc_fans_kw"],
+            -parasitic_b["auxiliary_kw"],
+            None,
+        ]
+        wf_b_measures = ["absolute", "relative", "relative", "relative", "total"]
+    else:
+        wf_b_labels = ["Gross", "ISO Pump", "Prop Pump", "ACC Fans", "Auxiliary", "True Net"]
+        wf_b_values = [
+            perf_b["gross_power_kw"],
+            -parasitic_b["iso_pump_kw"],
+            -parasitic_b["prop_pump_kw"],
+            -parasitic_b["acc_fans_kw"],
+            -parasitic_b["auxiliary_kw"],
+            None,
+        ]
+        wf_b_measures = ["absolute", "relative", "relative", "relative", "relative", "total"]
     fig_wf_pwr_b = go.Figure(go.Waterfall(
         x=wf_b_labels, y=wf_b_values, measure=wf_b_measures,
         connector=dict(line=dict(color="rgb(63, 63, 63)")),
@@ -2954,11 +2989,11 @@ with tab8:
             "Power (HP)": f"{pump_iso_b['power_hp']:.0f}",
         },
         {
-            "Pump": "Propane pump (B)",
-            "Flow (gpm)": f"{pump_prop_b['flow_gpm']:.1f}",
+            "Pump": "Propane pump (B)" + (" -- thermosiphon" if parasitic_b["thermosiphon"] else ""),
+            "Flow (gpm)": f"{pump_prop_b['flow_gpm']:.1f}" if not parasitic_b["thermosiphon"] else "N/A",
             "dP (psi)": f"{pump_prop_b['dP_psi']:.0f}",
-            "Power (kW)": f"{pump_prop_b['power_kw']:.1f}",
-            "Power (HP)": f"{pump_prop_b['power_hp']:.0f}",
+            "Power (kW)": "0 (thermosiphon)" if parasitic_b["thermosiphon"] else f"{pump_prop_b['power_kw']:.1f}",
+            "Power (HP)": "0" if parasitic_b["thermosiphon"] else f"{pump_prop_b['power_hp']:.0f}",
         },
     ]
     st.dataframe(pd.DataFrame(pump_summary_rows).set_index("Pump"), use_container_width=True)
@@ -3029,6 +3064,7 @@ with st.expander("Assumptions and Software Information"):
 - Brine modeled as constant-cp fluid
 - All costs are installed costs (2024 USD)
 - ACC fan power from first-principles airflow model (Cp_air=0.24, face vel=400 fpm)
+{"- Propane loop designed as thermosiphon -- ACC elevated above IHX, gravity drives liquid return, no pump required" if inputs.get("prop_thermosiphon", True) else "- Propane loop uses mechanical pump for liquid return"}
 - Recuperator modeled with constant-dT pinch
 """)
 
@@ -3046,4 +3082,4 @@ with st.expander("Assumptions and Software Information"):
 - Charts: Plotly
 """)
 
-    st.caption("ORC Comparator v5.2 -- Parasitic load model, fan power optimization, pump sizing")
+    st.caption("ORC Comparator v5.3 -- Parasitic load model, thermosiphon option, fan power optimization")
