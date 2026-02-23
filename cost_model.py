@@ -173,6 +173,70 @@ def pump_sizing(m_dot_lb_hr, rho_liquid, P_high_psia, P_low_psia, W_pump_btu_lb,
     }
 
 
+def compute_power_balance(perf, fan_result, inputs, config="A"):
+    """Centralized power balance for an ORC configuration.
+
+    Every power/efficiency metric flows from this single function.
+    All values in kW unless noted.
+
+    Config A: P_net = P_gross - W_iso_pump - W_fans - W_auxiliary
+    Config B: P_net = P_gross - W_iso_pump - W_prop_pump - W_fans - W_auxiliary
+    """
+    P_gross = perf["gross_power_kw"]
+
+    # ISO pump (both configs)
+    if config == "B":
+        W_iso_pump = perf["m_dot_iso"] * perf["w_pump_iso"] / 3412.14
+    else:
+        W_iso_pump = perf["m_dot_iso"] * perf["w_pump"] / 3412.14
+
+    # Propane pump (Config B only)
+    W_prop_pump_calc = 0.0
+    if config == "B":
+        W_prop_pump_calc = perf["m_dot_prop"] * perf["w_pump_prop"] / 3412.14
+    thermosiphon = config == "B" and inputs.get("prop_thermosiphon", True)
+    W_prop_pump = 0.0 if thermosiphon else W_prop_pump_calc
+
+    # ACC fans
+    W_fans = fan_result["W_fans_kw"]
+
+    # Auxiliary
+    W_auxiliary = inputs.get("W_aux_kw", 150)
+
+    # Total parasitic and net power
+    W_total_parasitic = W_iso_pump + W_prop_pump + W_fans + W_auxiliary
+    P_net = P_gross - W_total_parasitic
+
+    # Brine heat input (kW)
+    Q_brine_kw = perf["m_dot_iso"] * perf["q_evap"] / 3412.14
+
+    # Thermal efficiency: P_net / Q_brine_input
+    eta_thermal = P_net / Q_brine_kw if Q_brine_kw > 0 else 0
+
+    # Brine effectiveness: kW per (lb/s) of brine
+    m_dot_geo = inputs.get("m_dot_geo", 200)
+    brine_effectiveness = P_net / m_dot_geo if m_dot_geo > 0 else 0
+
+    # Parasitic fraction
+    parasitic_pct = W_total_parasitic / P_gross * 100 if P_gross > 0 else 0
+
+    return {
+        "P_gross": P_gross,
+        "W_iso_pump": W_iso_pump,
+        "W_prop_pump": W_prop_pump,
+        "W_prop_pump_calc": W_prop_pump_calc,
+        "W_fans": W_fans,
+        "W_auxiliary": W_auxiliary,
+        "W_total_parasitic": W_total_parasitic,
+        "P_net": P_net,
+        "Q_brine_kw": Q_brine_kw,
+        "eta_thermal": eta_thermal,
+        "brine_effectiveness": brine_effectiveness,
+        "parasitic_pct": parasitic_pct,
+        "thermosiphon": thermosiphon,
+    }
+
+
 def acc_area_with_air_rise(Q_reject_mmbtu_hr, T_cond, T_ambient, dT_air, U=None):
     """ACC area using proper LMTD with air inlet/outlet temperatures.
 
@@ -643,16 +707,19 @@ def optimize_approach_temp(inputs, fp):
     """
     from thermodynamics import solve_config_b, solve_config_a
 
-    # Solve Config A once for reference
+    # Solve Config A once for reference (with full power balance)
     try:
         result_a = solve_config_a(inputs, fp)
         costs_a = calculate_costs_a(
             result_a["states"], result_a["performance"], inputs,
             result_a.get("duct"),
         )
-        lc_a = lifecycle_cost(costs_a["total_installed"],
-                              result_a["performance"]["net_power_kw"], inputs)
-        ref_power_a = result_a["performance"]["net_power_kw"]
+        fan_a = calculate_fan_power(
+            result_a["performance"]["Q_reject_mmbtu_hr"],
+            inputs.get("T_ambient", 95), inputs)
+        pwr_a = compute_power_balance(result_a["performance"], fan_a, inputs, config="A")
+        lc_a = lifecycle_cost(costs_a["total_installed"], pwr_a["P_net"], inputs)
+        ref_power_a = pwr_a["P_net"]
         ref_cost_a = costs_a["total_installed"]
         ref_lcoe_a = lc_a["lcoe"]
     except Exception:
@@ -663,16 +730,24 @@ def optimize_approach_temp(inputs, fp):
     sweep_dts = np.linspace(5, 25, 21)
     sweep_results = []
 
+    def _solve_b_with_balance(inp):
+        """Solve Config B and return full power balance net power."""
+        result = solve_config_b(inp, fp)
+        ps = result["propane_states"]
+        Q_rej_b = result["performance"]["m_dot_prop"] * (ps["A"].h - ps["B"].h) / 1e6
+        fan_b = calculate_fan_power(Q_rej_b, inp.get("T_ambient", 95), inp)
+        pwr_b = compute_power_balance(result["performance"], fan_b, inp, config="B")
+        return result, pwr_b
+
     def objective(dt):
         try:
             inp = {**inputs, "dt_approach_intermediate": float(dt)}
-            result = solve_config_b(inp, fp)
+            result, pwr_b = _solve_b_with_balance(inp)
             costs = calculate_costs_b(
                 result["states"], result["propane_states"],
                 result["performance"], inp, result.get("duct"),
             )
-            lc = lifecycle_cost(costs["total_installed"],
-                                result["performance"]["net_power_kw"], inp)
+            lc = lifecycle_cost(costs["total_installed"], pwr_b["P_net"], inp)
             return -lc["net_npv"]
         except Exception:
             return 1e12
@@ -680,16 +755,15 @@ def optimize_approach_temp(inputs, fp):
     for dt in sweep_dts:
         try:
             inp = {**inputs, "dt_approach_intermediate": float(dt)}
-            result = solve_config_b(inp, fp)
+            result, pwr_b = _solve_b_with_balance(inp)
             costs = calculate_costs_b(
                 result["states"], result["propane_states"],
                 result["performance"], inp, result.get("duct"),
             )
-            lc = lifecycle_cost(costs["total_installed"],
-                                result["performance"]["net_power_kw"], inp)
+            lc = lifecycle_cost(costs["total_installed"], pwr_b["P_net"], inp)
             sweep_results.append({
                 "dt_approach": float(dt),
-                "net_power_kw": result["performance"]["net_power_kw"],
+                "net_power_kw": pwr_b["P_net"],
                 "installed_cost": costs["total_installed"],
                 "intermediate_hx_cost": costs["intermediate_hx"],
                 "net_npv": lc["net_npv"],
@@ -942,14 +1016,22 @@ def sizing_tradeoff_sweep(inputs, fp, config="A"):
                 r = solve_config_a(inp_mod, fp)
                 c = calculate_costs_a(r["states"], r["performance"],
                                       inp_mod, r.get("duct"))
+                fan = calculate_fan_power(
+                    r["performance"]["Q_reject_mmbtu_hr"],
+                    inp_mod.get("T_ambient", 95), inp_mod)
+                pwr = compute_power_balance(r["performance"], fan, inp_mod, config="A")
             else:
                 r = solve_config_b(inp_mod, fp)
                 c = calculate_costs_b(r["states"], r["propane_states"],
                                       r["performance"], inp_mod, r.get("duct"))
+                ps = r["propane_states"]
+                Q_rej = r["performance"]["m_dot_prop"] * (ps["A"].h - ps["B"].h) / 1e6
+                fan = calculate_fan_power(Q_rej, inp_mod.get("T_ambient", 95), inp_mod)
+                pwr = compute_power_balance(r["performance"], fan, inp_mod, config="B")
             results.append({
                 "multiplier": float(mult),
                 "total_cost": c["total_installed"],
-                "net_power_kw": r["performance"]["net_power_kw"],
+                "net_power_kw": pwr["P_net"],
             })
         except Exception:
             results.append({

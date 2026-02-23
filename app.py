@@ -35,6 +35,7 @@ from cost_model import (
     acc_tubes_vs_dp, sizing_tradeoff_sweep, ACC_TUBE_DEFAULTS,
     _duct_segment_cost,
     calculate_fan_power, pump_sizing, acc_area_with_air_rise,
+    compute_power_balance,
 )
 
 st.set_page_config(page_title="ORC Comparator", layout="wide")
@@ -349,16 +350,6 @@ except Exception as e:
 perf_a = result_a["performance"]
 perf_b = result_b["performance"]
 
-# Thermosiphon correction: if no propane pump, add back the propane pump work
-if inputs.get("prop_thermosiphon", True):
-    _prop_pump_kw_cycle = perf_b["m_dot_prop"] * perf_b["w_pump_prop"] / 3412.14
-    perf_b["net_power_kw"] += _prop_pump_kw_cycle
-    # Also correct per-lb values for consistency
-    perf_b["w_pump_total"] = perf_b["w_pump_iso"]
-    perf_b["w_net"] = perf_b["w_turbine"] - perf_b["w_pump_iso"]
-    perf_b["eta_thermal"] = perf_b["w_net"] / perf_b["q_evap"] if perf_b["q_evap"] > 0 else 0
-    perf_b["brine_effectiveness"] = perf_b["net_power_kw"] / inputs["m_dot_geo"] if inputs["m_dot_geo"] > 0 else 0
-
 states_a = result_a["states"]
 states_b = result_b["states"]
 prop_states = result_b["propane_states"]
@@ -371,23 +362,27 @@ hydraulic_b = result_b["hydraulic"]
 try:
     inp_pert_a = {**inputs, "dt_pinch_acc_a": inputs["dt_pinch_acc_a"] + 1}
     result_a_pert = solve_config_a(inp_pert_a, fp)
-    dW_dT_a = perf_a["net_power_kw"] - result_a_pert["performance"]["net_power_kw"]  # kW per degF
+    fan_a_pert = calculate_fan_power(result_a_pert["performance"]["Q_reject_mmbtu_hr"], inputs["T_ambient"], inputs)
+    pwr_a_pert = compute_power_balance(result_a_pert["performance"], fan_a_pert, inputs, config="A")
+    dW_dT_a = pwr_a["P_net"] - pwr_a_pert["P_net"]  # kW per degF
 except Exception:
     dW_dT_a = 0.0
 
 try:
     inp_pert_b = {**inputs, "dt_pinch_acc_b": inputs["dt_pinch_acc_b"] + 1}
     result_b_pert = solve_config_b(inp_pert_b, fp)
-    dW_dT_b = perf_b["net_power_kw"] - result_b_pert["performance"]["net_power_kw"]  # kW per degF
+    _ps_b_pert = result_b_pert["propane_states"]
+    _Q_rej_b_pert = result_b_pert["performance"]["m_dot_prop"] * (_ps_b_pert["A"].h - _ps_b_pert["B"].h) / 1e6
+    fan_b_pert = calculate_fan_power(_Q_rej_b_pert, inputs["T_ambient"], inputs)
+    pwr_b_pert = compute_power_balance(result_b_pert["performance"], fan_b_pert, inputs, config="B")
+    dW_dT_b = pwr_b["P_net"] - pwr_b_pert["P_net"]  # kW per degF
 except Exception:
     dW_dT_b = 0.0
 
-# Costs
+# Costs (equipment sizing — does not depend on net power)
 try:
     costs_a = calculate_costs_a(states_a, perf_a, inputs, duct_a)
     costs_b = calculate_costs_b(states_b, prop_states, perf_b, inputs, duct_b)
-    lc_a = lifecycle_cost(costs_a["total_installed"], perf_a["net_power_kw"], inputs)
-    lc_b = lifecycle_cost(costs_b["total_installed"], perf_b["net_power_kw"], inputs)
 except Exception as e:
     st.error(f"**Cost calculation error:** {e}\n\n"
              "This is likely caused by an input value that is too large or too small. "
@@ -399,11 +394,11 @@ try:
     # Config A: isopentane condenses directly to air
     fan_a = calculate_fan_power(perf_a["Q_reject_mmbtu_hr"], inputs["T_ambient"], inputs)
 
-    # Config B: propane rejects to air (slightly more than iso condensing duty due to prop pump work)
+    # Config B: propane rejects to air
     Q_reject_air_b = perf_b["m_dot_prop"] * (prop_states["A"].h - prop_states["B"].h) / 1e6
     fan_b = calculate_fan_power(Q_reject_air_b, inputs["T_ambient"], inputs)
 
-    # Pump sizing
+    # Pump sizing (for equipment selection display only)
     pump_iso_a = pump_sizing(
         perf_a["m_dot_iso"], states_a["4"].rho,
         perf_a["P_high"], perf_a["P_low"],
@@ -431,32 +426,47 @@ except Exception as e:
              f"or ambient temperature ({T_ambient}°F).")
     st.stop()
 
-# Build parasitic dicts
-iso_pump_kw_a = perf_a["m_dot_iso"] * perf_a["w_pump"] / 3412.14
-iso_pump_kw_b = perf_b["m_dot_iso"] * perf_b["w_pump_iso"] / 3412.14
-prop_pump_kw_b_calc = perf_b["m_dot_prop"] * perf_b["w_pump_prop"] / 3412.14
-prop_pump_kw_b = 0.0 if inputs.get("prop_thermosiphon", True) else prop_pump_kw_b_calc
-aux_kw = inputs["W_aux_kw"]
+# ============================================================================
+# CENTRALIZED POWER BALANCE — single source of truth for net power, efficiency
+# ============================================================================
+pwr_a = compute_power_balance(perf_a, fan_a, inputs, config="A")
+pwr_b = compute_power_balance(perf_b, fan_b, inputs, config="B")
 
+# Verification assertions
+_bal_a = abs(pwr_a["P_net"] - (pwr_a["P_gross"] - pwr_a["W_total_parasitic"]))
+_bal_b = abs(pwr_b["P_net"] - (pwr_b["P_gross"] - pwr_b["W_total_parasitic"]))
+if _bal_a > 1.0 or _bal_b > 1.0:
+    st.error(f"**Power balance error:** Net power does not balance.\n"
+             f"Config A: {pwr_a['P_net']:.1f} != {pwr_a['P_gross']:.1f} - {pwr_a['W_total_parasitic']:.1f} (err={_bal_a:.2f})\n"
+             f"Config B: {pwr_b['P_net']:.1f} != {pwr_b['P_gross']:.1f} - {pwr_b['W_total_parasitic']:.1f} (err={_bal_b:.2f})")
+    st.stop()
+
+# Backward-compatible aliases used by display code
 parasitic_a = {
-    "iso_pump_kw": iso_pump_kw_a,
+    "iso_pump_kw": pwr_a["W_iso_pump"],
     "prop_pump_kw": 0,
-    "acc_fans_kw": fan_a["W_fans_kw"],
-    "auxiliary_kw": aux_kw,
-    "total_kw": iso_pump_kw_a + fan_a["W_fans_kw"] + aux_kw,
+    "acc_fans_kw": pwr_a["W_fans"],
+    "auxiliary_kw": pwr_a["W_auxiliary"],
+    "total_kw": pwr_a["W_total_parasitic"],
+    "thermosiphon": False,
 }
 parasitic_b = {
-    "iso_pump_kw": iso_pump_kw_b,
-    "prop_pump_kw": prop_pump_kw_b,
-    "prop_pump_kw_calc": prop_pump_kw_b_calc,  # always available for display
-    "thermosiphon": inputs.get("prop_thermosiphon", True),
-    "acc_fans_kw": fan_b["W_fans_kw"],
-    "auxiliary_kw": aux_kw,
-    "total_kw": iso_pump_kw_b + prop_pump_kw_b + fan_b["W_fans_kw"] + aux_kw,
+    "iso_pump_kw": pwr_b["W_iso_pump"],
+    "prop_pump_kw": pwr_b["W_prop_pump"],
+    "prop_pump_kw_calc": pwr_b["W_prop_pump_calc"],
+    "acc_fans_kw": pwr_b["W_fans"],
+    "auxiliary_kw": pwr_b["W_auxiliary"],
+    "total_kw": pwr_b["W_total_parasitic"],
+    "thermosiphon": pwr_b["thermosiphon"],
 }
 
-true_net_a = perf_a["gross_power_kw"] - parasitic_a["total_kw"]
-true_net_b = perf_b["gross_power_kw"] - parasitic_b["total_kw"]
+# Lifecycle economics — uses centralized P_net (includes ALL parasitics)
+try:
+    lc_a = lifecycle_cost(costs_a["total_installed"], pwr_a["P_net"], inputs)
+    lc_b = lifecycle_cost(costs_b["total_installed"], pwr_b["P_net"], inputs)
+except Exception as e:
+    st.error(f"**Lifecycle cost error:** {e}")
+    st.stop()
 
 # Seasonal fan power variation (Q_reject held constant, only air density changes)
 seasonal_temps = {
@@ -472,12 +482,12 @@ for season, T_amb_s in seasonal_temps.items():
     seasonal_a[season] = {
         "T_ambient": T_amb_s,
         "fan_kw": sf_a["W_fans_kw"],
-        "true_net": perf_a["gross_power_kw"] - (iso_pump_kw_a + sf_a["W_fans_kw"] + aux_kw),
+        "P_net": pwr_a["P_gross"] - pwr_a["W_iso_pump"] - sf_a["W_fans_kw"] - pwr_a["W_auxiliary"],
     }
     seasonal_b[season] = {
         "T_ambient": T_amb_s,
         "fan_kw": sf_b["W_fans_kw"],
-        "true_net": perf_b["gross_power_kw"] - (iso_pump_kw_b + prop_pump_kw_b + sf_b["W_fans_kw"] + aux_kw),
+        "P_net": pwr_b["P_gross"] - pwr_b["W_iso_pump"] - pwr_b["W_prop_pump"] - sf_b["W_fans_kw"] - pwr_b["W_auxiliary"],
     }
 
 # Pinch checks
@@ -495,11 +505,11 @@ sched_delta = sched_info["net_delta"]
 # Payback
 payback_yrs = simple_payback(
     costs_a["total_installed"], costs_b["total_installed"],
-    perf_a["net_power_kw"], perf_b["net_power_kw"], inputs
+    pwr_a["P_net"], pwr_b["P_net"], inputs
 )
 
 # NPV of schedule savings
-sched_npv = schedule_savings_npv(sched_info, perf_b["net_power_kw"], inputs)
+sched_npv = schedule_savings_npv(sched_info, pwr_b["P_net"], inputs)
 
 # Volumetric flow ratio
 vol_a = duct_a["total_vol_flow_ft3s"]
@@ -672,11 +682,11 @@ def _build_chat_context():
             "prop_piping_pct": inputs.get("uc_prop_piping_pct", COST_FACTORS["prop_piping_pct"]),
         },
         "config_a": {
-            "net_power_kw": round(perf_a["net_power_kw"], 1),
+            "net_power_kw": round(pwr_a["P_net"], 1),
             "gross_power_kw": round(perf_a["gross_power_kw"], 1),
-            "thermal_eff_pct": round(perf_a["eta_thermal"] * 100, 2),
+            "thermal_eff_pct": round(pwr_a["eta_thermal"] * 100, 2),
             "T_cond_F": round(perf_a["T_cond"], 1),
-            "brine_effectiveness_kW_per_lbs": round(perf_a["brine_effectiveness"], 3),
+            "brine_effectiveness_kW_per_lbs": round(pwr_a["brine_effectiveness"], 3),
             "tailpipe_diameter_in": round(duct_a["tailpipe_diameter_in"], 1),
             "acc_header_diameter_in": round(duct_a["acc_header_diameter_in"], 1),
             "total_installed_cost": round(costs_a["total_installed"]),
@@ -692,12 +702,12 @@ def _build_chat_context():
             "specific_cost_per_kw": round(lc_a["specific_cost_per_kw"]),
         },
         "config_b": {
-            "net_power_kw": round(perf_b["net_power_kw"], 1),
+            "net_power_kw": round(pwr_b["P_net"], 1),
             "gross_power_kw": round(perf_b["gross_power_kw"], 1),
-            "thermal_eff_pct": round(perf_b["eta_thermal"] * 100, 2),
+            "thermal_eff_pct": round(pwr_b["eta_thermal"] * 100, 2),
             "T_cond_iso_F": round(perf_b["T_cond_iso"], 1),
             "T_propane_cond_F": round(perf_b["T_propane_cond"], 1),
-            "brine_effectiveness_kW_per_lbs": round(perf_b["brine_effectiveness"], 3),
+            "brine_effectiveness_kW_per_lbs": round(pwr_b["brine_effectiveness"], 3),
             "tailpipe_diameter_in": round(duct_b["tailpipe_diameter_in"], 1),
             "total_installed_cost": round(costs_b["total_installed"]),
             "equipment_subtotal": round(costs_b["equipment_subtotal"]),
@@ -715,7 +725,7 @@ def _build_chat_context():
         },
         "comparison": {
             "cost_delta_B_minus_A": round(costs_b["total_installed"] - costs_a["total_installed"]),
-            "power_delta_B_minus_A_kw": round(perf_b["net_power_kw"] - perf_a["net_power_kw"], 1),
+            "power_delta_B_minus_A_kw": round(pwr_b["P_net"] - pwr_a["P_net"], 1),
             "npv_advantage_B": round(total_economic_advantage),
             "schedule_delta_weeks": sched_info["net_delta"],
             "vol_flow_ratio_A_over_B": round(vol_ratio, 1),
@@ -1266,21 +1276,21 @@ summary_rows = []
 # -- Power Performance --
 summary_rows.append(("group", "Power Performance", "", "", "", "", ""))
 summary_rows.append(("row", "Net power output",
-                      _fmt(perf_a["net_power_kw"], ".0f"), "kW",
-                      _fmt(perf_b["net_power_kw"], ".0f"), "kW",
-                      _winner(perf_a["net_power_kw"], perf_b["net_power_kw"], lower_better=False)))
+                      _fmt(pwr_a["P_net"], ".0f"), "kW",
+                      _fmt(pwr_b["P_net"], ".0f"), "kW",
+                      _winner(pwr_a["P_net"], pwr_b["P_net"], lower_better=False)))
 summary_rows.append(("row", "Gross turbine power",
                       _fmt(perf_a["gross_power_kw"], ".0f"), "kW",
                       _fmt(perf_b["gross_power_kw"], ".0f"), "kW",
                       _winner(perf_a["gross_power_kw"], perf_b["gross_power_kw"], lower_better=False)))
-summary_rows.append(("row", "Cycle thermal efficiency",
-                      _fmt(perf_a["eta_thermal"]*100, ".1f"), "%",
-                      _fmt(perf_b["eta_thermal"]*100, ".1f"), "%",
-                      _winner(perf_a["eta_thermal"], perf_b["eta_thermal"], lower_better=False)))
+summary_rows.append(("row", "Net thermal efficiency",
+                      _fmt(pwr_a["eta_thermal"]*100, ".1f"), "%",
+                      _fmt(pwr_b["eta_thermal"]*100, ".1f"), "%",
+                      _winner(pwr_a["eta_thermal"], pwr_b["eta_thermal"], lower_better=False)))
 summary_rows.append(("row", "Brine effectiveness",
-                      _fmt(perf_a["brine_effectiveness"], ".2f"), "kW/(lb/s)",
-                      _fmt(perf_b["brine_effectiveness"], ".2f"), "kW/(lb/s)",
-                      _winner(perf_a["brine_effectiveness"], perf_b["brine_effectiveness"], lower_better=False)))
+                      _fmt(pwr_a["brine_effectiveness"], ".2f"), "kW/(lb/s)",
+                      _fmt(pwr_b["brine_effectiveness"], ".2f"), "kW/(lb/s)",
+                      _winner(pwr_a["brine_effectiveness"], pwr_b["brine_effectiveness"], lower_better=False)))
 summary_rows.append(("row", "Heat rejection duty",
                       _fmt(perf_a["Q_reject_mmbtu_hr"], ".2f"), "MMBtu/hr",
                       _fmt(perf_b["Q_reject_mmbtu_hr"], ".2f"), "MMBtu/hr",
@@ -1310,16 +1320,21 @@ summary_rows.append(("row", "Total parasitic",
                       _fmt(parasitic_a["total_kw"], ".0f"), "kW",
                       _fmt(parasitic_b["total_kw"], ".0f"), "kW",
                       _winner(parasitic_a["total_kw"], parasitic_b["total_kw"], lower_better=True)))
-pct_para_a = parasitic_a["total_kw"] / perf_a["gross_power_kw"] * 100 if perf_a["gross_power_kw"] > 0 else 0
-pct_para_b = parasitic_b["total_kw"] / perf_b["gross_power_kw"] * 100 if perf_b["gross_power_kw"] > 0 else 0
+pct_para_a = pwr_a["parasitic_pct"]
+pct_para_b = pwr_b["parasitic_pct"]
 summary_rows.append(("row", "Parasitic % of gross",
                       _fmt(pct_para_a, ".1f"), "%",
                       _fmt(pct_para_b, ".1f"), "%",
                       _winner(pct_para_a, pct_para_b, lower_better=True)))
-summary_rows.append(("row", "True net output (incl. fans)",
-                      _fmt(true_net_a, ".0f"), "kW",
-                      _fmt(true_net_b, ".0f"), "kW",
-                      _winner(true_net_a, true_net_b, lower_better=False)))
+# Verification: net must equal gross - total parasitic
+_check_a = abs(pwr_a["P_net"] - (pwr_a["P_gross"] - pwr_a["W_total_parasitic"])) > 1.0
+_check_b = abs(pwr_b["P_net"] - (pwr_b["P_gross"] - pwr_b["W_total_parasitic"])) > 1.0
+_net_a_style = "**:red[" + _fmt(pwr_a["P_net"], ".0f") + "]**" if _check_a else _fmt(pwr_a["P_net"], ".0f")
+_net_b_style = "**:red[" + _fmt(pwr_b["P_net"], ".0f") + "]**" if _check_b else _fmt(pwr_b["P_net"], ".0f")
+summary_rows.append(("row", "= Net power",
+                      _net_a_style, "kW",
+                      _net_b_style, "kW",
+                      _winner(pwr_a["P_net"], pwr_b["P_net"], lower_better=False)))
 
 # -- Physical Scale --
 summary_rows.append(("group", "Physical Scale", "", "", "", "", ""))
@@ -1472,9 +1487,9 @@ for row in summary_rows:
 st.markdown(table_md)
 
 # Auto-generated summary sentence
-power_winner = "A" if perf_a["net_power_kw"] >= perf_b["net_power_kw"] else "B"
+power_winner = "A" if pwr_a["P_net"] >= pwr_b["P_net"] else "B"
 cost_winner = "A" if costs_a["total_installed"] <= costs_b["total_installed"] else "B"
-power_diff_kw = abs(perf_a["net_power_kw"] - perf_b["net_power_kw"])
+power_diff_kw = abs(pwr_a["P_net"] - pwr_b["P_net"])
 cost_diff_mm = abs(costs_a["total_installed"] - costs_b["total_installed"]) / 1e6
 
 summary_sentence = (
@@ -1506,9 +1521,9 @@ with st.expander("Seasonal Fan Power & Net Output"):
             "Season": season,
             "T_amb (°F)": f"{sa['T_ambient']:.0f}",
             "Fan A (kW)": f"{sa['fan_kw']:.0f}",
-            "True Net A (kW)": f"{sa['true_net']:.0f}",
+            "Net A (kW)": f"{sa['P_net']:.0f}",
             "Fan B (kW)": f"{sb['fan_kw']:.0f}",
-            "True Net B (kW)": f"{sb['true_net']:.0f}",
+            "Net B (kW)": f"{sb['P_net']:.0f}",
         })
     st.dataframe(pd.DataFrame(seasonal_rows).set_index("Season"), use_container_width=True)
     st.caption("Q_rejection held constant at design value; only air density varies with temperature.")
@@ -1689,8 +1704,8 @@ fig_power = make_subplots(specs=[[{"secondary_y": True}]])
 
 # Bar chart: gross and net power
 categories = ["Gross Power", "Net Power"]
-power_a_vals = [perf_a["gross_power_kw"], perf_a["net_power_kw"]]
-power_b_vals = [perf_b["gross_power_kw"], perf_b["net_power_kw"]]
+power_a_vals = [perf_a["gross_power_kw"], pwr_a["P_net"]]
+power_b_vals = [perf_b["gross_power_kw"], pwr_b["P_net"]]
 
 fig_power.add_trace(
     go.Bar(x=categories, y=power_a_vals, name="Config A", marker_color="steelblue"),
@@ -1703,7 +1718,7 @@ fig_power.add_trace(
 
 # Efficiency line on secondary axis
 eta_categories = ["Config A", "Config B"]
-eta_vals = [perf_a["eta_thermal"]*100, perf_b["eta_thermal"]*100]
+eta_vals = [pwr_a["eta_thermal"]*100, pwr_b["eta_thermal"]*100]
 fig_power.add_trace(
     go.Scatter(x=eta_categories, y=eta_vals, name="Thermal Efficiency",
                mode="lines+markers", marker=dict(size=12, color="orange"),
@@ -1723,17 +1738,17 @@ st.plotly_chart(fig_power, width="stretch")
 
 # Key metrics below chart
 pwr_col1, pwr_col2, pwr_col3, pwr_col4 = st.columns(4)
-pwr_col1.metric("Net Power A", f"{perf_a['net_power_kw']:.0f} kW")
-pwr_col2.metric("Net Power B", f"{perf_b['net_power_kw']:.0f} kW")
-pwr_col3.metric("Delta (B-A)", f"{perf_b['net_power_kw'] - perf_a['net_power_kw']:.0f} kW")
+pwr_col1.metric("Net Power A", f"{pwr_a['P_net']:.0f} kW")
+pwr_col2.metric("Net Power B", f"{pwr_b['P_net']:.0f} kW")
+pwr_col3.metric("Delta (B-A)", f"{pwr_b['P_net'] - pwr_a['P_net']:.0f} kW")
 pwr_col4.metric("Vol. Flow Ratio (A/B)", f"{vol_ratio:.1f}x")
 
-# Power waterfall: Gross -> deductions -> True Net
+# Power waterfall: Gross -> deductions -> Net Power
 st.subheader("Parasitic Load Breakdown")
 wf_pwr_col1, wf_pwr_col2 = st.columns(2)
 
 with wf_pwr_col1:
-    wf_a_labels = ["Gross", "ISO Pump", "ACC Fans", "Auxiliary", "True Net"]
+    wf_a_labels = ["Gross", "ISO Pump", "ACC Fans", "Auxiliary", "Net Power"]
     wf_a_values = [
         perf_a["gross_power_kw"],
         -parasitic_a["iso_pump_kw"],
@@ -1748,11 +1763,11 @@ with wf_pwr_col1:
         decreasing=dict(marker=dict(color="indianred")),
         increasing=dict(marker=dict(color="steelblue")),
         totals=dict(marker=dict(color="darkblue")),
-        text=[f"{abs(v):.0f} kW" if v is not None else f"{true_net_a:.0f} kW" for v in wf_a_values],
+        text=[f"{abs(v):.0f} kW" if v is not None else f"{pwr_a["P_net"]:.0f} kW" for v in wf_a_values],
         textposition="outside",
     ))
     fig_wf_pwr_a.update_layout(
-        title="Config A -- Gross to True Net (kW)",
+        title="Config A -- Gross to Net Power (kW)",
         yaxis_title="Power (kW)", height=400, showlegend=False,
     )
     fig_wf_pwr_a.update_traces(textfont_size=10, cliponaxis=False)
@@ -1760,7 +1775,7 @@ with wf_pwr_col1:
 
 with wf_pwr_col2:
     if parasitic_b["thermosiphon"]:
-        wf_b_labels = ["Gross", "ISO Pump", "ACC Fans", "Auxiliary", "True Net"]
+        wf_b_labels = ["Gross", "ISO Pump", "ACC Fans", "Auxiliary", "Net Power"]
         wf_b_values = [
             perf_b["gross_power_kw"],
             -parasitic_b["iso_pump_kw"],
@@ -1770,7 +1785,7 @@ with wf_pwr_col2:
         ]
         wf_b_measures = ["absolute", "relative", "relative", "relative", "total"]
     else:
-        wf_b_labels = ["Gross", "ISO Pump", "Prop Pump", "ACC Fans", "Auxiliary", "True Net"]
+        wf_b_labels = ["Gross", "ISO Pump", "Prop Pump", "ACC Fans", "Auxiliary", "Net Power"]
         wf_b_values = [
             perf_b["gross_power_kw"],
             -parasitic_b["iso_pump_kw"],
@@ -1786,11 +1801,11 @@ with wf_pwr_col2:
         decreasing=dict(marker=dict(color="indianred")),
         increasing=dict(marker=dict(color="steelblue")),
         totals=dict(marker=dict(color="darkred")),
-        text=[f"{abs(v):.0f} kW" if v is not None else f"{true_net_b:.0f} kW" for v in wf_b_values],
+        text=[f"{abs(v):.0f} kW" if v is not None else f"{pwr_b["P_net"]:.0f} kW" for v in wf_b_values],
         textposition="outside",
     ))
     fig_wf_pwr_b.update_layout(
-        title="Config B -- Gross to True Net (kW)",
+        title="Config B -- Gross to Net Power (kW)",
         yaxis_title="Power (kW)", height=400, showlegend=False,
     )
     fig_wf_pwr_b.update_traces(textfont_size=10, cliponaxis=False)
@@ -1867,6 +1882,17 @@ with tab1:
                      annotation_text=f"A cond: {perf_a['T_cond']:.0f}degF")
     fig_ts.add_hline(y=perf_b["T_cond_iso"], line_dash="dot", line_color="red",
                      annotation_text=f"B cond: {perf_b['T_cond_iso']:.0f}degF")
+
+    # Net efficiency annotations
+    fig_ts.add_annotation(
+        x=0.98, y=0.02, xref="paper", yref="paper",
+        text=(f"Net eta_th: A={pwr_a['eta_thermal']*100:.1f}%  "
+              f"B={pwr_b['eta_thermal']*100:.1f}%"),
+        showarrow=False,
+        font=dict(size=11, color="black"),
+        bgcolor="rgba(255,255,255,0.8)", bordercolor="gray", borderwidth=1,
+        xanchor="right", yanchor="bottom",
+    )
 
     fig_ts.update_layout(
         title="T-s Diagram -- Isopentane ORC Cycles",
@@ -2274,13 +2300,19 @@ with tab6:
         try:
             inp_sw_a = {**inputs, "dp_acc_tubes_a": float(dp_val)}
             r_sw_a = solve_config_a(inp_sw_a, fp)
-            power_a_sweep.append(r_sw_a["performance"]["net_power_kw"])
+            fan_sw_a = calculate_fan_power(r_sw_a["performance"]["Q_reject_mmbtu_hr"], inputs["T_ambient"], inp_sw_a)
+            pwr_sw_a = compute_power_balance(r_sw_a["performance"], fan_sw_a, inp_sw_a, config="A")
+            power_a_sweep.append(pwr_sw_a["P_net"])
         except Exception:
             power_a_sweep.append(float("nan"))
         try:
             inp_sw_b = {**inputs, "dp_acc_tubes_prop": float(dp_val)}
             r_sw_b = solve_config_b(inp_sw_b, fp)
-            power_b_sweep_hyd.append(r_sw_b["performance"]["net_power_kw"])
+            _ps_sw_b = r_sw_b["propane_states"]
+            _Q_rej_sw_b = r_sw_b["performance"]["m_dot_prop"] * (_ps_sw_b["A"].h - _ps_sw_b["B"].h) / 1e6
+            fan_sw_b = calculate_fan_power(_Q_rej_sw_b, inputs["T_ambient"], inp_sw_b)
+            pwr_sw_b = compute_power_balance(r_sw_b["performance"], fan_sw_b, inp_sw_b, config="B")
+            power_b_sweep_hyd.append(pwr_sw_b["P_net"])
         except Exception:
             power_b_sweep_hyd.append(float("nan"))
 
