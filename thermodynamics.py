@@ -151,10 +151,12 @@ def _duct_segment(m_dot_lbs, rho, velocity, length, fluid, T_sat, fp, f_darcy=0.
     diameter_ft = (4 * area / math.pi) ** 0.5
     diameter_in = diameter_ft * 12
 
-    # Darcy-Weisbach: dP = f * L/D * 0.5 * rho * v^2
+    # Darcy-Weisbach: dP = f * (L/D) * rho * v^2 / (2 * g_c)
+    # g_c = 32.174 lbm·ft/(lbf·s²) converts lbm/(ft·s²) to lbf/ft²
     f = f_darcy
+    g_c = 32.174
     if diameter_ft > 0:
-        dp_lbft2 = f * (length / diameter_ft) * 0.5 * rho * velocity ** 2
+        dp_lbft2 = f * (length / diameter_ft) * 0.5 * rho * velocity ** 2 / g_c
         dp_psi = dp_lbft2 / 144.0
     else:
         dp_psi = 0.0
