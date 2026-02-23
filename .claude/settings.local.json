@@ -1,0 +1,16 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(py:*)",
+      "Bash(winget install:*)",
+      "Bash(export PATH=\"$PATH:/c/Program Files/GitHub CLI\" && \"/c/Program Files/GitHub CLI/gh.exe\" auth status 2>&1)",
+      "Bash(sleep 5:*)",
+      "WebSearch",
+      "Bash(head:*)",
+      "WebFetch(domain:docs.streamlit.io)",
+      "Bash(ls:*)",
+      "WebFetch(domain:github.com)",
+      "Bash(cd:*)"
+    ]
+  }
+}
