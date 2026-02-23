@@ -34,6 +34,7 @@ from cost_model import (
     hx_area_vs_pinch, acc_area_vs_pinch, duct_diameter_vs_dp,
     acc_tubes_vs_dp, sizing_tradeoff_sweep, ACC_TUBE_DEFAULTS,
     _duct_segment_cost,
+    calculate_fan_power, pump_sizing, acc_area_with_air_rise,
 )
 
 st.set_page_config(page_title="ORC Comparator", layout="wide")
@@ -80,104 +81,158 @@ with st.sidebar:
 
     with st.form("input_form"):
         with st.expander("Brine Inputs", expanded=True):
-            T_geo_in = st.number_input("Brine inlet temperature (degF)", 200, 500, 300, 5)
-            m_dot_geo = st.number_input("Brine mass flow rate (lb/s)", 10, 2000, 200, 10)
-            cp_brine = st.number_input("Brine specific heat (BTU/lb-degF)", 0.5, 1.5, 1.0, 0.05)
-            T_geo_out_min = st.number_input("Min brine outlet temperature (degF)", 80, 250, 160, 5,
+            T_geo_in = st.number_input("Brine inlet temperature (degF)",
+                                       min_value=1, value=300, step=5)
+            m_dot_geo = st.number_input("Brine mass flow rate (lb/s)",
+                                        min_value=1, value=200, step=10)
+            cp_brine = st.number_input("Brine specific heat (BTU/lb-degF)",
+                                       min_value=0.01, value=1.0, step=0.05, format="%.2f")
+            T_geo_out_min = st.number_input("Min brine outlet temperature (degF)",
+                                            min_value=1, value=160, step=5,
                                             help="Silica/scaling constraint")
 
         with st.expander("Cycle Parameters"):
-            eta_turbine = st.slider("Turbine isentropic efficiency", 0.60, 0.95, 0.82, 0.01)
-            eta_pump = st.slider("Pump isentropic efficiency", 0.50, 0.95, 0.75, 0.01)
-            superheat = st.number_input("Turbine inlet superheat (degF above sat)", 0, 50, 0, 1)
+            eta_turbine = st.number_input("Turbine isentropic efficiency",
+                                          min_value=0.01, value=0.82, step=0.01, format="%.2f")
+            eta_pump = st.number_input("Pump isentropic efficiency",
+                                       min_value=0.01, value=0.75, step=0.01, format="%.2f")
+            superheat = st.number_input("Turbine inlet superheat (degF above sat)",
+                                        min_value=0, value=0, step=1)
             st.info("Isopentane circulation rate is solved from brine energy balance.")
 
         with st.expander("Ambient Conditions"):
-            T_ambient = st.number_input("Ambient dry bulb temperature (degF)", 50, 130, 95, 5)
+            T_ambient = st.number_input("Ambient dry bulb temperature (degF)",
+                                        min_value=-40, value=95, step=5)
 
         with st.expander("Pinch Points"):
-            dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)", 5, 50, 15, 1)
-            dt_pinch_acc_b = st.number_input("ACC pinch Config B (degF)", 5, 50, 15, 1)
-            dt_pinch_vaporizer = st.number_input("Vaporizer pinch (degF)", 3, 30, 10, 1)
-            dt_pinch_preheater = st.number_input("Preheater pinch (degF)", 3, 30, 10, 1)
-            dt_pinch_recup = st.number_input("Recuperator pinch (degF)", 5, 40, 15, 1)
+            dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)",
+                                             min_value=1, value=15, step=1)
+            dt_pinch_acc_b = st.number_input("ACC pinch Config B (degF)",
+                                             min_value=1, value=15, step=1)
+            dt_pinch_vaporizer = st.number_input("Vaporizer pinch (degF)",
+                                                 min_value=1, value=10, step=1)
+            dt_pinch_preheater = st.number_input("Preheater pinch (degF)",
+                                                 min_value=1, value=10, step=1)
+            dt_pinch_recup = st.number_input("Recuperator pinch (degF)",
+                                             min_value=1, value=15, step=1)
             dt_approach_intermediate = st.number_input(
-                "Intermediate HX approach (degF, Config B)", 5, 25, 10, 1)
+                "Intermediate HX approach (degF, Config B)",
+                min_value=1, value=10, step=1)
 
         with st.expander("Duct Parameters"):
-            v_tailpipe = st.number_input("Tailpipe vapor velocity (ft/s)", 5, 25, 10, 1)
-            v_acc_header = st.number_input("ACC header vapor velocity (ft/s)", 5, 25, 15, 1)
-            L_tailpipe_a = st.number_input("Tailpipe length Config A (ft)", 10, 100, 30, 5)
-            L_long_header = st.number_input("Long vapor header length (ft)", 50, 500, 120, 10)
-            L_acc_header = st.number_input("ACC distribution header length (ft)", 50, 500, 200, 10)
+            v_tailpipe = st.number_input("Tailpipe vapor velocity (ft/s)",
+                                         min_value=1, value=10, step=1)
+            v_acc_header = st.number_input("ACC header vapor velocity (ft/s)",
+                                           min_value=1, value=15, step=1)
+            L_tailpipe_a = st.number_input("Tailpipe length Config A (ft)",
+                                           min_value=1, value=30, step=5)
+            L_long_header = st.number_input("Long vapor header length (ft)",
+                                            min_value=1, value=120, step=10)
+            L_acc_header = st.number_input("ACC distribution header length (ft)",
+                                           min_value=1, value=200, step=10)
 
         with st.expander("Hydraulic Parameters"):
-            f_darcy = st.number_input("Darcy friction factor f", 0.015, 0.030, 0.020, 0.001, format="%.3f")
+            f_darcy = st.number_input("Darcy friction factor f",
+                                      min_value=0.001, value=0.020, step=0.001, format="%.3f")
             st.markdown("**Config A Equipment dP (psi)**")
-            dp_acc_tubes_a = st.number_input("ACC tube bundle dP", 0.0, 3.0, 0.5, 0.1, key="dp_acc_tubes_a")
-            dp_acc_headers_a = st.number_input("ACC vapor headers dP", 0.0, 3.0, 0.3, 0.1, key="dp_acc_headers_a")
-            dp_recup_a = st.number_input("Recuperator dP (A)", 0.0, 3.0, 0.3, 0.1, key="dp_recup_a")
+            dp_acc_tubes_a = st.number_input("ACC tube bundle dP",
+                                             min_value=0.0, value=0.5, step=0.1, key="dp_acc_tubes_a")
+            dp_acc_headers_a = st.number_input("ACC vapor headers dP",
+                                               min_value=0.0, value=0.3, step=0.1, key="dp_acc_headers_a")
+            dp_recup_a = st.number_input("Recuperator dP (A)",
+                                         min_value=0.0, value=0.3, step=0.1, key="dp_recup_a")
             st.markdown("**Config B Isopentane Side dP (psi)**")
-            dp_ihx_iso = st.number_input("IHX iso side dP", 0.0, 3.0, 0.5, 0.1, key="dp_ihx_iso")
-            dp_recup_b = st.number_input("Recuperator dP (B)", 0.0, 3.0, 0.3, 0.1, key="dp_recup_b")
-            dp_tailpipe_iso_b = st.number_input("ISO tailpipe dP (B)", 0.0, 3.0, 0.3, 0.1, key="dp_tailpipe_iso_b")
+            dp_ihx_iso = st.number_input("IHX iso side dP",
+                                         min_value=0.0, value=0.5, step=0.1, key="dp_ihx_iso")
+            dp_recup_b = st.number_input("Recuperator dP (B)",
+                                         min_value=0.0, value=0.3, step=0.1, key="dp_recup_b")
+            dp_tailpipe_iso_b = st.number_input("ISO tailpipe dP (B)",
+                                                min_value=0.0, value=0.3, step=0.1, key="dp_tailpipe_iso_b")
             st.markdown("**Config B Propane Side dP (psi)**")
-            dp_acc_tubes_prop = st.number_input("ACC tube bundle dP (prop)", 0.0, 5.0, 1.0, 0.1, key="dp_acc_tubes_prop")
-            dp_ihx_prop = st.number_input("IHX propane side dP", 0.0, 3.0, 0.5, 0.1, key="dp_ihx_prop")
+            dp_acc_tubes_prop = st.number_input("ACC tube bundle dP (prop)",
+                                                min_value=0.0, value=1.0, step=0.1, key="dp_acc_tubes_prop")
+            dp_ihx_prop = st.number_input("IHX propane side dP",
+                                          min_value=0.0, value=0.5, step=0.1, key="dp_ihx_prop")
+
+        with st.expander("ACC Fan Parameters"):
+            dT_air = st.number_input("Air temp rise (°F)",
+                                     min_value=1, value=25, step=1,
+                                     help="Temperature rise of air across ACC bundles")
+            fan_static_inwc = st.number_input("Fan static pressure (in WC)",
+                                              min_value=0.01, value=0.75, step=0.05,
+                                              key="fan_static_inwc", format="%.2f")
+            eta_fan = st.number_input("Fan efficiency",
+                                      min_value=0.01, value=0.78, step=0.01,
+                                      key="eta_fan", format="%.2f")
+            eta_motor = st.number_input("Motor efficiency",
+                                        min_value=0.01, value=0.95, step=0.01,
+                                        key="eta_motor", format="%.2f")
+            n_fan_bays = st.number_input("Number of fan bays (0=auto)",
+                                         min_value=0, value=0, step=1,
+                                         help="Set to 0 to auto-size from airflow")
+            fan_diameter_ft = st.number_input("Fan diameter (ft)",
+                                              min_value=1, value=28, step=1)
+            W_aux_kw = st.number_input("Auxiliary parasitic (kW)",
+                                       min_value=0, value=150, step=10,
+                                       help="Lube oil, controls, lighting, instruments")
 
         with st.expander("Economic Parameters"):
-            electricity_price = st.number_input("Electricity price ($/MWh)", 10, 200, 35, 5)
-            capacity_factor = st.slider("Capacity factor (%)", 70, 100, 95, 1)
-            discount_rate = st.slider("Discount rate (%)", 3, 15, 8, 1)
-            project_life = st.number_input("Plant life (years)", 10, 40, 30, 1)
+            electricity_price = st.number_input("Electricity price ($/MWh)",
+                                                min_value=1, value=35, step=5)
+            capacity_factor = st.number_input("Capacity factor (%)",
+                                              min_value=1, value=95, step=1)
+            discount_rate = st.number_input("Discount rate (%)",
+                                            min_value=0, value=8, step=1)
+            project_life = st.number_input("Plant life (years)",
+                                           min_value=1, value=30, step=1)
 
         with st.expander("Unit Cost Assumptions (2024 USD Installed)"):
             st.markdown("**Heat Exchanger Costs**")
             uc_vaporizer_per_ft2 = st.number_input(
-                "Vaporizer ($/ft2)", 20, 60, 35, 1, key="uc_vaporizer")
+                "Vaporizer ($/ft2)", min_value=1, value=35, step=1, key="uc_vaporizer")
             uc_preheater_per_ft2 = st.number_input(
-                "Preheater ($/ft2)", 15, 50, 30, 1, key="uc_preheater")
+                "Preheater ($/ft2)", min_value=1, value=30, step=1, key="uc_preheater")
             uc_recuperator_per_ft2 = st.number_input(
-                "Recuperator ($/ft2)", 15, 45, 25, 1, key="uc_recuperator")
+                "Recuperator ($/ft2)", min_value=1, value=25, step=1, key="uc_recuperator")
             uc_ihx_per_ft2 = st.number_input(
-                "IHX ($/ft2, pressure rated)", 25, 70, 40, 1, key="uc_ihx")
+                "IHX ($/ft2, pressure rated)", min_value=1, value=40, step=1, key="uc_ihx")
             uc_acc_per_ft2 = st.number_input(
-                "ACC ($/ft2 face area)", 8, 20, 12, 1, key="uc_acc")
+                "ACC ($/ft2 face area)", min_value=1, value=12, step=1, key="uc_acc")
 
             st.markdown("**Duct and Piping Costs**")
             uc_iso_duct_per_ft2 = st.number_input(
-                "Iso duct ($/ft2 surface)", 100, 300, 180, 5,
+                "Iso duct ($/ft2 surface)", min_value=1, value=180, step=5,
                 key="uc_iso_duct",
                 help="Diameter multiplier: >72\" x1.7, >60\" x1.4")
             uc_prop_pipe_per_ft2 = st.number_input(
-                "Propane pipe ($/ft2 surface)", 80, 200, 120, 5,
+                "Propane pipe ($/ft2 surface)", min_value=1, value=120, step=5,
                 key="uc_prop_pipe")
             uc_prop_piping_pct = st.number_input(
-                "Propane system (% of IHX cost)", 10, 35, 20, 1,
+                "Propane system (% of IHX cost)", min_value=0, value=20, step=1,
                 key="uc_prop_pct")
 
             st.markdown("**Turbine and Electrical**")
             uc_turbine_per_kw = st.number_input(
-                "Turbine-generator ($/kW)", 800, 1800, 1200, 50,
+                "Turbine-generator ($/kW)", min_value=1, value=1200, step=50,
                 key="uc_turbine")
 
             st.markdown("**Civil and Structural**")
             uc_steel_per_lb = st.number_input(
-                "Structural steel ($/lb)", 3.0, 7.0, 4.5, 0.25,
+                "Structural steel ($/lb)", min_value=0.01, value=4.5, step=0.25,
                 key="uc_steel", format="%.2f")
             uc_foundation_pct = st.number_input(
-                "Foundation (% of equipment)", 5, 15, 8, 1,
+                "Foundation (% of equipment)", min_value=0, value=8, step=1,
                 key="uc_foundation")
 
             st.markdown("**Indirect Costs**")
             uc_engineering_pct = st.number_input(
-                "Engineering & procurement (%)", 8, 18, 12, 1,
+                "Engineering & procurement (%)", min_value=0, value=12, step=1,
                 key="uc_eng")
             uc_construction_mgmt_pct = st.number_input(
-                "Construction management (%)", 5, 12, 8, 1,
+                "Construction management (%)", min_value=0, value=8, step=1,
                 key="uc_cm")
             uc_contingency_pct = st.number_input(
-                "Contingency (%)", 10, 25, 15, 1,
+                "Contingency (%)", min_value=0, value=15, step=1,
                 key="uc_contingency")
 
             st.caption("Cost basis: AACE Class 4-5 factored estimate. Accuracy range -30% to +50%.")
@@ -217,6 +272,14 @@ inputs = {
     "dp_tailpipe_iso_b": dp_tailpipe_iso_b,
     "dp_acc_tubes_prop": dp_acc_tubes_prop,
     "dp_ihx_prop": dp_ihx_prop,
+    # ACC fan parameters
+    "dT_air": dT_air,
+    "fan_static_inwc": fan_static_inwc,
+    "eta_fan": eta_fan,
+    "eta_motor": eta_motor,
+    "n_fan_bays": n_fan_bays,
+    "fan_diameter_ft": fan_diameter_ft,
+    "W_aux_kw": W_aux_kw,
     # Unit cost overrides
     "uc_vaporizer_per_ft2": uc_vaporizer_per_ft2,
     "uc_preheater_per_ft2": uc_preheater_per_ft2,
@@ -245,9 +308,21 @@ for w in warns:
 
 try:
     result_a = solve_config_a(inputs, fp)
+except Exception as e:
+    st.error(f"**Config A solver error:** {e}\n\n"
+             "This is likely caused by an input value that is too large or too small. "
+             f"Check brine temps ({T_geo_in}→{T_geo_out_min}°F), ambient ({T_ambient}°F), "
+             f"ACC pinch ({dt_pinch_acc_a}°F), efficiencies, or duct velocities.")
+    st.stop()
+
+try:
     result_b = solve_config_b(inputs, fp)
 except Exception as e:
-    st.error(f"Cycle solver error: {e}")
+    st.error(f"**Config B solver error:** {e}\n\n"
+             "This is likely caused by an input value that is too large or too small. "
+             f"Check brine temps ({T_geo_in}→{T_geo_out_min}°F), ambient ({T_ambient}°F), "
+             f"ACC pinch ({dt_pinch_acc_b}°F), IHX approach ({dt_approach_intermediate}°F), "
+             f"or duct velocities.")
     st.stop()
 
 perf_a = result_a["performance"]
@@ -276,10 +351,95 @@ except Exception:
     dW_dT_b = 0.0
 
 # Costs
-costs_a = calculate_costs_a(states_a, perf_a, inputs, duct_a)
-costs_b = calculate_costs_b(states_b, prop_states, perf_b, inputs, duct_b)
-lc_a = lifecycle_cost(costs_a["total_installed"], perf_a["net_power_kw"], inputs)
-lc_b = lifecycle_cost(costs_b["total_installed"], perf_b["net_power_kw"], inputs)
+try:
+    costs_a = calculate_costs_a(states_a, perf_a, inputs, duct_a)
+    costs_b = calculate_costs_b(states_b, prop_states, perf_b, inputs, duct_b)
+    lc_a = lifecycle_cost(costs_a["total_installed"], perf_a["net_power_kw"], inputs)
+    lc_b = lifecycle_cost(costs_b["total_installed"], perf_b["net_power_kw"], inputs)
+except Exception as e:
+    st.error(f"**Cost calculation error:** {e}\n\n"
+             "This is likely caused by an input value that is too large or too small. "
+             "Check unit cost assumptions, pinch points, or economic parameters.")
+    st.stop()
+
+# ---- Fan power & pump sizing ----
+try:
+    # Config A: isopentane condenses directly to air
+    fan_a = calculate_fan_power(perf_a["Q_reject_mmbtu_hr"], inputs["T_ambient"], inputs)
+
+    # Config B: propane rejects to air (slightly more than iso condensing duty due to prop pump work)
+    Q_reject_air_b = perf_b["m_dot_prop"] * (prop_states["A"].h - prop_states["B"].h) / 1e6
+    fan_b = calculate_fan_power(Q_reject_air_b, inputs["T_ambient"], inputs)
+
+    # Pump sizing
+    pump_iso_a = pump_sizing(
+        perf_a["m_dot_iso"], states_a["4"].rho,
+        perf_a["P_high"], perf_a["P_low"],
+        perf_a["w_pump"], inputs["eta_pump"],
+    )
+    pump_iso_b = pump_sizing(
+        perf_b["m_dot_iso"], states_b["4"].rho,
+        perf_b["P_high_iso"], perf_b["P_low_iso"],
+        perf_b["w_pump_iso"], inputs["eta_pump"],
+    )
+    pump_prop_b = pump_sizing(
+        perf_b["m_dot_prop"], prop_states["B"].rho,
+        perf_b["P_prop_evap"], perf_b["P_prop_cond"],
+        perf_b["w_pump_prop"], inputs["eta_pump"],
+    )
+except Exception as e:
+    st.error(f"**Fan/pump sizing error:** {e}\n\n"
+             "This is likely caused by an input value that is too large or too small. "
+             f"Check fan parameters (dT_air={dT_air}°F, fan efficiency={eta_fan}, "
+             f"motor efficiency={eta_motor}, fan diameter={fan_diameter_ft} ft) "
+             f"or ambient temperature ({T_ambient}°F).")
+    st.stop()
+
+# Build parasitic dicts
+iso_pump_kw_a = perf_a["m_dot_iso"] * perf_a["w_pump"] / 3412.14
+iso_pump_kw_b = perf_b["m_dot_iso"] * perf_b["w_pump_iso"] / 3412.14
+prop_pump_kw_b = perf_b["m_dot_prop"] * perf_b["w_pump_prop"] / 3412.14
+aux_kw = inputs["W_aux_kw"]
+
+parasitic_a = {
+    "iso_pump_kw": iso_pump_kw_a,
+    "prop_pump_kw": 0,
+    "acc_fans_kw": fan_a["W_fans_kw"],
+    "auxiliary_kw": aux_kw,
+    "total_kw": iso_pump_kw_a + fan_a["W_fans_kw"] + aux_kw,
+}
+parasitic_b = {
+    "iso_pump_kw": iso_pump_kw_b,
+    "prop_pump_kw": prop_pump_kw_b,
+    "acc_fans_kw": fan_b["W_fans_kw"],
+    "auxiliary_kw": aux_kw,
+    "total_kw": iso_pump_kw_b + prop_pump_kw_b + fan_b["W_fans_kw"] + aux_kw,
+}
+
+true_net_a = perf_a["gross_power_kw"] - parasitic_a["total_kw"]
+true_net_b = perf_b["gross_power_kw"] - parasitic_b["total_kw"]
+
+# Seasonal fan power variation (Q_reject held constant, only air density changes)
+seasonal_temps = {
+    "Winter": inputs["T_ambient"] - 30,
+    "Design": inputs["T_ambient"],
+    "Summer": inputs["T_ambient"] + 10,
+}
+seasonal_a = {}
+seasonal_b = {}
+for season, T_amb_s in seasonal_temps.items():
+    sf_a = calculate_fan_power(perf_a["Q_reject_mmbtu_hr"], T_amb_s, inputs)
+    sf_b = calculate_fan_power(Q_reject_air_b, T_amb_s, inputs)
+    seasonal_a[season] = {
+        "T_ambient": T_amb_s,
+        "fan_kw": sf_a["W_fans_kw"],
+        "true_net": perf_a["gross_power_kw"] - (iso_pump_kw_a + sf_a["W_fans_kw"] + aux_kw),
+    }
+    seasonal_b[season] = {
+        "T_ambient": T_amb_s,
+        "fan_kw": sf_b["W_fans_kw"],
+        "true_net": perf_b["gross_power_kw"] - (iso_pump_kw_b + prop_pump_kw_b + sf_b["W_fans_kw"] + aux_kw),
+    }
 
 # Pinch checks
 pinch_a = verify_recuperator_pinch(states_a, fp)
@@ -426,15 +586,15 @@ _WIDGET_KEY_MAP = {
     "uc_contingency_pct": "uc_contingency",
 }
 
-# Bounds for validation (min, max) keyed by widget key
+# Bounds for Claude AI recommendation validation -- wide ranges to allow flexibility
 _WIDGET_BOUNDS = {
-    "uc_vaporizer": (20, 60), "uc_preheater": (15, 50),
-    "uc_recuperator": (15, 45), "uc_ihx": (25, 70),
-    "uc_acc": (8, 20), "uc_iso_duct": (100, 300),
-    "uc_prop_pipe": (80, 200), "uc_prop_pct": (10, 35),
-    "uc_turbine": (800, 1800), "uc_steel": (3.0, 7.0),
-    "uc_foundation": (5, 15), "uc_eng": (8, 18),
-    "uc_cm": (5, 12), "uc_contingency": (10, 25),
+    "uc_vaporizer": (1, 999), "uc_preheater": (1, 999),
+    "uc_recuperator": (1, 999), "uc_ihx": (1, 999),
+    "uc_acc": (1, 999), "uc_iso_duct": (1, 9999),
+    "uc_prop_pipe": (1, 9999), "uc_prop_pct": (0, 100),
+    "uc_turbine": (1, 99999), "uc_steel": (0.01, 999.0),
+    "uc_foundation": (0, 100), "uc_eng": (0, 100),
+    "uc_cm": (0, 100), "uc_contingency": (0, 100),
 }
 
 
@@ -1084,6 +1244,39 @@ summary_rows.append(("row", "Heat rejection duty",
                       _fmt(perf_b["Q_reject_mmbtu_hr"], ".2f"), "MMBtu/hr",
                       _winner(perf_a["Q_reject_mmbtu_hr"], perf_b["Q_reject_mmbtu_hr"], lower_better=True)))
 
+# -- Parasitic Loads --
+summary_rows.append(("group", "Parasitic Loads", "", "", "", "", ""))
+summary_rows.append(("row", "ISO pump",
+                      _fmt(parasitic_a["iso_pump_kw"], ".0f"), "kW",
+                      _fmt(parasitic_b["iso_pump_kw"], ".0f"), "kW",
+                      _winner(parasitic_a["iso_pump_kw"], parasitic_b["iso_pump_kw"], lower_better=True)))
+summary_rows.append(("row", "Propane pump",
+                      "N/A", "",
+                      _fmt(parasitic_b["prop_pump_kw"], ".0f"), "kW",
+                      ""))
+summary_rows.append(("row", "ACC fans",
+                      _fmt(parasitic_a["acc_fans_kw"], ".0f"), "kW",
+                      _fmt(parasitic_b["acc_fans_kw"], ".0f"), "kW",
+                      _winner(parasitic_a["acc_fans_kw"], parasitic_b["acc_fans_kw"], lower_better=True)))
+summary_rows.append(("row", "Auxiliary",
+                      _fmt(parasitic_a["auxiliary_kw"], ".0f"), "kW",
+                      _fmt(parasitic_b["auxiliary_kw"], ".0f"), "kW",
+                      "Tie"))
+summary_rows.append(("row", "Total parasitic",
+                      _fmt(parasitic_a["total_kw"], ".0f"), "kW",
+                      _fmt(parasitic_b["total_kw"], ".0f"), "kW",
+                      _winner(parasitic_a["total_kw"], parasitic_b["total_kw"], lower_better=True)))
+pct_para_a = parasitic_a["total_kw"] / perf_a["gross_power_kw"] * 100 if perf_a["gross_power_kw"] > 0 else 0
+pct_para_b = parasitic_b["total_kw"] / perf_b["gross_power_kw"] * 100 if perf_b["gross_power_kw"] > 0 else 0
+summary_rows.append(("row", "Parasitic % of gross",
+                      _fmt(pct_para_a, ".1f"), "%",
+                      _fmt(pct_para_b, ".1f"), "%",
+                      _winner(pct_para_a, pct_para_b, lower_better=True)))
+summary_rows.append(("row", "True net output (incl. fans)",
+                      _fmt(true_net_a, ".0f"), "kW",
+                      _fmt(true_net_b, ".0f"), "kW",
+                      _winner(true_net_a, true_net_b, lower_better=False)))
+
 # -- Physical Scale --
 summary_rows.append(("group", "Physical Scale", "", "", "", "", ""))
 summary_rows.append(("row", "Tailpipe diameter",
@@ -1258,6 +1451,23 @@ elif total_economic_advantage < 0:
     summary_sentence += f"Total economic advantage for A: **${abs(total_economic_advantage)/1e6:.2f}MM**."
 
 st.markdown(summary_sentence)
+
+# Seasonal variation mini-table
+with st.expander("Seasonal Fan Power & Net Output"):
+    seasonal_rows = []
+    for season in ["Winter", "Design", "Summer"]:
+        sa = seasonal_a[season]
+        sb = seasonal_b[season]
+        seasonal_rows.append({
+            "Season": season,
+            "T_amb (°F)": f"{sa['T_ambient']:.0f}",
+            "Fan A (kW)": f"{sa['fan_kw']:.0f}",
+            "True Net A (kW)": f"{sa['true_net']:.0f}",
+            "Fan B (kW)": f"{sb['fan_kw']:.0f}",
+            "True Net B (kW)": f"{sb['true_net']:.0f}",
+        })
+    st.dataframe(pd.DataFrame(seasonal_rows).set_index("Season"), use_container_width=True)
+    st.caption("Q_rejection held constant at design value; only air density varies with temperature.")
 
 # Schedule breakdown detail
 with st.expander("Schedule Breakdown"):
@@ -1474,6 +1684,63 @@ pwr_col2.metric("Net Power B", f"{perf_b['net_power_kw']:.0f} kW")
 pwr_col3.metric("Delta (B-A)", f"{perf_b['net_power_kw'] - perf_a['net_power_kw']:.0f} kW")
 pwr_col4.metric("Vol. Flow Ratio (A/B)", f"{vol_ratio:.1f}x")
 
+# Power waterfall: Gross -> deductions -> True Net
+st.subheader("Parasitic Load Breakdown")
+wf_pwr_col1, wf_pwr_col2 = st.columns(2)
+
+with wf_pwr_col1:
+    wf_a_labels = ["Gross", "ISO Pump", "ACC Fans", "Auxiliary", "True Net"]
+    wf_a_values = [
+        perf_a["gross_power_kw"],
+        -parasitic_a["iso_pump_kw"],
+        -parasitic_a["acc_fans_kw"],
+        -parasitic_a["auxiliary_kw"],
+        None,
+    ]
+    wf_a_measures = ["absolute", "relative", "relative", "relative", "total"]
+    fig_wf_pwr_a = go.Figure(go.Waterfall(
+        x=wf_a_labels, y=wf_a_values, measure=wf_a_measures,
+        connector=dict(line=dict(color="rgb(63, 63, 63)")),
+        decreasing=dict(marker=dict(color="indianred")),
+        increasing=dict(marker=dict(color="steelblue")),
+        totals=dict(marker=dict(color="darkblue")),
+        text=[f"{abs(v):.0f} kW" if v is not None else f"{true_net_a:.0f} kW" for v in wf_a_values],
+        textposition="outside",
+    ))
+    fig_wf_pwr_a.update_layout(
+        title="Config A -- Gross to True Net (kW)",
+        yaxis_title="Power (kW)", height=400, showlegend=False,
+    )
+    fig_wf_pwr_a.update_traces(textfont_size=10, cliponaxis=False)
+    st.plotly_chart(fig_wf_pwr_a, use_container_width=True)
+
+with wf_pwr_col2:
+    wf_b_labels = ["Gross", "ISO Pump", "Prop Pump", "ACC Fans", "Auxiliary", "True Net"]
+    wf_b_values = [
+        perf_b["gross_power_kw"],
+        -parasitic_b["iso_pump_kw"],
+        -parasitic_b["prop_pump_kw"],
+        -parasitic_b["acc_fans_kw"],
+        -parasitic_b["auxiliary_kw"],
+        None,
+    ]
+    wf_b_measures = ["absolute", "relative", "relative", "relative", "relative", "total"]
+    fig_wf_pwr_b = go.Figure(go.Waterfall(
+        x=wf_b_labels, y=wf_b_values, measure=wf_b_measures,
+        connector=dict(line=dict(color="rgb(63, 63, 63)")),
+        decreasing=dict(marker=dict(color="indianred")),
+        increasing=dict(marker=dict(color="steelblue")),
+        totals=dict(marker=dict(color="darkred")),
+        text=[f"{abs(v):.0f} kW" if v is not None else f"{true_net_b:.0f} kW" for v in wf_b_values],
+        textposition="outside",
+    ))
+    fig_wf_pwr_b.update_layout(
+        title="Config B -- Gross to True Net (kW)",
+        yaxis_title="Power (kW)", height=400, showlegend=False,
+    )
+    fig_wf_pwr_b.update_traces(textfont_size=10, cliponaxis=False)
+    st.plotly_chart(fig_wf_pwr_b, use_container_width=True)
+
 
 # ============================================================================
 # SECTION 4: TECHNICAL CHARTS (TABS)
@@ -1481,10 +1748,10 @@ pwr_col4.metric("Vol. Flow Ratio (A/B)", f"{vol_ratio:.1f}x")
 
 st.header("Technical Analysis")
 
-tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "T-s Diagram", "Duct Sizing", "Approach Optimization",
     "Brine Utilization", "Sensitivity Analysis", "Hydraulic Analysis",
-    "Equipment Sizing Trade-offs",
+    "Equipment Sizing Trade-offs", "Fan Power & ACC Optimization",
 ])
 
 # -- Tab 1: T-s Diagram ---------------------------------------------------
@@ -2466,6 +2733,227 @@ Invest in tighter heat exchangers and ducts where the marginal cost curve is
 the plant lifetime.
 """)
 
+# -- Tab 8: Fan Power & ACC Optimization -----------------------------------
+with tab8:
+    st.subheader("Fan Power & ACC Area vs Air Temperature Rise")
+
+    # Sweep dT_air from 15 to 40
+    dT_air_sweep = np.linspace(15, 40, 26)
+    sweep_fan_a = []
+    sweep_fan_b = []
+    sweep_acc_a = []
+    sweep_acc_b = []
+
+    T_cond_a = perf_a["T_cond"]
+    T_cond_b = perf_b["T_propane_cond"]
+
+    for dt_sweep in dT_air_sweep:
+        inp_sweep = {**inputs, "dT_air": float(dt_sweep)}
+        sf_a = calculate_fan_power(perf_a["Q_reject_mmbtu_hr"], inputs["T_ambient"], inp_sweep)
+        sf_b = calculate_fan_power(Q_reject_air_b, inputs["T_ambient"], inp_sweep)
+        sweep_fan_a.append(sf_a["W_fans_kw"])
+        sweep_fan_b.append(sf_b["W_fans_kw"])
+        sweep_acc_a.append(acc_area_with_air_rise(
+            perf_a["Q_reject_mmbtu_hr"], T_cond_a, inputs["T_ambient"], float(dt_sweep)))
+        sweep_acc_b.append(acc_area_with_air_rise(
+            Q_reject_air_b, T_cond_b, inputs["T_ambient"], float(dt_sweep)))
+
+    fig_fan_acc = make_subplots(rows=1, cols=2,
+                                subplot_titles=["Fan Power vs dT_air", "ACC Area vs dT_air"])
+
+    fig_fan_acc.add_trace(go.Scatter(
+        x=dT_air_sweep, y=sweep_fan_a, name="Config A fan",
+        mode="lines", line=dict(color="steelblue", width=2),
+    ), row=1, col=1)
+    fig_fan_acc.add_trace(go.Scatter(
+        x=dT_air_sweep, y=sweep_fan_b, name="Config B fan",
+        mode="lines", line=dict(color="indianred", width=2),
+    ), row=1, col=1)
+
+    # Mark current operating point
+    fig_fan_acc.add_trace(go.Scatter(
+        x=[inputs["dT_air"]], y=[fan_a["W_fans_kw"]],
+        mode="markers", marker=dict(size=12, color="steelblue", symbol="diamond"),
+        name="A design", showlegend=False,
+    ), row=1, col=1)
+    fig_fan_acc.add_trace(go.Scatter(
+        x=[inputs["dT_air"]], y=[fan_b["W_fans_kw"]],
+        mode="markers", marker=dict(size=12, color="indianred", symbol="diamond"),
+        name="B design", showlegend=False,
+    ), row=1, col=1)
+
+    fig_fan_acc.add_trace(go.Scatter(
+        x=dT_air_sweep, y=[a / 1000 for a in sweep_acc_a], name="Config A ACC",
+        mode="lines", line=dict(color="steelblue", width=2, dash="dash"),
+    ), row=1, col=2)
+    fig_fan_acc.add_trace(go.Scatter(
+        x=dT_air_sweep, y=[a / 1000 for a in sweep_acc_b], name="Config B ACC",
+        mode="lines", line=dict(color="indianred", width=2, dash="dash"),
+    ), row=1, col=2)
+
+    fig_fan_acc.update_xaxes(title_text="Air Temp Rise dT_air (°F)", row=1, col=1)
+    fig_fan_acc.update_xaxes(title_text="Air Temp Rise dT_air (°F)", row=1, col=2)
+    fig_fan_acc.update_yaxes(title_text="Fan Power (kW)", row=1, col=1)
+    fig_fan_acc.update_yaxes(title_text="ACC Area (1000 ft²)", row=1, col=2)
+    fig_fan_acc.update_layout(height=450)
+    st.plotly_chart(fig_fan_acc, use_container_width=True)
+
+    # --- Annualized total cost vs dT_air ---
+    st.subheader("Annualized Total Cost vs Air Temperature Rise")
+
+    elec_price = inputs["electricity_price"]  # $/MWh
+    cf_val = inputs["capacity_factor"]
+    r_val = inputs["discount_rate"]
+    n_val = inputs["project_life"]
+    if r_val > 0:
+        ann_fac = (1 - (1 + r_val) ** (-n_val)) / r_val
+    else:
+        ann_fac = n_val
+    uc_acc_val = inputs.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"])
+
+    annual_fan_cost_a = []
+    annual_fan_cost_b = []
+    annual_acc_cost_a = []
+    annual_acc_cost_b = []
+    total_ann_a = []
+    total_ann_b = []
+
+    for i, dt_sweep in enumerate(dT_air_sweep):
+        # Annual fan electricity cost: fan_kW * 8760 * CF * $/MWh / 1000
+        fan_annual_a = sweep_fan_a[i] * 8760 * cf_val * elec_price / 1000
+        fan_annual_b = sweep_fan_b[i] * 8760 * cf_val * elec_price / 1000
+        # ACC capital annualized: area * uc / annuity_factor
+        acc_ann_a = sweep_acc_a[i] * uc_acc_val / ann_fac
+        acc_ann_b = sweep_acc_b[i] * uc_acc_val / ann_fac
+        annual_fan_cost_a.append(fan_annual_a)
+        annual_fan_cost_b.append(fan_annual_b)
+        annual_acc_cost_a.append(acc_ann_a)
+        annual_acc_cost_b.append(acc_ann_b)
+        total_ann_a.append(fan_annual_a + acc_ann_a)
+        total_ann_b.append(fan_annual_b + acc_ann_b)
+
+    # Find optimal dT_air for each config
+    opt_idx_a = int(np.argmin(total_ann_a))
+    opt_idx_b = int(np.argmin(total_ann_b))
+    opt_dt_a = dT_air_sweep[opt_idx_a]
+    opt_dt_b = dT_air_sweep[opt_idx_b]
+
+    fig_ann = go.Figure()
+    fig_ann.add_trace(go.Scatter(
+        x=dT_air_sweep, y=[t / 1000 for t in total_ann_a],
+        name="Config A total", mode="lines",
+        line=dict(color="steelblue", width=2),
+    ))
+    fig_ann.add_trace(go.Scatter(
+        x=dT_air_sweep, y=[t / 1000 for t in total_ann_b],
+        name="Config B total", mode="lines",
+        line=dict(color="indianred", width=2),
+    ))
+
+    # Optimal markers
+    fig_ann.add_trace(go.Scatter(
+        x=[opt_dt_a], y=[total_ann_a[opt_idx_a] / 1000],
+        mode="markers", marker=dict(size=14, color="steelblue", symbol="star"),
+        name=f"A optimal ({opt_dt_a:.0f}°F)",
+    ))
+    fig_ann.add_trace(go.Scatter(
+        x=[opt_dt_b], y=[total_ann_b[opt_idx_b] / 1000],
+        mode="markers", marker=dict(size=14, color="indianred", symbol="star"),
+        name=f"B optimal ({opt_dt_b:.0f}°F)",
+    ))
+
+    fig_ann.update_layout(
+        title="Annualized Cost: Fan Electricity + ACC Capital",
+        xaxis_title="Air Temp Rise dT_air (°F)",
+        yaxis_title="Annualized Cost ($k/yr)",
+        height=400,
+    )
+    st.plotly_chart(fig_ann, use_container_width=True)
+
+    # --- Fan Sizing Summary Table ---
+    st.subheader("Fan Sizing Summary")
+    fan_summary = pd.DataFrame([
+        {
+            "Parameter": "Q rejection (MMBtu/hr)",
+            "Config A": f"{perf_a['Q_reject_mmbtu_hr']:.2f}",
+            "Config B": f"{Q_reject_air_b:.2f}",
+        },
+        {
+            "Parameter": "Air mass flow (klb/hr)",
+            "Config A": f"{fan_a['m_dot_air_lb_hr']/1000:.0f}",
+            "Config B": f"{fan_b['m_dot_air_lb_hr']/1000:.0f}",
+        },
+        {
+            "Parameter": "Vol. flow (ft³/s)",
+            "Config A": f"{fan_a['vol_flow_ft3s']:.0f}",
+            "Config B": f"{fan_b['vol_flow_ft3s']:.0f}",
+        },
+        {
+            "Parameter": "Fan power (kW)",
+            "Config A": f"{fan_a['W_fans_kw']:.0f}",
+            "Config B": f"{fan_b['W_fans_kw']:.0f}",
+        },
+        {
+            "Parameter": "Fan bays (required)",
+            "Config A": f"{fan_a['n_fans_required']}",
+            "Config B": f"{fan_b['n_fans_required']}",
+        },
+        {
+            "Parameter": "Fan bays (used)",
+            "Config A": f"{fan_a['n_fans_used']}",
+            "Config B": f"{fan_b['n_fans_used']}",
+        },
+        {
+            "Parameter": "Fan diameter (ft)",
+            "Config A": f"{inputs['fan_diameter_ft']}",
+            "Config B": f"{inputs['fan_diameter_ft']}",
+        },
+        {
+            "Parameter": "Auxiliary (kW)",
+            "Config A": f"{aux_kw:.0f}",
+            "Config B": f"{aux_kw:.0f}",
+        },
+    ]).set_index("Parameter")
+    st.dataframe(fan_summary, use_container_width=True)
+
+    # --- Pump Sizing Summary Table ---
+    st.subheader("Pump Sizing Summary")
+    pump_summary_rows = [
+        {
+            "Pump": "ISO pump (A)",
+            "Flow (gpm)": f"{pump_iso_a['flow_gpm']:.1f}",
+            "dP (psi)": f"{pump_iso_a['dP_psi']:.0f}",
+            "Power (kW)": f"{pump_iso_a['power_kw']:.1f}",
+            "Power (HP)": f"{pump_iso_a['power_hp']:.0f}",
+        },
+        {
+            "Pump": "ISO pump (B)",
+            "Flow (gpm)": f"{pump_iso_b['flow_gpm']:.1f}",
+            "dP (psi)": f"{pump_iso_b['dP_psi']:.0f}",
+            "Power (kW)": f"{pump_iso_b['power_kw']:.1f}",
+            "Power (HP)": f"{pump_iso_b['power_hp']:.0f}",
+        },
+        {
+            "Pump": "Propane pump (B)",
+            "Flow (gpm)": f"{pump_prop_b['flow_gpm']:.1f}",
+            "dP (psi)": f"{pump_prop_b['dP_psi']:.0f}",
+            "Power (kW)": f"{pump_prop_b['power_kw']:.1f}",
+            "Power (HP)": f"{pump_prop_b['power_hp']:.0f}",
+        },
+    ]
+    st.dataframe(pd.DataFrame(pump_summary_rows).set_index("Pump"), use_container_width=True)
+
+    # --- Interpretation ---
+    st.markdown(f"""
+**Interpretation:**
+- Optimal air temperature rise: **{opt_dt_a:.0f}°F** (Config A), **{opt_dt_b:.0f}°F** (Config B)
+- Current design dT_air = **{inputs['dT_air']}°F**
+- Config A parasitic: **{parasitic_a['total_kw']:.0f} kW** ({pct_para_a:.1f}% of gross)
+- Config B parasitic: **{parasitic_b['total_kw']:.0f} kW** ({pct_para_b:.1f}% of gross)
+- Lower dT_air = more ACC area (capital) but less fan power (operating cost)
+- Higher dT_air = less ACC area but more fan power; star markers show the minimum total annualized cost
+""")
+
 
 # ============================================================================
 # SECTION 5: ASSUMPTIONS AND SOFTWARE INFORMATION
@@ -2520,7 +3008,7 @@ with st.expander("Assumptions and Software Information"):
 - Cycle convergence tolerance: 0.1 degF on condensing temperature
 - Brine modeled as constant-cp fluid
 - All costs are installed costs (2024 USD)
-- No parasitic load for ACC fans included
+- ACC fan power from first-principles airflow model (Cp_air=0.24, face vel=400 fpm)
 - Recuperator modeled with constant-dT pinch
 """)
 
@@ -2538,4 +3026,4 @@ with st.expander("Assumptions and Software Information"):
 - Charts: Plotly
 """)
 
-    st.caption("ORC Comparator v5.0 -- Adjustable unit costs, indirect cost layers, cost sensitivity")
+    st.caption("ORC Comparator v5.2 -- Parasitic load model, fan power optimization, pump sizing")

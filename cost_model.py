@@ -77,6 +77,14 @@ def _default_inputs():
         "dp_acc_tubes_prop": 1.0,
         "dp_prop_headers": 0.5,
         "dp_ihx_prop": 0.5,
+        # ACC fan parameters
+        "dT_air": 25,
+        "fan_static_inwc": 0.75,
+        "eta_fan": 0.78,
+        "eta_motor": 0.95,
+        "n_fan_bays": 0,           # 0 = auto-solve from airflow
+        "fan_diameter_ft": 28,
+        "W_aux_kw": 150,
     }
 
 
@@ -95,6 +103,89 @@ def _acc_face_area(Q_mmbtu_hr, T_cond, T_ambient, U=None):
     if dT <= 0:
         dT = 1
     return Q_mmbtu_hr * 1e6 / (U * dT)
+
+
+def calculate_fan_power(Q_reject_mmbtu_hr, T_ambient, inputs):
+    """ACC fan power from first principles.
+
+    Returns dict with air properties, airflow, fan power, and fan count.
+    """
+    inp = {**_default_inputs(), **inputs}
+    dT_air = inp["dT_air"]
+    fan_static_inwc = inp["fan_static_inwc"]
+    eta_fan = inp["eta_fan"]
+    eta_motor = inp["eta_motor"]
+    n_fan_override = inp["n_fan_bays"]
+    fan_dia_ft = inp["fan_diameter_ft"]
+
+    Cp_air = 0.24  # BTU/(lb·°F)
+    rho_air = 0.0735 * (460 + 68) / (460 + T_ambient)  # lb/ft3
+
+    # Air mass flow from heat balance: Q = m_dot_air * Cp * dT_air
+    m_dot_air_lb_hr = Q_reject_mmbtu_hr * 1e6 / (Cp_air * dT_air)
+
+    # Volumetric flow
+    vol_flow_ft3s = m_dot_air_lb_hr / (rho_air * 3600)
+
+    # Fan static pressure: convert in WC to lbf/ft2
+    dP_fan_psf = fan_static_inwc * 5.192
+
+    # Total fan shaft power: W = V_dot * dP / (eta_fan * eta_motor)
+    W_fans_kw = vol_flow_ft3s * dP_fan_psf / (eta_fan * eta_motor * 745.7)
+
+    # Fan sizing: each fan sweeps a circular area
+    fan_area_each_ft2 = math.pi / 4 * fan_dia_ft ** 2
+    face_vel_fpm = 400  # ft/min typical ACC fan face velocity
+    n_fans_required = max(1, math.ceil(
+        vol_flow_ft3s * 60 / (fan_area_each_ft2 * face_vel_fpm)
+    ))
+    n_fans_used = n_fan_override if n_fan_override > 0 else n_fans_required
+
+    return {
+        "rho_air": rho_air,
+        "m_dot_air_lb_hr": m_dot_air_lb_hr,
+        "vol_flow_ft3s": vol_flow_ft3s,
+        "dP_fan_psf": dP_fan_psf,
+        "W_fans_kw": W_fans_kw,
+        "fan_area_each_ft2": fan_area_each_ft2,
+        "n_fans_required": n_fans_required,
+        "n_fans_used": n_fans_used,
+    }
+
+
+def pump_sizing(m_dot_lb_hr, rho_liquid, P_high_psia, P_low_psia, W_pump_btu_lb, eta_pump):
+    """Pump sizing for equipment selection.
+
+    Returns dict with flow_gpm, dP_psi, power_kw, power_hp.
+    """
+    # rho in lb/ft3; convert to SG for standard gpm formula: gpm = lb_hr / (SG * 500)
+    SG = rho_liquid / 62.4 if rho_liquid > 0 else 1
+    flow_gpm = m_dot_lb_hr / (SG * 500) if SG > 0 else 0
+    dP_psi = P_high_psia - P_low_psia
+    power_kw = m_dot_lb_hr * W_pump_btu_lb / 3412.14
+    power_hp = power_kw * 1.341
+
+    return {
+        "flow_gpm": flow_gpm,
+        "dP_psi": dP_psi,
+        "power_kw": power_kw,
+        "power_hp": power_hp,
+    }
+
+
+def acc_area_with_air_rise(Q_reject_mmbtu_hr, T_cond, T_ambient, dT_air, U=None):
+    """ACC area using proper LMTD with air inlet/outlet temperatures.
+
+    Air enters at T_ambient and exits at T_ambient + dT_air.
+    Returns area_ft2.
+    """
+    U = U or U_VALUES["acc"]
+    dT_hot = T_cond - T_ambient           # hot end: condensing vs air inlet
+    dT_cold = T_cond - (T_ambient + dT_air)  # cold end: condensing vs air outlet
+    if dT_cold <= 0:
+        dT_cold = 0.5
+    lmtd_val = _lmtd(dT_hot, dT_cold)
+    return Q_reject_mmbtu_hr * 1e6 / (U * lmtd_val)
 
 
 def _hx_area(Q_mmbtu_hr, lmtd_val, U):
