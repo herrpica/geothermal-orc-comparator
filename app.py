@@ -89,9 +89,9 @@ with st.sidebar:
     with st.form("input_form"):
         with st.expander("Brine Inputs", expanded=True):
             T_geo_in = st.number_input("Brine inlet temperature (degF)",
-                                       min_value=1, value=300, step=5)
+                                       min_value=1, value=420, step=5)
             m_dot_geo = st.number_input("Brine mass flow rate (lb/s)",
-                                        min_value=1, value=200, step=10)
+                                        min_value=1, value=1100, step=10)
             cp_brine = st.number_input("Brine specific heat (BTU/lb-degF)",
                                        min_value=0.01, value=1.0, step=0.05, format="%.2f")
             T_geo_out_min = st.number_input("Min brine outlet temperature (degF)",
@@ -100,16 +100,16 @@ with st.sidebar:
 
         with st.expander("Cycle Parameters"):
             eta_turbine = st.number_input("Turbine isentropic efficiency",
-                                          min_value=0.01, value=0.82, step=0.01, format="%.2f")
+                                          min_value=0.01, value=0.91, step=0.01, format="%.2f")
             eta_pump = st.number_input("Pump isentropic efficiency",
-                                       min_value=0.01, value=0.75, step=0.01, format="%.2f")
+                                       min_value=0.01, value=0.84, step=0.01, format="%.2f")
             superheat = st.number_input("Turbine inlet superheat (degF above sat)",
                                         min_value=0, value=0, step=1)
             st.info("Isopentane circulation rate is solved from brine energy balance.")
 
         with st.expander("Ambient Conditions"):
             T_ambient = st.number_input("Ambient dry bulb temperature (degF)",
-                                        min_value=-40, value=95, step=5)
+                                        min_value=-40, value=57, step=5)
 
         with st.expander("Pinch Points"):
             dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)",
@@ -128,7 +128,7 @@ with st.sidebar:
 
         with st.expander("Duct Parameters"):
             v_tailpipe = st.number_input("Tailpipe vapor velocity (ft/s)",
-                                         min_value=1, value=10, step=1)
+                                         min_value=1, value=70, step=1)
             v_acc_header = st.number_input("ACC header vapor velocity (ft/s)",
                                            min_value=1, value=15, step=1)
             L_tailpipe_a = st.number_input("Tailpipe length Config A (ft)",
