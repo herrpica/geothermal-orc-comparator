@@ -213,19 +213,19 @@ def calculate_duct_segments_a(states, perf, inp, fp):
         m_dot_lbs, s2.rho, inp["v_tailpipe"], inp["L_tailpipe_a"],
         "isopentane", T_cond, fp, f_darcy=f_darcy,
     )
-    seg1["name"] = "Tailpipe (turbine-recup)"
+    seg1["name"] = "Tailpipe (isopentane)"
 
     seg2 = _duct_segment(
         m_dot_lbs, s3.rho, inp["v_tailpipe"], inp["L_long_header"],
         "isopentane", T_cond, fp, f_darcy=f_darcy,
     )
-    seg2["name"] = "Recup exit header"
+    seg2["name"] = "ACC vapor header (isopentane)"
 
     seg3 = _duct_segment(
         m_dot_lbs, s3.rho, inp["v_acc_header"], inp["L_acc_header"],
         "isopentane", T_cond, fp, f_darcy=f_darcy,
     )
-    seg3["name"] = "ACC distribution"
+    seg3["name"] = "ACC distribution (isopentane)"
 
     segments = [seg1, seg2, seg3]
     total_dp = sum(s["delta_P_psi"] for s in segments)
@@ -267,19 +267,19 @@ def calculate_duct_segments_b(states, prop_states, perf, inp, fp):
         m_dot_iso_lbs, s2.rho, inp["v_tailpipe"], inp["L_tailpipe_a"],
         "isopentane", T_cond_iso, fp, f_darcy=f_darcy,
     )
-    seg1["name"] = "ISO tailpipe (turbine-recup)"
+    seg1["name"] = "Tailpipe (isopentane)"
 
     seg2 = _duct_segment(
         m_dot_iso_lbs, s3.rho, inp["v_tailpipe"], inp.get("L_iso_to_ihx", 40),
         "isopentane", T_cond_iso, fp, f_darcy=f_darcy,
     )
-    seg2["name"] = "ISO recup exit to IHX"
+    seg2["name"] = "ISO to IHX duct"
 
     seg3 = _duct_segment(
         m_dot_prop_lbs, sA.rho, inp["v_tailpipe"], inp["L_long_header"],
         "propane", T_propane_cond, fp, f_darcy=f_darcy,
     )
-    seg3["name"] = "Propane vapor header"
+    seg3["name"] = "Propane vapor header to ACC"
 
     seg4 = _duct_segment(
         m_dot_prop_lbs, sA.rho, inp["v_acc_header"], inp["L_acc_header"],

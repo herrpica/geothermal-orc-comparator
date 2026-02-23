@@ -1387,22 +1387,32 @@ summary_rows.append(("row", "= Net power",
 
 # -- Physical Scale --
 summary_rows.append(("group", "Physical Scale", "", "", "", "", ""))
-summary_rows.append(("row", "Tailpipe diameter (per train)",
+summary_rows.append(("row", "Tailpipe diameter (isopentane, both configs)",
                       _fmt(duct_a["tailpipe_diameter_in"], ".0f"), "in",
                       _fmt(duct_b["tailpipe_diameter_in"], ".0f"), "in",
-                      _winner(duct_a["tailpipe_diameter_in"], duct_b["tailpipe_diameter_in"], lower_better=True)))
-summary_rows.append(("row", "ACC header diameter (per train)",
+                      ""))
+summary_rows.append(("row", "Isopentane ACC vapor header (per train)",
                       _fmt(duct_a["acc_header_diameter_in"], ".0f"), "in",
-                      _fmt(duct_b["acc_header_diameter_in"], ".0f"), "in",
-                      _winner(duct_a["acc_header_diameter_in"], duct_b["acc_header_diameter_in"], lower_better=True)))
-summary_rows.append(("row", "Vapor vol. flow",
+                      "", "",
+                      ""))
+prop_header_dia = duct_b.get("propane_header_diameter_in", 0)
+summary_rows.append(("row", "Propane ACC vapor header (per train)",
+                      "", "",
+                      _fmt(prop_header_dia, ".0f"), "in",
+                      ""))
+dia_reduction = duct_a["acc_header_diameter_in"] - prop_header_dia
+summary_rows.append(("row", "ACC header diameter reduction (B vs A)",
+                      "", "",
+                      _fmt(dia_reduction, ".0f"), "in",
+                      "B"))
+summary_rows.append(("row", "Vapor vol. flow (plant total)",
                       _fmt(vol_a, ".0f"), "ft3/s",
                       _fmt(vol_b, ".0f"), "ft3/s",
                       _winner(vol_a, vol_b, lower_better=True)))
 summary_rows.append(("row", "Vol. flow ratio (A/B)",
                       "", "",
                       _fmt(vol_ratio, ".1f"), "x",
-                      ""))
+                      "B" if vol_ratio > 1 else ""))
 
 hyd_penalty_a = hydraulic_a["total_dT_penalty_F"]
 hyd_penalty_b = hydraulic_b["total_dT_penalty_F"]
@@ -1563,6 +1573,15 @@ for row in summary_rows:
         table_md += f"| {label} | {va_str} | {vb_str} | {delta_str} | {winner_display} |\n"
 
 st.markdown(table_md)
+
+# Physical scale callout
+if dia_reduction > 0 and vol_ratio > 1:
+    st.info(
+        f"Config B eliminates the large-bore isopentane ACC vapor header "
+        f"(**{duct_a['acc_header_diameter_in']:.0f}\"**) and replaces it with a propane vapor header "
+        f"(**{prop_header_dia:.0f}\"**) -- a **{vol_ratio:.1f}x** reduction in vapor volumetric flow. "
+        f"The isopentane tailpipe is identical in both configurations as it is upstream of the split point."
+    )
 
 # Auto-generated summary sentence
 power_winner = "A" if pwr_a["P_net"] >= pwr_b["P_net"] else "B"
