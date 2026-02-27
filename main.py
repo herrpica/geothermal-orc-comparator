@@ -30,9 +30,30 @@ st.set_page_config(
 
 st.markdown("""
 <style>
-/* Light background for main content area */
+/* Light background + dark text for main content area */
 .stApp {
     background-color: #FFFFFF;
+}
+/* Main content text: dark for readability on white background */
+[data-testid="stMainBlockContainer"] {
+    color: #1A1A2E !important;
+}
+[data-testid="stMainBlockContainer"] p,
+[data-testid="stMainBlockContainer"] span,
+[data-testid="stMainBlockContainer"] label,
+[data-testid="stMainBlockContainer"] li,
+[data-testid="stMainBlockContainer"] td,
+[data-testid="stMainBlockContainer"] th,
+[data-testid="stMainBlockContainer"] h1,
+[data-testid="stMainBlockContainer"] h2,
+[data-testid="stMainBlockContainer"] h3,
+[data-testid="stMainBlockContainer"] h4 {
+    color: #1A1A2E !important;
+}
+/* Metric values and deltas */
+[data-testid="stMetricValue"],
+[data-testid="stMetricLabel"] {
+    color: #1A1A2E !important;
 }
 /* Tab labels: ensure visible on white background */
 .stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
