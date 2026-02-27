@@ -16,6 +16,7 @@ import streamlit as st
 
 from debate_engine import (
     run_debate,
+    run_debate_streaming,
     DebateState,
     DebateMessage,
     AnalysisRun,
@@ -459,13 +460,71 @@ def render_debate_message(msg: DebateMessage, prev_opponent_result: dict | None 
 
 
 def render_synthesis(synthesis: dict):
-    """Render the synthesis / arbitrator result."""
+    """Render the synthesis / arbitrator result with winner banner."""
+    # ── Winner declaration banner ──
+    arch = synthesis.get("architecture", "TBD")
+    rationale = synthesis.get("architecture_rationale", "")
+    validated = synthesis.get("validated_performance", synthesis.get("predicted_performance", {}))
+
+    if arch == "A":
+        config_name = "Config A — Direct Air-Cooled"
+        banner_color = NAVY
+    elif arch == "B":
+        config_name = "Config B — Propane Intermediate Loop"
+        banner_color = DARK_GRAY
+    else:
+        config_name = f"Config {arch}"
+        banner_color = GREEN
+
+    # Key metrics for the banner
+    npv_val = validated.get("npv_USD", 0)
+    lcoe_val = validated.get("lcoe_per_MWh", 0)
+    net_mw = validated.get("net_power_MW", 0)
+    sched_wk = validated.get("construction_weeks_critical_path", 0)
+
+    st.markdown(f"""
+    <div style="background: linear-gradient(135deg, {banner_color}15, {banner_color}30);
+                border: 3px solid {banner_color}; border-radius: 12px;
+                padding: 24px; margin: 8px 0 20px 0; text-align: center;">
+        <div style="font-size: 13px; text-transform: uppercase; letter-spacing: 2px;
+                    color: {banner_color}; opacity: 0.7; margin-bottom: 4px;">
+            Recommended Architecture
+        </div>
+        <div style="font-size: 28px; font-weight: 800; color: {banner_color};
+                    margin-bottom: 12px;">
+            {config_name}
+        </div>
+        <div style="display: flex; justify-content: center; gap: 32px;
+                    flex-wrap: wrap; margin-bottom: 12px;">
+            <div style="text-align: center;">
+                <div style="font-size: 11px; color: #888; text-transform: uppercase;">Net Power</div>
+                <div style="font-size: 20px; font-weight: 700; color: {banner_color};">{net_mw:.1f} MW</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="font-size: 11px; color: #888; text-transform: uppercase;">NPV</div>
+                <div style="font-size: 20px; font-weight: 700; color: {banner_color};">${npv_val/1e6:.1f}M</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="font-size: 11px; color: #888; text-transform: uppercase;">LCOE</div>
+                <div style="font-size: 20px; font-weight: 700; color: {banner_color};">${lcoe_val:.1f}/MWh</div>
+            </div>
+            <div style="text-align: center;">
+                <div style="font-size: 11px; color: #888; text-transform: uppercase;">Schedule</div>
+                <div style="font-size: 20px; font-weight: 700; color: {banner_color};">{sched_wk} wk</div>
+            </div>
+        </div>
+        <div style="font-size: 14px; color: #555; max-width: 700px; margin: 0 auto;
+                    line-height: 1.5; font-style: italic;">
+            {rationale[:300]}{"..." if len(rationale) > 300 else ""}
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
+
+    # ── Detailed synthesis ──
     st.markdown('<div class="arbitrator-strip">', unsafe_allow_html=True)
     st.markdown('<div class="arbitrator-header">⚖️ ARBITRATOR SYNTHESIS</div>',
                 unsafe_allow_html=True)
 
-    arch = synthesis.get("architecture", "TBD")
-    rationale = synthesis.get("architecture_rationale", "")
     st.markdown(f"**Recommended Architecture: Config {arch}**")
     st.markdown(rationale)
 
@@ -530,7 +589,7 @@ def render_synthesis(synthesis: dict):
 # ── Debate execution (synchronous with progress updates) ────────────────────
 
 def execute_debate(design_basis: dict):
-    """Run the debate and update the UI progressively."""
+    """Run the debate with real-time streaming updates."""
     api_key = _get_api_key()
     if not api_key:
         st.error("No Anthropic API key found. Set ANTHROPIC_API_KEY in "
@@ -538,83 +597,109 @@ def execute_debate(design_basis: dict):
         st.session_state.dialectic_debate_running = False
         return
 
-    status_container = st.empty()
     debate_container = st.container()
     synthesis_container = st.container()
 
-    # Track opponent's last result for delta comparison
-    last_result_by_bot: dict[str, dict] = {}
-
-    def on_message(msg: DebateMessage):
-        """Callback for each bot message."""
-        st.session_state.dialectic_messages_displayed.append(msg)
-
-    def on_round_complete(round_num: int, state: DebateState):
-        """Callback after each round."""
-        pass
-
-    # Run debate
-    with status_container:
-        st.markdown(
-            f'<div class="pulse" style="text-align:center; padding:12px; '
-            f'background:{NAVY}10; border-radius:8px;">'
-            f'⚡ Debate in progress...</div>',
-            unsafe_allow_html=True,
-        )
-
-    state = run_debate(
+    # Stream the debate using manual next() to capture the generator's
+    # return value (DebateState). A for-loop swallows StopIteration.
+    gen = run_debate_streaming(
         design_basis=design_basis,
         api_key=api_key,
         model=DEFAULT_MODEL,
-        on_message=on_message,
-        on_round_complete=on_round_complete,
     )
 
-    st.session_state.dialectic_debate_state = state
-    status_container.empty()
+    state = None
+    last_result_by_bot: dict[str, dict] = {}
+    current_text = ""
+    text_placeholder = None
 
-    # Display all messages
     with debate_container:
-        current_round = 0
-        for msg in state.transcript:
-            if msg.round_num != current_round:
-                current_round = msg.round_num
+        while True:
+            try:
+                event = next(gen)
+            except StopIteration as e:
+                state = e.value
+                break
+
+            etype = event["type"]
+
+            if etype == "round_start":
                 st.markdown(
-                    f'<div class="round-divider">ROUND {current_round}</div>',
+                    f'<div class="round-divider">ROUND {event["round"]}</div>',
                     unsafe_allow_html=True,
                 )
 
-            if msg.bot == "system":
-                continue
+            elif etype == "bot_start":
+                current_text = ""
+                if event["bot"] == "PropaneFirst":
+                    st.markdown(
+                        '<div class="bot-a-header">⚡ PropaneFirst — Config B Advocate</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        '<div class="bot-b-header">🏭 Conventionalist — Config A Advocate</div>',
+                        unsafe_allow_html=True,
+                    )
+                text_placeholder = st.empty()
 
-            # Find opponent's last result for delta
-            opponent = "Conventionalist" if msg.bot == "PropaneFirst" else "PropaneFirst"
-            prev_result = last_result_by_bot.get(opponent)
+            elif etype == "text_delta":
+                current_text += event["text"]
+                if text_placeholder is not None:
+                    css_class = "bot-a-msg" if event["bot"] == "PropaneFirst" else "bot-b-msg"
+                    text_placeholder.markdown(
+                        f'<div class="{css_class}">{current_text}▌</div>',
+                        unsafe_allow_html=True,
+                    )
 
-            render_debate_message(msg, prev_result)
+            elif etype == "tool_call":
+                tool_name = event.get("tool", "")
+                if tool_name == "run_orc_analysis":
+                    config = event.get("input", {}).get("config", "?")
+                    st.status(f"Running ORC analysis — Config {config}...", state="running")
+                elif tool_name == "propose_structural_change":
+                    st.status("Proposing structural change...", state="running")
 
-            # Update last result tracker
-            for tr in msg.tool_results:
-                r = tr["result"]
-                if isinstance(r, dict) and "net_power_MW" in r:
-                    last_result_by_bot[msg.bot] = r
+            elif etype == "tool_result":
+                result = event.get("result", {})
+                bot = event.get("bot", "")
+                if isinstance(result, dict) and "net_power_MW" in result:
+                    config_label = result.get("_detail", {}).get("config", "?")
+                    opponent = "Conventionalist" if bot == "PropaneFirst" else "PropaneFirst"
+                    prev_result = last_result_by_bot.get(opponent)
+                    st.markdown(f"**Analysis Result — Config {config_label}**")
+                    render_analysis_card(result, prev_result)
+                    last_result_by_bot[bot] = result
+                elif isinstance(result, dict) and "logged" in result:
+                    st.info(f"📋 Structural proposal logged: {result.get('proposal_id', '')}")
 
-        # Convergence banner
-        if state.converged:
-            st.markdown(
-                f'<div class="convergence-banner">'
-                f'<h3>✅ Debate Converged</h3>'
-                f'<p>{state.convergence_reason}</p>'
-                f'<p>Completed {state.current_round} rounds with '
-                f'{len(state.analysis_runs)} analysis runs</p>'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
-        elif state.error:
-            st.error(f"Debate ended with error: {state.error}")
+            elif etype == "bot_end":
+                # Finalize the bot's text (remove typing cursor)
+                if text_placeholder is not None and current_text:
+                    css_class = "bot-a-msg" if event["bot"] == "PropaneFirst" else "bot-b-msg"
+                    text_placeholder.markdown(
+                        f'<div class="{css_class}">{current_text}</div>',
+                        unsafe_allow_html=True,
+                    )
+                text_placeholder = None
+                current_text = ""
+
+            elif etype == "convergence":
+                st.markdown(
+                    f'<div class="convergence-banner">'
+                    f'<h3>✅ Debate Converged</h3>'
+                    f'<p>{event["reason"]}</p>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            elif etype == "error":
+                st.error(f"Debate error: {event['message']}")
+
+    st.session_state.dialectic_debate_state = state
 
     # Run synthesis
-    if state.completed and not state.error:
+    if state and state.completed and not state.error:
         with synthesis_container:
             with st.spinner("Running arbitrator synthesis..."):
                 try:
