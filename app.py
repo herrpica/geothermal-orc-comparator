@@ -319,7 +319,7 @@ def _claude_chat_dialog():
     _clicked_prompt = None
     for i, qp in enumerate(_quick_prompts):
         with qcols[i % 3]:
-            if st.button(qp, key=f"_qp_{i}", use_container_width=True):
+            if st.button(qp, key=f"_qp_{i}", width="stretch"):
                 _clicked_prompt = qp
 
     st.divider()
@@ -765,7 +765,7 @@ def build_analysis_sidebar(shared_inputs=None):
     shared = shared_inputs or {}
 
     with st.sidebar:
-        if st.button("💬 Ask Claude", use_container_width=True, type="secondary"):
+        if st.button("💬 Ask Claude", width="stretch", type="secondary"):
             _claude_chat_dialog()
         st.header("Inputs")
 
@@ -1713,7 +1713,7 @@ def render_analysis_tab(inputs):
                 "Fan B (kW)": f"{sb['fan_kw']:.0f}",
                 "Net B (kW)": f"{sb['P_net']:.0f}",
             })
-        st.dataframe(pd.DataFrame(seasonal_rows).set_index("Season"), use_container_width=True)
+        st.dataframe(pd.DataFrame(seasonal_rows).set_index("Season"), width="stretch")
         st.caption("Q_rejection held constant at design value; only air density varies with temperature.")
 
     # Schedule breakdown detail -- Gantt chart
@@ -1757,11 +1757,11 @@ def render_analysis_tab(inputs):
         with col_ga:
             fig_a = _gantt_fig(si["config_a"]["phases"], a_total_weeks,
                                f"Config A  --  {a_total_weeks} weeks", max_weeks)
-            st.plotly_chart(fig_a, use_container_width=True)
+            st.plotly_chart(fig_a, width="stretch")
         with col_gb:
             fig_b = _gantt_fig(si["config_b"]["phases"], b_total_weeks,
                                f"Config B  --  {b_total_weeks} weeks", max_weeks)
-            st.plotly_chart(fig_b, use_container_width=True)
+            st.plotly_chart(fig_b, width="stretch")
 
         # Phase detail tables
         col_ta, col_tb = st.columns(2)
@@ -1772,7 +1772,7 @@ def render_analysis_tab(inputs):
                  "Dur": f'{p["duration"]}w', "Critical": "Yes" if p["critical"] else ""}
                 for p in si["config_a"]["phases"]
             ])
-            st.dataframe(df_a.set_index("Phase"), use_container_width=True)
+            st.dataframe(df_a.set_index("Phase"), width="stretch")
         with col_tb:
             st.markdown("**Config B phases**")
             df_b = pd.DataFrame([
@@ -1780,7 +1780,7 @@ def render_analysis_tab(inputs):
                  "Dur": f'{p["duration"]}w', "Track": p["track"], "Critical": "Yes" if p["critical"] else ""}
                 for p in si["config_b"]["phases"]
             ])
-            st.dataframe(df_b.set_index("Phase"), use_container_width=True)
+            st.dataframe(df_b.set_index("Phase"), width="stretch")
 
         # Summary callout
         if sched_savings > 0:
@@ -1822,7 +1822,7 @@ def render_analysis_tab(inputs):
             )
             # Separator line before total bar
             fig_sav.add_vline(x=3.5, line_dash="dot", line_color="gray", line_width=1)
-            st.plotly_chart(fig_sav, use_container_width=True)
+            st.plotly_chart(fig_sav, width="stretch")
 
             st.caption(
                 "Construction cost savings estimated from schedule compression. "
@@ -2056,7 +2056,7 @@ def render_analysis_tab(inputs):
             yaxis_title="Power (kW)", height=400, showlegend=False,
         )
         fig_wf_pwr_a.update_traces(textfont_size=10, cliponaxis=False)
-        st.plotly_chart(fig_wf_pwr_a, use_container_width=True)
+        st.plotly_chart(fig_wf_pwr_a, width="stretch")
 
     with wf_pwr_col2:
         if parasitic_b["thermosiphon"]:
@@ -2094,7 +2094,7 @@ def render_analysis_tab(inputs):
             yaxis_title="Power (kW)", height=400, showlegend=False,
         )
         fig_wf_pwr_b.update_traces(textfont_size=10, cliponaxis=False)
-        st.plotly_chart(fig_wf_pwr_b, use_container_width=True)
+        st.plotly_chart(fig_wf_pwr_b, width="stretch")
 
 
     # ============================================================================
@@ -3169,7 +3169,7 @@ the plant lifetime.
         fig_fan_acc.update_yaxes(title_text="Fan Power (kW)", row=1, col=1)
         fig_fan_acc.update_yaxes(title_text="ACC Area (1000 ft²)", row=1, col=2)
         fig_fan_acc.update_layout(height=450)
-        st.plotly_chart(fig_fan_acc, use_container_width=True)
+        st.plotly_chart(fig_fan_acc, width="stretch")
 
         # --- Annualized total cost vs dT_air ---
         st.subheader("Annualized Total Cost vs Air Temperature Rise")
@@ -3241,7 +3241,7 @@ the plant lifetime.
             yaxis_title="Annualized Cost ($k/yr)",
             height=400,
         )
-        st.plotly_chart(fig_ann, use_container_width=True)
+        st.plotly_chart(fig_ann, width="stretch")
 
         # --- Fan Sizing Summary Table ---
         st.subheader("Fan Sizing Summary")
@@ -3287,7 +3287,7 @@ the plant lifetime.
                 "Config B": f"{inputs['W_aux_kw']:.0f}",
             },
         ]).set_index("Parameter")
-        st.dataframe(fan_summary, use_container_width=True)
+        st.dataframe(fan_summary, width="stretch")
 
         # --- Pump Sizing Summary Table ---
         st.subheader("Pump Sizing Summary")
@@ -3314,7 +3314,7 @@ the plant lifetime.
                 "Power (HP)": "0" if parasitic_b["thermosiphon"] else f"{pump_prop_b['power_hp']:.0f}",
             },
         ]
-        st.dataframe(pd.DataFrame(pump_summary_rows).set_index("Pump"), use_container_width=True)
+        st.dataframe(pd.DataFrame(pump_summary_rows).set_index("Pump"), width="stretch")
 
         # --- Interpretation ---
         st.markdown(f"""

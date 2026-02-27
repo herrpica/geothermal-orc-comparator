@@ -385,7 +385,7 @@ def render_header(design_basis: dict):
     with cols[1]:
         start_disabled = st.session_state.dialectic_debate_running
         if st.button("▶ Start Debate", disabled=start_disabled,
-                     type="primary", key="btn_start", use_container_width=True):
+                     type="primary", key="btn_start", width="stretch"):
             st.session_state.dialectic_debate_running = True
             st.session_state.dialectic_debate_paused = False
             st.session_state.dialectic_synthesis_result = None
@@ -395,7 +395,7 @@ def render_header(design_basis: dict):
 
     with cols[2]:
         if st.button("⏸ Pause", disabled=not st.session_state.dialectic_debate_running,
-                     key="btn_pause", use_container_width=True):
+                     key="btn_pause", width="stretch"):
             st.session_state.dialectic_debate_paused = True
 
     with cols[3]:
@@ -407,11 +407,11 @@ def render_header(design_basis: dict):
                 file_name="converged_design.json",
                 mime="application/json",
                 key="btn_json",
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.button("⬇ JSON", disabled=True, key="btn_json_disabled",
-                      use_container_width=True)
+                      width="stretch")
 
     with cols[4]:
         has_deck = st.session_state.dialectic_deck_summary is not None
@@ -422,11 +422,11 @@ def render_header(design_basis: dict):
                 file_name="deck_summary.json",
                 mime="application/json",
                 key="btn_deck",
-                use_container_width=True,
+                width="stretch",
             )
         else:
             st.button("📊 Build Deck", disabled=True, key="btn_deck_disabled",
-                      use_container_width=True)
+                      width="stretch")
 
 
 def render_debate_message(msg: DebateMessage, prev_opponent_result: dict | None = None):
