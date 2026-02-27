@@ -30,6 +30,11 @@ st.set_page_config(
 
 st.markdown("""
 <style>
+/* Light background for main content area */
+.stApp {
+    background-color: #FFFFFF;
+    color: #1A1A2E;
+}
 /* Dark sidebar background for contrast */
 [data-testid="stSidebar"] {
     background-color: #1e1e2f;
