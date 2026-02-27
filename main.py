@@ -34,13 +34,20 @@ st.markdown("""
 [data-testid="stSidebar"] {
     background-color: #1e1e2f;
 }
-/* Sidebar text: light gray for readability */
-[data-testid="stSidebar"] * {
+/* Sidebar text: target specific text elements, not buttons/links */
+[data-testid="stSidebar"] p,
+[data-testid="stSidebar"] span,
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stMarkdown {
     color: #e0e0e0 !important;
 }
 /* Header accent */
 [data-testid="stSidebar"] h2 {
     color: #ffa726 !important;
+}
+/* Sidebar headings */
+[data-testid="stSidebar"] h4 {
+    color: #90caf9 !important;
 }
 /* Expander headers slightly brighter */
 [data-testid="stSidebar"] [data-testid="stExpander"] summary span {
@@ -51,6 +58,14 @@ st.markdown("""
     background-color: #2a2a3d !important;
     color: #ffffff !important;
     border-color: #555 !important;
+}
+/* Ensure sidebar buttons remain visible */
+[data-testid="stSidebar"] button {
+    color: inherit;
+}
+/* Checkbox labels */
+[data-testid="stSidebar"] [data-testid="stCheckbox"] label span {
+    color: #e0e0e0 !important;
 }
 </style>
 """, unsafe_allow_html=True)

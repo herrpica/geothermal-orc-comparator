@@ -55,11 +55,6 @@ def _inject_dialectic_css():
     """Inject CSS styling for the dialectic UI."""
     st.markdown(f"""
 <style>
-    /* Global theme */
-    .stApp {{
-        background-color: {WHITE};
-    }}
-
     /* Bot message containers */
     .bot-a-msg {{
         background: linear-gradient(135deg, {NAVY}08, {NAVY}15);
@@ -168,14 +163,6 @@ def _inject_dialectic_css():
     .convergence-banner h3 {{
         color: {GREEN};
         margin: 0;
-    }}
-
-    /* Sidebar styling */
-    section[data-testid="stSidebar"] {{
-        background-color: {NAVY};
-    }}
-    section[data-testid="stSidebar"] .stMarkdown {{
-        color: {WHITE};
     }}
 
     /* Pulse animation for running indicator */
