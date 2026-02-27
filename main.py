@@ -15,6 +15,7 @@ import streamlit as st
 
 from app import build_analysis_sidebar, render_analysis_tab
 from dialectic import build_dialectic_sidebar, render_dialectic_tab
+from comparison_tab import render_comparison_tab
 
 # ── Page config ────────────────────────────────────────────────────────────
 
@@ -120,6 +121,14 @@ with st.sidebar:
 
     st.markdown("---")
 
+    st.checkbox(
+        "Apply dialectic constraints to comparison",
+        key="shared_apply_constraints",
+        help="Pass locked constraints from the dialectic debate into comparison analysis",
+    )
+
+    st.markdown("---")
+
 shared_inputs = {
     "T_geo_in": T_geo_in,
     "T_geo_out_min": T_geo_out_min,
@@ -135,7 +144,7 @@ shared_inputs = {
 
 # ── Tabs ───────────────────────────────────────────────────────────────────
 
-tab1, tab2 = st.tabs(["🔧 ORC Analysis", "⚗️ Design Dialectic"])
+tab1, tab2, tab3 = st.tabs(["🔧 ORC Analysis", "⚗️ Design Dialectic", "🔬 Design Comparison"])
 
 with tab1:
     analysis_inputs = build_analysis_sidebar(shared_inputs)
@@ -144,3 +153,6 @@ with tab1:
 with tab2:
     design_basis = build_dialectic_sidebar(shared_inputs)
     render_dialectic_tab(design_basis)
+
+with tab3:
+    render_comparison_tab(design_basis)

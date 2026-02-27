@@ -17,6 +17,7 @@ import streamlit as st
 from debate_engine import (
     run_debate,
     run_debate_streaming,
+    run_single_round,
     DebateState,
     DebateMessage,
     AnalysisRun,
@@ -31,6 +32,13 @@ from synthesis import (
     save_deck_summary,
 )
 from analysis_bridge import get_structural_proposals, clear_structural_proposals
+from proposal_system import (
+    RefinementProposal,
+    ConstraintState,
+    ConstraintManager,
+    extract_proposals_from_message,
+)
+from decision_cards import render_decision_card, render_constraint_panel
 
 # ── Fervo brand colors ──────────────────────────────────────────────────────
 
@@ -199,6 +207,19 @@ def _init_dialectic_state():
         st.session_state.dialectic_messages_displayed = []
     if "dialectic_current_status" not in st.session_state:
         st.session_state.dialectic_current_status = ""
+    # Decision card system state
+    if "dialectic_debate_phase" not in st.session_state:
+        st.session_state.dialectic_debate_phase = "idle"
+    if "dialectic_current_round" not in st.session_state:
+        st.session_state.dialectic_current_round = 0
+    if "dialectic_constraint_state" not in st.session_state:
+        st.session_state.dialectic_constraint_state = None
+    if "dialectic_pending_proposals" not in st.session_state:
+        st.session_state.dialectic_pending_proposals = []
+    if "dialectic_pending_decisions" not in st.session_state:
+        st.session_state.dialectic_pending_decisions = {}
+    if "dialectic_use_decision_cards" not in st.session_state:
+        st.session_state.dialectic_use_decision_cards = False
 
 # ── API key handling ────────────────────────────────────────────────────────
 
@@ -337,6 +358,12 @@ def build_dialectic_sidebar(shared_inputs=None):
         max_rounds = st.slider("Max rounds", min_value=2, max_value=10, value=6,
                                 key="db_rounds")
 
+        st.checkbox(
+            "Enable decision cards",
+            key="dialectic_use_decision_cards",
+            help="Pause after each round to review and decide on parameter proposals",
+        )
+
         st.markdown(f"<p style='color:{WHITE}; opacity:0.8; font-size:12px;'>"
                     "Objective weights (must sum to 1.0)</p>",
                     unsafe_allow_html=True)
@@ -382,19 +409,44 @@ def render_header(design_basis: dict):
         st.markdown(f"<h1 style='color:{NAVY}; margin:0;'>ORC Design Dialectic</h1>",
                     unsafe_allow_html=True)
 
+    phase = st.session_state.dialectic_debate_phase
+    is_busy = (st.session_state.dialectic_debate_running
+               or phase in ("streaming", "synthesis"))
+
     with cols[1]:
-        start_disabled = st.session_state.dialectic_debate_running
+        start_disabled = is_busy or phase == "deciding"
         if st.button("▶ Start Debate", disabled=start_disabled,
                      type="primary", key="btn_start", width="stretch"):
-            st.session_state.dialectic_debate_running = True
-            st.session_state.dialectic_debate_paused = False
-            st.session_state.dialectic_synthesis_result = None
-            st.session_state.dialectic_deck_summary = None
-            st.session_state.dialectic_messages_displayed = []
+            use_cards = st.session_state.dialectic_use_decision_cards
+            if use_cards:
+                # Round-by-round mode with decision cards
+                st.session_state.dialectic_debate_phase = "streaming"
+                st.session_state.dialectic_current_round = 1
+                st.session_state.dialectic_debate_state = DebateState(
+                    design_basis=design_basis,
+                    objective_weights=design_basis.get("objective_weights", {
+                        "efficiency": 0.4, "capital_cost": 0.4, "schedule": 0.2,
+                    }),
+                    max_rounds=design_basis.get("max_rounds", 6),
+                )
+                st.session_state.dialectic_constraint_state = ConstraintState()
+                st.session_state.dialectic_pending_proposals = []
+                st.session_state.dialectic_pending_decisions = {}
+                st.session_state.dialectic_synthesis_result = None
+                st.session_state.dialectic_deck_summary = None
+            else:
+                # Legacy streaming mode (no decision cards)
+                st.session_state.dialectic_debate_running = True
+                st.session_state.dialectic_debate_paused = False
+                st.session_state.dialectic_debate_phase = "idle"
+                st.session_state.dialectic_synthesis_result = None
+                st.session_state.dialectic_deck_summary = None
+                st.session_state.dialectic_messages_displayed = []
             st.rerun()
 
     with cols[2]:
-        if st.button("⏸ Pause", disabled=not st.session_state.dialectic_debate_running,
+        pause_disabled = not is_busy
+        if st.button("⏸ Pause", disabled=pause_disabled,
                      key="btn_pause", width="stretch"):
             st.session_state.dialectic_debate_paused = True
 
@@ -716,6 +768,257 @@ def execute_debate(design_basis: dict):
     st.session_state.dialectic_debate_running = False
 
 
+# ── Round-by-round execution (decision card mode) ──────────────────────────
+
+def _get_last_result_for_bot(state: DebateState, bot_name: str) -> dict | None:
+    """Get the most recent analysis result for a given bot."""
+    for msg in reversed(state.transcript):
+        if msg.bot == bot_name:
+            for tr in msg.tool_results:
+                r = tr["result"]
+                if isinstance(r, dict) and "net_power_MW" in r:
+                    return r
+    return None
+
+
+def execute_round_by_round(design_basis: dict):
+    """Execute one round of the debate, then pause for decisions if proposals found.
+
+    This replaces the monolithic execute_debate() when decision cards are enabled.
+    Called when dialectic_debate_phase == "streaming".
+    """
+    api_key = _get_api_key()
+    if not api_key:
+        st.error("No Anthropic API key found. Set ANTHROPIC_API_KEY in "
+                 ".streamlit/secrets.toml or as an environment variable.")
+        st.session_state.dialectic_debate_phase = "idle"
+        return
+
+    state = st.session_state.dialectic_debate_state
+    round_num = st.session_state.dialectic_current_round
+    constraint_state = st.session_state.dialectic_constraint_state or ConstraintState()
+    constraint_mgr = ConstraintManager(constraint_state)
+
+    # Apply any pending decisions from the previous deciding phase
+    pending_decisions = st.session_state.dialectic_pending_decisions
+    if pending_decisions:
+        for pid, decision_data in pending_decisions.items():
+            constraint_mgr.decide(
+                pid,
+                decision_data["decision"],
+                modified_params=decision_data.get("modified_params"),
+                defer_round=decision_data.get("defer_round"),
+            )
+        st.session_state.dialectic_pending_decisions = {}
+        st.session_state.dialectic_constraint_state = constraint_mgr.state
+
+    # Check for deferred proposals due this round
+    due_deferred = constraint_mgr.get_due_deferred(round_num)
+    if due_deferred:
+        st.session_state.dialectic_constraint_state = constraint_mgr.state
+
+    # Render prior rounds (static replay)
+    if state.transcript:
+        _render_transcript_static(state)
+
+    # Render constraint panel if constraints exist
+    if (constraint_mgr.state.locked or constraint_mgr.state.soft
+            or constraint_mgr.state.declined or constraint_mgr.state.deferred):
+        render_constraint_panel(constraint_mgr)
+
+    # Build constraint prompt block and locked params
+    constraint_block = constraint_mgr.build_constraint_prompt_block()
+    locked_params = constraint_mgr.get_locked_parameters()
+
+    # Stream this round
+    debate_container = st.container()
+
+    gen = run_single_round(
+        state=state,
+        round_num=round_num,
+        api_key=api_key,
+        model=DEFAULT_MODEL,
+        constraint_prompt_block=constraint_block,
+        locked_params=locked_params or None,
+    )
+
+    last_result_by_bot: dict[str, dict] = {}
+    current_text = ""
+    text_placeholder = None
+    converged = False
+
+    with debate_container:
+        while True:
+            try:
+                event = next(gen)
+            except StopIteration as e:
+                state = e.value
+                break
+
+            etype = event["type"]
+
+            if etype == "round_start":
+                st.markdown(
+                    f'<div class="round-divider">ROUND {event["round"]}</div>',
+                    unsafe_allow_html=True,
+                )
+
+            elif etype == "bot_start":
+                current_text = ""
+                if event["bot"] == "PropaneFirst":
+                    st.markdown(
+                        '<div class="bot-a-header">⚡ PropaneFirst — Config B Advocate</div>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        '<div class="bot-b-header">🏭 Conventionalist — Config A Advocate</div>',
+                        unsafe_allow_html=True,
+                    )
+                text_placeholder = st.empty()
+
+            elif etype == "text_delta":
+                current_text += event["text"]
+                if text_placeholder is not None:
+                    css_class = "bot-a-msg" if event["bot"] == "PropaneFirst" else "bot-b-msg"
+                    text_placeholder.markdown(
+                        f'<div class="{css_class}">{current_text}▌</div>',
+                        unsafe_allow_html=True,
+                    )
+
+            elif etype == "tool_call":
+                tool_name = event.get("tool", "")
+                if tool_name == "run_orc_analysis":
+                    config = event.get("input", {}).get("config", "?")
+                    st.status(f"Running ORC analysis — Config {config}...", state="running")
+                elif tool_name == "propose_structural_change":
+                    st.status("Proposing structural change...", state="running")
+
+            elif etype == "tool_result":
+                result = event.get("result", {})
+                bot = event.get("bot", "")
+                if isinstance(result, dict) and "net_power_MW" in result:
+                    config_label = result.get("_detail", {}).get("config", "?")
+                    opponent = "Conventionalist" if bot == "PropaneFirst" else "PropaneFirst"
+                    prev_result = last_result_by_bot.get(opponent)
+                    st.markdown(f"**Analysis Result — Config {config_label}**")
+                    render_analysis_card(result, prev_result)
+                    last_result_by_bot[bot] = result
+                elif isinstance(result, dict) and "logged" in result:
+                    st.info(f"📋 Structural proposal logged: {result.get('proposal_id', '')}")
+
+            elif etype == "bot_end":
+                if text_placeholder is not None and current_text:
+                    css_class = "bot-a-msg" if event["bot"] == "PropaneFirst" else "bot-b-msg"
+                    text_placeholder.markdown(
+                        f'<div class="{css_class}">{current_text}</div>',
+                        unsafe_allow_html=True,
+                    )
+                text_placeholder = None
+                current_text = ""
+
+            elif etype == "round_end":
+                converged = event.get("converged", False)
+
+            elif etype == "convergence":
+                st.markdown(
+                    f'<div class="convergence-banner">'
+                    f'<h3>✅ Debate Converged</h3>'
+                    f'<p>{event["reason"]}</p>'
+                    f'</div>',
+                    unsafe_allow_html=True,
+                )
+
+            elif etype == "error":
+                st.error(f"Debate error: {event['message']}")
+
+    # Save updated state
+    st.session_state.dialectic_debate_state = state
+
+    # Extract proposals from this round's messages
+    round_messages = [m for m in state.transcript
+                      if m.round_num == round_num and m.bot != "system"]
+    proposals = []
+    for msg in round_messages:
+        opponent = "Conventionalist" if msg.bot == "PropaneFirst" else "PropaneFirst"
+        prev_result = _get_last_result_for_bot(state, opponent)
+        # Current result is the latest from this bot's tool results
+        current_result = None
+        for tr in msg.tool_results:
+            r = tr["result"]
+            if isinstance(r, dict) and "net_power_MW" in r:
+                current_result = r
+        extracted = extract_proposals_from_message(msg, prev_result, current_result, round_num)
+        proposals.extend(extracted)
+
+    # Decide next phase
+    if converged or round_num >= state.max_rounds:
+        st.session_state.dialectic_debate_phase = "synthesis"
+        st.rerun()
+    elif proposals:
+        # Add proposals to constraint manager as pending
+        for p in proposals:
+            constraint_mgr.add_proposal(p)
+        st.session_state.dialectic_constraint_state = constraint_mgr.state
+        st.session_state.dialectic_pending_proposals = proposals
+        st.session_state.dialectic_debate_phase = "deciding"
+        st.rerun()
+    else:
+        # No proposals — advance to next round
+        st.session_state.dialectic_current_round = round_num + 1
+        st.session_state.dialectic_debate_phase = "streaming"
+        st.rerun()
+
+
+def run_synthesis_phase():
+    """Run the arbitrator synthesis after debate completes or converges."""
+    api_key = _get_api_key()
+    state = st.session_state.dialectic_debate_state
+
+    if not state or not api_key:
+        st.session_state.dialectic_debate_phase = "complete"
+        return
+
+    with st.spinner("Running arbitrator synthesis..."):
+        try:
+            synthesis = synthesize_debate(state, api_key=api_key)
+            st.session_state.dialectic_synthesis_result = synthesis
+
+            deck = build_deck_summary(synthesis, state)
+            st.session_state.dialectic_deck_summary = deck
+        except Exception as e:
+            st.error(f"Synthesis error: {e}")
+
+    st.session_state.dialectic_debate_phase = "complete"
+    st.rerun()
+
+
+def _render_transcript_static(state: DebateState):
+    """Render all existing transcript messages as static (non-streaming) content."""
+    last_result_by_bot: dict[str, dict] = {}
+    current_round = 0
+
+    for msg in state.transcript:
+        if msg.round_num != current_round:
+            current_round = msg.round_num
+            st.markdown(
+                f'<div class="round-divider">ROUND {current_round}</div>',
+                unsafe_allow_html=True,
+            )
+
+        if msg.bot == "system":
+            continue
+
+        opponent = "Conventionalist" if msg.bot == "PropaneFirst" else "PropaneFirst"
+        prev_result = last_result_by_bot.get(opponent)
+        render_debate_message(msg, prev_result)
+
+        for tr in msg.tool_results:
+            r = tr["result"]
+            if isinstance(r, dict) and "net_power_MW" in r:
+                last_result_by_bot[msg.bot] = r
+
+
 # ── Render existing debate state ────────────────────────────────────────────
 
 def render_existing_debate():
@@ -817,6 +1120,92 @@ def render_dialectic_tab(design_basis: dict):
 
     st.markdown("---")
 
+    phase = st.session_state.dialectic_debate_phase
+
+    # Decision card mode state machine
+    if phase == "streaming":
+        execute_round_by_round(design_basis)
+        return
+
+    if phase == "deciding":
+        state = st.session_state.dialectic_debate_state
+        constraint_state = st.session_state.dialectic_constraint_state or ConstraintState()
+        constraint_mgr = ConstraintManager(constraint_state)
+
+        # Render prior rounds
+        if state and state.transcript:
+            _render_transcript_static(state)
+
+        # Constraint panel
+        render_constraint_panel(constraint_mgr)
+
+        # Decision cards for pending proposals
+        st.markdown("---")
+        st.markdown(
+            f"<h3 style='color:{NAVY};'>Decision Point — Round "
+            f"{st.session_state.dialectic_current_round}</h3>",
+            unsafe_allow_html=True,
+        )
+        st.markdown("Review each proposal and decide how to proceed:")
+
+        pending = st.session_state.dialectic_pending_proposals
+        max_rounds = design_basis.get("max_rounds", 6)
+        for i, proposal in enumerate(pending):
+            render_decision_card(proposal, i, max_rounds=max_rounds)
+
+        # Check if all decisions are made
+        decisions = st.session_state.dialectic_pending_decisions
+        all_decided = all(p.proposal_id in decisions for p in pending)
+
+        bcol1, bcol2 = st.columns(2)
+        with bcol1:
+            if st.button("Continue Debate", disabled=not all_decided,
+                         type="primary", key="btn_continue_debate"):
+                # Apply decisions and advance
+                for pid, dec_data in decisions.items():
+                    constraint_mgr.decide(
+                        pid,
+                        dec_data["decision"],
+                        modified_params=dec_data.get("modified_params"),
+                        defer_round=dec_data.get("defer_round"),
+                    )
+                st.session_state.dialectic_constraint_state = constraint_mgr.state
+                st.session_state.dialectic_pending_decisions = {}
+                st.session_state.dialectic_pending_proposals = []
+                st.session_state.dialectic_current_round += 1
+                st.session_state.dialectic_debate_phase = "streaming"
+                st.rerun()
+
+        with bcol2:
+            if st.button("Skip all — continue", key="btn_skip_decisions"):
+                # Auto-accept all as soft constraints
+                for p in pending:
+                    if p.proposal_id not in decisions:
+                        constraint_mgr.decide(p.proposal_id, "soft")
+                st.session_state.dialectic_constraint_state = constraint_mgr.state
+                st.session_state.dialectic_pending_decisions = {}
+                st.session_state.dialectic_pending_proposals = []
+                st.session_state.dialectic_current_round += 1
+                st.session_state.dialectic_debate_phase = "streaming"
+                st.rerun()
+        return
+
+    if phase == "synthesis":
+        state = st.session_state.dialectic_debate_state
+        if state and state.transcript:
+            _render_transcript_static(state)
+        run_synthesis_phase()
+        return
+
+    if phase == "complete":
+        state = st.session_state.dialectic_debate_state
+        if state and state.transcript:
+            render_existing_debate()
+        elif st.session_state.dialectic_synthesis_result:
+            render_synthesis(st.session_state.dialectic_synthesis_result)
+        return
+
+    # Legacy flow (no decision cards)
     if st.session_state.dialectic_debate_running:
         execute_debate(design_basis)
     elif st.session_state.dialectic_debate_state is not None:

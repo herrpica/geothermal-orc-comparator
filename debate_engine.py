@@ -174,9 +174,20 @@ def execute_tool_call(
     tool_name: str,
     tool_input: dict,
     design_basis: dict,
+    locked_params: dict | None = None,
 ) -> dict:
-    """Route a tool call to the appropriate handler."""
+    """Route a tool call to the appropriate handler.
+
+    Parameters
+    ----------
+    locked_params : dict, optional
+        Locked parameter values from ConstraintManager. These are merged
+        on top of tool_input before calling run_orc_analysis, ensuring
+        bots cannot bypass user-locked constraints.
+    """
     if tool_name == "run_orc_analysis":
+        if locked_params:
+            tool_input = {**tool_input, **locked_params}
         return run_orc_analysis(tool_input, design_basis)
     elif tool_name == "propose_structural_change":
         return propose_structural_change(tool_input)
@@ -787,6 +798,199 @@ def run_debate_streaming(
         yield {"type": "error", "message": str(e)}
 
     state.completed = True
+    return state
+
+
+# ── Round-by-round execution (for decision card system) ─────────────────────
+
+def _stream_bot_turn_standalone(
+    bot_name: str,
+    system_prompt: str,
+    state: DebateState,
+    round_num: int,
+    client: anthropic.Anthropic,
+    model: str,
+    design_basis: dict,
+    locked_params: dict | None = None,
+) -> Generator[dict, None, None]:
+    """Stream a single bot's turn with tool use loop.
+
+    Module-level version of the nested _stream_bot_turn in run_debate_streaming.
+    Yields the same event types. Locked params are enforced on tool calls.
+    """
+    messages = _build_messages_for_bot(state.transcript, bot_name)
+
+    while True:
+        text_parts = []
+        tool_calls = []
+
+        with client.messages.stream(
+            model=model,
+            max_tokens=MAX_TOKENS,
+            system=system_prompt,
+            messages=messages,
+            tools=TOOLS,
+        ) as stream:
+            for event in stream:
+                if hasattr(event, 'type'):
+                    if event.type == "content_block_start":
+                        if hasattr(event, 'content_block'):
+                            if event.content_block.type == "tool_use":
+                                pass  # tracked by final_message
+                    elif event.type == "content_block_delta":
+                        if hasattr(event, 'delta'):
+                            if event.delta.type == "text_delta":
+                                text_parts.append(event.delta.text)
+                                yield {
+                                    "type": "text_delta",
+                                    "bot": bot_name,
+                                    "text": event.delta.text,
+                                }
+                            elif event.delta.type == "input_json_delta":
+                                pass  # JSON streamed, processed from final_message
+
+            final_message = stream.get_final_message()
+
+        # Process tool calls from the final message
+        tool_results = []
+        for block in final_message.content:
+            if block.type == "text":
+                pass
+            elif block.type == "tool_use":
+                tc = {"id": block.id, "name": block.name, "input": block.input}
+                tool_calls.append(tc)
+
+                yield {"type": "tool_call", "bot": bot_name,
+                       "tool": block.name, "input": block.input}
+
+                result = execute_tool_call(
+                    block.name, block.input, design_basis,
+                    locked_params=locked_params,
+                )
+                tool_results.append({"tool_use_id": block.id, "result": result})
+
+                yield {"type": "tool_result", "bot": bot_name,
+                       "tool": block.name, "result": result}
+
+                if block.name == "run_orc_analysis":
+                    state.analysis_runs.append(AnalysisRun(
+                        round_num=round_num,
+                        bot=bot_name,
+                        config=block.input.get("config", "?"),
+                        tool_input=block.input,
+                        result=result,
+                    ))
+
+        # Record message
+        msg = DebateMessage(
+            round_num=round_num,
+            bot=bot_name,
+            role="assistant",
+            content="".join(text_parts),
+            tool_calls=tool_calls,
+            tool_results=tool_results,
+        )
+        state.transcript.append(msg)
+
+        if final_message.stop_reason != "tool_use":
+            break
+        messages = _build_messages_for_bot(state.transcript, bot_name)
+
+
+def run_single_round(
+    state: DebateState,
+    round_num: int,
+    api_key: str,
+    model: str = DEFAULT_MODEL,
+    constraint_prompt_block: str = "",
+    locked_params: dict | None = None,
+) -> Generator[dict, None, DebateState]:
+    """Run exactly ONE debate round (Bot A turn + Bot B turn + convergence check).
+
+    This is the round-by-round alternative to run_debate_streaming().
+    The caller controls the loop and can pause between rounds for
+    user decisions (the stop-point / decision card system).
+
+    Yields same event types as run_debate_streaming().
+    Returns the updated DebateState via generator return.
+
+    Parameters
+    ----------
+    state : DebateState
+        Existing debate state (transcript, analysis_runs, etc.).
+    round_num : int
+        Which round to execute (1-indexed).
+    api_key : str
+        Anthropic API key.
+    model : str
+        Claude model ID.
+    constraint_prompt_block : str
+        Text block to append to bot system prompts (locked/soft/declined constraints).
+    locked_params : dict, optional
+        Locked parameter values enforced on all tool calls.
+    """
+    client = anthropic.Anthropic(api_key=api_key)
+
+    db_context = _format_design_basis_context(state.design_basis)
+    system_a = f"{BOT_A_SYSTEM}\n\n{db_context}"
+    system_b = f"{BOT_B_SYSTEM}\n\n{db_context}"
+
+    if constraint_prompt_block:
+        system_a = f"{system_a}\n\n{constraint_prompt_block}"
+        system_b = f"{system_b}\n\n{constraint_prompt_block}"
+
+    state.current_round = round_num
+
+    try:
+        yield {"type": "round_start", "round": round_num}
+
+        # ── Bot A turn ──────────────────────────────────────────────────
+        if round_num == 1:
+            prompt_a = _opening_prompt_a(state.design_basis)
+        else:
+            prompt_a = _round_prompt_a(round_num)
+
+        state.transcript.append(DebateMessage(
+            round_num=round_num, bot="system", role="user", content=prompt_a,
+        ))
+
+        yield {"type": "bot_start", "bot": "PropaneFirst", "round": round_num}
+        yield from _stream_bot_turn_standalone(
+            "PropaneFirst", system_a, state, round_num,
+            client, model, state.design_basis, locked_params,
+        )
+        yield {"type": "bot_end", "bot": "PropaneFirst", "round": round_num}
+
+        # ── Bot B turn ──────────────────────────────────────────────────
+        if round_num == 1:
+            prompt_b = _opening_prompt_b(state.design_basis)
+        else:
+            prompt_b = _round_prompt_b(round_num)
+
+        state.transcript.append(DebateMessage(
+            round_num=round_num, bot="system", role="user", content=prompt_b,
+        ))
+
+        yield {"type": "bot_start", "bot": "Conventionalist", "round": round_num}
+        yield from _stream_bot_turn_standalone(
+            "Conventionalist", system_b, state, round_num,
+            client, model, state.design_basis, locked_params,
+        )
+        yield {"type": "bot_end", "bot": "Conventionalist", "round": round_num}
+
+        # ── Convergence check ───────────────────────────────────────────
+        converged, reason = check_convergence(state)
+        yield {"type": "round_end", "round": round_num, "converged": converged}
+
+        if converged:
+            state.converged = True
+            state.convergence_reason = reason
+            yield {"type": "convergence", "reason": reason}
+
+    except Exception as e:
+        state.error = str(e)
+        yield {"type": "error", "message": str(e)}
+
     return state
 
 
