@@ -33,7 +33,15 @@ st.markdown("""
 /* Light background for main content area */
 .stApp {
     background-color: #FFFFFF;
-    color: #1A1A2E;
+}
+/* Tab labels: ensure visible on white background */
+.stTabs [data-baseweb="tab-list"] button [data-testid="stMarkdownContainer"] p {
+    color: #444444 !important;
+    font-weight: 500;
+}
+.stTabs [data-baseweb="tab-list"] [aria-selected="true"] [data-testid="stMarkdownContainer"] p {
+    color: #1A1A2E !important;
+    font-weight: 700;
 }
 /* Dark sidebar background for contrast */
 [data-testid="stSidebar"] {
