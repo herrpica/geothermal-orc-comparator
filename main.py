@@ -25,6 +25,35 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# ── Sidebar styling ───────────────────────────────────────────────────────
+
+st.markdown("""
+<style>
+/* Dark sidebar background for contrast */
+[data-testid="stSidebar"] {
+    background-color: #1e1e2f;
+}
+/* Sidebar text: light gray for readability */
+[data-testid="stSidebar"] * {
+    color: #e0e0e0 !important;
+}
+/* Header accent */
+[data-testid="stSidebar"] h2 {
+    color: #ffa726 !important;
+}
+/* Expander headers slightly brighter */
+[data-testid="stSidebar"] [data-testid="stExpander"] summary span {
+    color: #90caf9 !important;
+}
+/* Number input fields: dark bg, white text */
+[data-testid="stSidebar"] input {
+    background-color: #2a2a3d !important;
+    color: #ffffff !important;
+    border-color: #555 !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
 # ── Shared sidebar ─────────────────────────────────────────────────────────
 
 with st.sidebar:
