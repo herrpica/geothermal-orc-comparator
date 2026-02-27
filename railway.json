@@ -1,0 +1,6 @@
+{
+  "$schema": "https://railway.com/railway.schema.json",
+  "deploy": {
+    "startCommand": "streamlit run main.py --server.port $PORT --server.address 0.0.0.0"
+  }
+}
