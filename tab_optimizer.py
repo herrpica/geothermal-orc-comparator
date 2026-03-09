@@ -31,8 +31,10 @@ from optimizer_engine import (
     TARGET_CAPEX_PER_KW,
     TARGET_SCHEDULE_WEEKS,
     TARGET_MIN_NET_MW,
+    TARGET_MAX_NET_MW,
     WORKING_FLUIDS,
     PROCUREMENT_STRATEGIES,
+    HEAT_REJECTIONS,
     AI_GUIDED_MAX_ROUNDS,
     AI_GUIDED_BATCH_SIZE,
     COMPLEXITY_PENALTIES,
@@ -62,6 +64,12 @@ def _init_session_state():
         "opt_ai_reasoning_log": [],
         "opt_ai_insights": [],
         "opt_ai_converged": False,
+        "opt_selected_hr": None,        # heat rejections locked at Start
+        # DBD update flow
+        "dbd_update_proposal": None,
+        "dbd_update_phase": "idle",      # idle|preview|generating|preview_diff|reviewing|applying|complete
+        "dbd_update_review_index": 0,
+        "dbd_update_error": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -98,7 +106,7 @@ def render_optimizer_tab(design_basis: dict):
     st.header("Autonomous ORC Optimizer")
 
     # ── Adjustable target constraints ──────────────────────────────────
-    tc1, tc2, tc3 = st.columns(3)
+    tc1, tc2, tc3, tc4 = st.columns(4)
     with tc1:
         user_capex = st.number_input(
             "Target installed cost ($/kW)",
@@ -113,9 +121,15 @@ def render_optimizer_tab(design_basis: dict):
         )
     with tc3:
         user_min_mw = st.number_input(
-            "Minimum net power (MW)",
+            "Min net power (MW)",
             min_value=1.0, max_value=200.0, value=float(TARGET_MIN_NET_MW), step=1.0,
             format="%.0f", key="opt_target_min_mw",
+        )
+    with tc4:
+        user_max_mw = st.number_input(
+            "Max net power (MW)",
+            min_value=1.0, max_value=500.0, value=float(TARGET_MAX_NET_MW), step=1.0,
+            format="%.0f", key="opt_target_max_mw",
         )
 
     # Apply user overrides to module-level constants so all logic uses them
@@ -123,6 +137,7 @@ def render_optimizer_tab(design_basis: dict):
     _oe.TARGET_CAPEX_PER_KW = float(user_capex)
     _oe.TARGET_SCHEDULE_WEEKS = int(user_schedule)
     _oe.TARGET_MIN_NET_MW = float(user_min_mw)
+    _oe.TARGET_MAX_NET_MW = float(user_max_mw)
 
     # Re-evaluate all results against current thresholds
     reevaluate_targets(store)
@@ -130,7 +145,7 @@ def render_optimizer_tab(design_basis: dict):
     st.caption(
         f"Target: **${user_capex:,.0f}/kW** installed cost | "
         f"**{user_schedule} weeks** schedule | "
-        f"**{user_min_mw:.0f} MW** minimum net power"
+        f"**{user_min_mw:.0f}–{user_max_mw:.0f} MW** net power band"
     )
 
     # ── Single-config-per-rerun execution ──────────────────────────────
@@ -246,7 +261,9 @@ def render_optimizer_tab(design_basis: dict):
                 if st.session_state["opt_ai_batch_counter"] >= AI_GUIDED_BATCH_SIZE or not st.session_state["opt_queue"]:
                     # Batch complete — call Claude for next batch
                     ai_round = st.session_state["opt_ai_round"]
-                    ai_response = call_ai_optimizer(store, ai_round, design_basis)
+                    _running_hr = st.session_state.get("opt_selected_hr") or list(HEAT_REJECTIONS)
+                    ai_response = call_ai_optimizer(store, ai_round, design_basis,
+                                                     heat_rejections=_running_hr)
 
                     # Log reasoning
                     log_entry = {
@@ -266,6 +283,8 @@ def render_optimizer_tab(design_basis: dict):
                         st.session_state["opt_report"] = generate_report(store)
                         st.session_state["opt_running"] = False
                         st.session_state["opt_paused"] = False
+                        if store.stats()["total_runs"] > 0:
+                            st.session_state["dbd_update_phase"] = "preview"
                         st.rerun()
                     else:
                         # Queue next batch
@@ -288,10 +307,14 @@ def render_optimizer_tab(design_basis: dict):
                     st.session_state["opt_report"] = generate_report(store)
                     st.session_state["opt_running"] = False
                     st.session_state["opt_paused"] = False
+                    if store.stats()["total_runs"] > 0:
+                        st.session_state["dbd_update_phase"] = "preview"
                     st.rerun()
         else:
             st.session_state["opt_running"] = False
             st.session_state["opt_paused"] = False
+            if store.stats()["total_runs"] > 0:
+                st.session_state["dbd_update_phase"] = "preview"
 
     # ── Sub-tabs ─────────────────────────────────────────────────────
     sub1, sub2, sub3, sub4 = st.tabs([
@@ -346,6 +369,17 @@ def _render_controls(design_basis: dict, store: ResultStore):
     )
     selected_strategies = [strategy_options[lbl] for lbl in selected_labels] or list(PROCUREMENT_STRATEGIES)
 
+    HR_LABELS = {"direct_acc": "Direct ACC", "propane_intermediate": "Propane IHX", "hybrid_wet_dry": "Hybrid Wet/Dry"}
+    hr_options = {HR_LABELS[hr]: hr for hr in HEAT_REJECTIONS}
+    selected_hr_labels = st.multiselect(
+        "Heat rejection types to explore",
+        options=list(hr_options.keys()),
+        default=list(hr_options.keys()),
+        key="opt_hr_selector",
+        disabled=st.session_state["opt_running"],
+    )
+    selected_hr = [hr_options[lbl] for lbl in selected_hr_labels] or list(HEAT_REJECTIONS)
+
     # ── Action buttons ─────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
 
@@ -360,7 +394,7 @@ def _render_controls(design_basis: dict, store: ResultStore):
             use_container_width=True,
         ):
             if st.session_state["opt_mode"] == "ai_guided":
-                queue = generate_seed_batch(store, strategies=selected_strategies)
+                queue = generate_seed_batch(store, strategies=selected_strategies, heat_rejections=selected_hr)
                 st.session_state["opt_queue"] = queue
                 st.session_state["opt_total_configs"] = len(queue) + stats["total_runs"]
                 st.session_state["opt_ai_round"] = 1
@@ -369,13 +403,14 @@ def _render_controls(design_basis: dict, store: ResultStore):
                 st.session_state["opt_ai_insights"] = []
                 st.session_state["opt_ai_converged"] = False
             else:
-                queue = generate_search_space(store, strategies=selected_strategies)
+                queue = generate_search_space(store, strategies=selected_strategies, heat_rejections=selected_hr)
                 st.session_state["opt_queue"] = queue
                 st.session_state["opt_total_configs"] = len(queue) + stats["total_runs"]
             st.session_state["opt_running"] = True
             st.session_state["opt_paused"] = False
             st.session_state["opt_start_time"] = time.time()
             st.session_state["opt_config_times"] = []
+            st.session_state["opt_selected_hr"] = selected_hr
             st.rerun()
 
     with col2:
@@ -408,6 +443,11 @@ def _render_controls(design_basis: dict, store: ResultStore):
             st.session_state["opt_ai_reasoning_log"] = []
             st.session_state["opt_ai_insights"] = []
             st.session_state["opt_ai_converged"] = False
+            # Clear DBD update state
+            st.session_state["dbd_update_proposal"] = None
+            st.session_state["dbd_update_phase"] = "idle"
+            st.session_state["dbd_update_review_index"] = 0
+            st.session_state["dbd_update_error"] = None
             st.rerun()
 
     with col4:
@@ -547,6 +587,9 @@ def _render_controls(design_basis: dict, store: ResultStore):
             mime="text/plain",
         )
 
+    # ── Top Configurations Report ──────────────────────────────────
+    _render_top_configs_report(store, stats)
+
     # ── Report insights ───────────────────────────────────────────
     report = st.session_state.get("opt_report")
     if report and report.get("insights"):
@@ -606,13 +649,310 @@ def _render_controls(design_basis: dict, store: ResultStore):
                         st.markdown(f"  - {ins}")
                 st.divider()
 
+    # ── DBD Update Flow (post-optimization) ──────────────────────
+    _render_dbd_update_flow(design_basis, store)
+
     # ── Search space info ─────────────────────────────────────────
     with st.expander("Search Space Details"):
-        total_valid = total_search_space_size(strategies=selected_strategies)
+        total_valid = total_search_space_size(strategies=selected_strategies, heat_rejections=selected_hr)
         tested = stats["total_runs"]
         st.write(f"Total valid configurations: **{total_valid:,}** ({len(selected_strategies)} strategies)")
         st.write(f"Already tested: **{tested:,}**")
         st.write(f"Remaining: **{total_valid - tested:,}**")
+
+
+def _render_dbd_update_flow(design_basis: dict, store: ResultStore):
+    """Post-optimization DBD update flow.
+
+    Phases: idle → preview → generating → preview_diff → reviewing → applying → complete
+    """
+    phase = st.session_state.get("dbd_update_phase", "idle")
+    if phase == "idle":
+        return
+
+    st.divider()
+    st.subheader("Design Basis Document Updates")
+
+    error = st.session_state.get("dbd_update_error")
+    if error:
+        st.error(f"Error: {error}")
+
+    # ── Phase: preview ─────────────────────────────────────────────
+    if phase == "preview":
+        st.info("Optimization complete. Would you like to generate Design Basis Document update proposals?")
+        pc1, pc2 = st.columns(2)
+        with pc1:
+            if st.button("Generate DBD Update Proposal", type="primary",
+                         use_container_width=True, key="dbd_generate_btn"):
+                st.session_state["dbd_update_phase"] = "generating"
+                st.session_state["dbd_update_error"] = None
+                st.rerun()
+        with pc2:
+            if st.button("Skip", use_container_width=True, key="dbd_skip_btn"):
+                st.session_state["dbd_update_phase"] = "idle"
+                st.rerun()
+
+    # ── Phase: generating ──────────────────────────────────────────
+    elif phase == "generating":
+        with st.spinner("Generating DBD update proposals..."):
+            try:
+                from optimizer_engine import generate_dbd_update_proposal
+                proposal = generate_dbd_update_proposal(store, design_basis)
+                st.session_state["dbd_update_proposal"] = proposal
+                st.session_state["dbd_update_phase"] = "preview_diff"
+                st.session_state["dbd_update_review_index"] = 0
+            except Exception as e:
+                st.session_state["dbd_update_error"] = str(e)
+                st.session_state["dbd_update_phase"] = "preview"
+        st.rerun()
+
+    # ── Phase: preview_diff ─────────────────────────────────────────
+    elif phase == "preview_diff":
+        proposal = st.session_state.get("dbd_update_proposal")
+        if not proposal or not proposal.get("items"):
+            st.warning("No update proposals generated.")
+            if st.button("Done", key="dbd_no_proposals_done"):
+                st.session_state["dbd_update_phase"] = "idle"
+                st.rerun()
+            return
+
+        items = proposal["items"]
+        st.write(f"**{len(items)} proposed changes:**")
+
+        # Group items by section
+        from collections import defaultdict
+        by_section = defaultdict(list)
+        for item in items:
+            by_section[item.get("section", "unknown")].append(item)
+
+        section_labels = {
+            "section_3_equipment": "Section 3: Equipment",
+            "section_6_info_requests": "Section 6: Info Requests",
+            "section_7_kb_inventory": "Section 7: KB Inventory",
+            "section_8_opt_history": "Section 8: Opt History",
+        }
+
+        for section_key, section_items in by_section.items():
+            label = section_labels.get(section_key, section_key)
+            st.markdown(f"**{label}** ({len(section_items)} changes)")
+            for item in section_items:
+                action = item.get("action", "?")
+                desc = item.get("description", "")
+                confidence = item.get("confidence", "?")
+                evidence = item.get("evidence", "")
+                requires_approval = item.get("requires_approval", False)
+
+                # Confidence badge color
+                conf_color = {"HIGH": "green", "MEDIUM": "orange", "LOW": "red"}.get(
+                    confidence, "gray"
+                )
+
+                col1, col2 = st.columns([4, 1])
+                with col1:
+                    approval_tag = " (requires approval)" if requires_approval else ""
+                    st.markdown(f"- **[{action}]** {desc}{approval_tag}")
+                    if item.get("old_value") is not None:
+                        old_str = str(item["old_value"])
+                        if len(old_str) > 100:
+                            old_str = old_str[:100] + "..."
+                        st.caption(f"Old: {old_str}")
+                    new_str = str(item.get("new_value", ""))
+                    if len(new_str) > 200:
+                        new_str = new_str[:200] + "..."
+                    st.caption(f"New: {new_str}")
+                    if evidence:
+                        st.caption(f"Evidence: {evidence}")
+                with col2:
+                    st.markdown(f":{conf_color}[{confidence}]")
+
+        st.divider()
+
+        # Action buttons
+        bc1, bc2, bc3 = st.columns(3)
+        with bc1:
+            if st.button("Accept All", type="primary", use_container_width=True,
+                         key="dbd_accept_all"):
+                for item in items:
+                    item["decision"] = "accepted"
+                st.session_state["dbd_update_phase"] = "applying"
+                st.rerun()
+        with bc2:
+            if st.button("Review Each", use_container_width=True, key="dbd_review_each"):
+                st.session_state["dbd_update_review_index"] = 0
+                st.session_state["dbd_update_phase"] = "reviewing"
+                st.rerun()
+        with bc3:
+            if st.button("Dismiss All", use_container_width=True, key="dbd_dismiss"):
+                st.session_state["dbd_update_phase"] = "idle"
+                st.session_state["dbd_update_proposal"] = None
+                st.rerun()
+
+    # ── Phase: reviewing ────────────────────────────────────────────
+    elif phase == "reviewing":
+        proposal = st.session_state.get("dbd_update_proposal")
+        if not proposal or not proposal.get("items"):
+            st.session_state["dbd_update_phase"] = "idle"
+            return
+
+        items = proposal["items"]
+        idx = st.session_state.get("dbd_update_review_index", 0)
+
+        if idx >= len(items):
+            # All reviewed — proceed to apply
+            st.session_state["dbd_update_phase"] = "applying"
+            st.rerun()
+            return
+
+        item = items[idx]
+        st.progress((idx + 1) / len(items), text=f"Reviewing item {idx + 1} of {len(items)}")
+
+        action = item.get("action", "?")
+        section = item.get("section", "?")
+        desc = item.get("description", "")
+        confidence = item.get("confidence", "?")
+        evidence = item.get("evidence", "")
+        requires = item.get("requires_approval", False)
+
+        section_labels = {
+            "section_3_equipment": "Section 3: Equipment",
+            "section_6_info_requests": "Section 6: Info Requests",
+            "section_7_kb_inventory": "Section 7: KB Inventory",
+            "section_8_opt_history": "Section 8: Opt History",
+        }
+        st.markdown(f"**[{action}] {section_labels.get(section, section)}**")
+        st.markdown(desc)
+        if requires:
+            st.warning("This change affects a user-approved section and requires your explicit approval.")
+        st.caption(f"Confidence: {confidence} | Evidence: {evidence}")
+
+        if item.get("old_value") is not None:
+            st.text_area("Current value", value=str(item["old_value"]),
+                         disabled=True, height=80, key=f"dbd_rev_old_{idx}")
+
+        import json as _json
+        new_val = item.get("new_value", "")
+        new_val_str = _json.dumps(new_val, indent=2, default=str) if isinstance(new_val, (dict, list)) else str(new_val)
+
+        modified_value = st.text_area(
+            "Proposed value (edit to modify)",
+            value=new_val_str,
+            height=120,
+            key=f"dbd_rev_new_{idx}",
+        )
+
+        rc1, rc2, rc3, rc4 = st.columns(4)
+        with rc1:
+            if st.button("Accept", type="primary", use_container_width=True,
+                         key=f"dbd_rev_accept_{idx}"):
+                item["decision"] = "accepted"
+                st.session_state["dbd_update_review_index"] = idx + 1
+                st.rerun()
+        with rc2:
+            if st.button("Modify & Accept", use_container_width=True,
+                         key=f"dbd_rev_modify_{idx}"):
+                try:
+                    parsed_mod = _json.loads(modified_value)
+                except (ValueError, _json.JSONDecodeError):
+                    parsed_mod = modified_value
+                item["new_value"] = parsed_mod
+                item["decision"] = "modified"
+                st.session_state["dbd_update_review_index"] = idx + 1
+                st.rerun()
+        with rc3:
+            if st.button("Reject", use_container_width=True,
+                         key=f"dbd_rev_reject_{idx}"):
+                item["decision"] = "rejected"
+                st.session_state["dbd_update_review_index"] = idx + 1
+                st.rerun()
+        with rc4:
+            if st.button("Skip", use_container_width=True,
+                         key=f"dbd_rev_skip_{idx}"):
+                # Leave as pending (won't be applied)
+                st.session_state["dbd_update_review_index"] = idx + 1
+                st.rerun()
+
+    # ── Phase: applying ─────────────────────────────────────────────
+    elif phase == "applying":
+        proposal = st.session_state.get("dbd_update_proposal")
+        if not proposal or not proposal.get("items"):
+            st.session_state["dbd_update_phase"] = "idle"
+            return
+
+        items = proposal["items"]
+        accepted = [i for i in items if i.get("decision") in ("accepted", "modified")]
+
+        if not accepted:
+            st.info("No changes accepted. No updates applied.")
+            if st.button("Done", key="dbd_apply_none_done"):
+                st.session_state["dbd_update_phase"] = "idle"
+                st.session_state["dbd_update_proposal"] = None
+                st.rerun()
+            return
+
+        with st.spinner(f"Applying {len(accepted)} DBD updates..."):
+            try:
+                from design_basis_document import apply_dbd_updates
+                from optimizer_engine import generate_session_summary
+
+                updated_dbd, new_version = apply_dbd_updates(items)
+
+                # Generate session summary
+                summary = generate_session_summary(store, design_basis, items)
+                proposal["session_summary"] = summary
+
+                # Save session file
+                import os
+                sessions_dir = os.path.join(
+                    os.path.dirname(__file__), "knowledge", "docs", "sessions"
+                )
+                os.makedirs(sessions_dir, exist_ok=True)
+                ts = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
+                session_file = os.path.join(sessions_dir, f"session_{ts}.txt")
+                with open(session_file, "w", encoding="utf-8") as f:
+                    f.write(summary)
+
+                # Ingest into knowledge base
+                try:
+                    from knowledge.ingestion import ingest_text
+                    ingest_text(
+                        summary,
+                        filename=f"session_{ts}.txt",
+                        domain="economics_market",
+                        tags=["optimizer_session", "design_basis_update"],
+                    )
+                except Exception:
+                    pass  # Knowledge base ingestion is best-effort
+
+                st.session_state["dbd_update_phase"] = "complete"
+            except Exception as e:
+                st.session_state["dbd_update_error"] = str(e)
+                st.session_state["dbd_update_phase"] = "preview_diff"
+        st.rerun()
+
+    # ── Phase: complete ─────────────────────────────────────────────
+    elif phase == "complete":
+        proposal = st.session_state.get("dbd_update_proposal", {})
+        items = proposal.get("items", [])
+        accepted = [i for i in items if i.get("decision") in ("accepted", "modified")]
+        rejected = [i for i in items if i.get("decision") == "rejected"]
+
+        st.success(
+            f"DBD updated successfully: {len(accepted)} changes applied, "
+            f"{len(rejected)} rejected"
+        )
+
+        # Show session summary
+        summary = proposal.get("session_summary", "")
+        if summary:
+            with st.expander("Session Summary", expanded=True):
+                st.text(summary)
+
+        if st.button("Done", type="primary", key="dbd_complete_done"):
+            st.session_state["dbd_update_phase"] = "idle"
+            st.session_state["dbd_update_proposal"] = None
+            st.session_state["dbd_update_review_index"] = 0
+            st.session_state["dbd_update_error"] = None
+            st.rerun()
 
 
 def _render_pareto(store: ResultStore):
@@ -782,6 +1122,106 @@ def _render_history(store: ResultStore):
                 sel = next((r for r in store.results if r.run_id == sel_id), None)
                 if sel:
                     _render_config_breakdown(sel)
+
+
+def _render_top_configs_report(store: ResultStore, stats: dict):
+    """Render Top 5 detailed report + full converged results table."""
+    if stats["converged"] == 0:
+        return
+
+    converged = sorted(store.get_converged(), key=lambda r: r.total_adjusted_per_kW)
+    hr_map = {"direct_acc": "ACC", "propane_intermediate": "IHX", "hybrid_wet_dry": "HYB"}
+    topo_map = {"basic": "Basic", "recuperated": "Recup", "dual_pressure": "Dual-P"}
+
+    # ── Top 5 Detailed Cards ─────────────────────────────────────
+    top_n = converged[:5]
+    st.subheader(f"Top {len(top_n)} Configurations (by Adjusted $/kW)")
+    for rank, r in enumerate(top_n, 1):
+        cfg = r.config
+        strat_label = STRATEGY_SHORT_LABELS.get(r.procurement_strategy, r.procurement_strategy)
+        topo_label = topo_map.get(cfg.get("topology", ""), cfg.get("topology", "?"))
+        hr_label = hr_map.get(cfg.get("heat_rejection", ""), cfg.get("heat_rejection", "?"))
+        fit_str = "TARGET HIT" if r.target_fit else "miss"
+
+        with st.expander(
+            f"#{rank}  {cfg.get('working_fluid','?')} / {topo_label} / {hr_label} / {strat_label}"
+            f"  |  **${r.total_adjusted_per_kW:,.0f}/kW**  |  {r.net_power_MW:.1f} MW  |  {fit_str}",
+            expanded=(rank == 1),
+        ):
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Adjusted $/kW", f"${r.total_adjusted_per_kW:,.0f}")
+            c2.metric("Installed $/kW", f"${r.capex_per_kW:,.0f}")
+            c3.metric("Equipment $/kW", f"${r.equipment_per_kW:,.0f}")
+            c4.metric("Complexity $/kW", f"${r.complexity_per_kW:,.0f}")
+
+            c5, c6, c7, c8 = st.columns(4)
+            c5.metric("Net Power", f"{r.net_power_MW:.1f} MW")
+            c6.metric("Gross Power", f"{r.gross_power_MW:.1f} MW")
+            c7.metric("Efficiency", f"{r.cycle_efficiency*100:.1f}%")
+            c8.metric("Schedule", f"{r.construction_weeks} wk")
+
+            c9, c10, c11, c12 = st.columns(4)
+            c9.metric("Total Installed", f"${r.capex_total_USD:,.0f}")
+            c10.metric("NPV", f"${r.npv_USD:,.0f}")
+            c11.metric("LCOE", f"${r.lcoe_per_MWh:.1f}/MWh")
+            c12.metric("Target Fit", fit_str)
+
+            st.markdown("**Pinch Points:**")
+            st.caption(
+                f"Vaporizer: {cfg.get('vaporizer_pinch_F','?')} F  |  "
+                f"ACC approach: {cfg.get('acc_approach_F','?')} F  |  "
+                f"Preheater: {cfg.get('preheater_pinch_F','?')} F  |  "
+                f"Recuperator: {cfg.get('recuperator_pinch_F','?')} F"
+            )
+
+            # BOM breakdown if available
+            if r.bom_per_kw:
+                st.markdown("**BOM ($/kW):**")
+                bom_items = sorted(r.bom_per_kw.items(), key=lambda x: -x[1])
+                bom_df = pd.DataFrame(
+                    [{"Component": k.replace("_", " ").title(), "$/kW": f"${v:,.0f}"} for k, v in bom_items]
+                )
+                st.dataframe(bom_df, use_container_width=True, hide_index=True)
+
+    # ── Full Results Table ────────────────────────────────────────
+    st.subheader("All Converged Results")
+    rows = []
+    for r in converged:
+        cfg = r.config
+        rows.append({
+            "Rank": len(rows) + 1,
+            "Fluid": cfg.get("working_fluid", "?"),
+            "Topology": topo_map.get(cfg.get("topology", ""), "?"),
+            "HR": hr_map.get(cfg.get("heat_rejection", ""), "?"),
+            "Strategy": STRATEGY_SHORT_LABELS.get(r.procurement_strategy, "?"),
+            "Adj $/kW": round(r.total_adjusted_per_kW),
+            "Inst $/kW": round(r.capex_per_kW),
+            "Equip $/kW": round(r.equipment_per_kW),
+            "Cmplx $/kW": round(r.complexity_per_kW),
+            "Net MW": round(r.net_power_MW, 1),
+            "Gross MW": round(r.gross_power_MW, 1),
+            "Eff %": round(r.cycle_efficiency * 100, 1),
+            "Sched wk": r.construction_weeks,
+            "NPV $": round(r.npv_USD),
+            "LCOE $/MWh": round(r.lcoe_per_MWh, 1),
+            "Target": "YES" if r.target_fit else "no",
+            "Vap F": cfg.get("vaporizer_pinch_F", ""),
+            "ACC F": cfg.get("acc_approach_F", ""),
+            "Pre F": cfg.get("preheater_pinch_F", ""),
+            "Rec F": cfg.get("recuperator_pinch_F", ""),
+        })
+    if rows:
+        df = pd.DataFrame(rows)
+        st.dataframe(df, use_container_width=True, hide_index=True, height=400)
+
+        # CSV download
+        csv = df.to_csv(index=False)
+        st.download_button(
+            "Export All Results (CSV)",
+            data=csv,
+            file_name="optimizer_all_results.csv",
+            mime="text/csv",
+        )
 
 
 def _render_config_breakdown(result):

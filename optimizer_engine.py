@@ -37,6 +37,7 @@ PROCUREMENT_STRATEGIES = ["oem_lump_sum", "direct_lump_sum", "oem_self_perform",
 TARGET_CAPEX_PER_KW = 2000.0
 TARGET_SCHEDULE_WEEKS = 70
 TARGET_MIN_NET_MW = 53.0
+TARGET_MAX_NET_MW = 57.0
 
 # ── Complexity Penalties (NPV of lifecycle costs beyond minimum viable design) ──
 # Per-component operational complexity, expressed as $/kW over 20yr at 8% discount rate.
@@ -350,6 +351,7 @@ def reevaluate_targets(store: ResultStore):
             r.total_adjusted_per_kW <= TARGET_CAPEX_PER_KW
             and r.schedule_fit
             and bool(r.net_power_MW >= TARGET_MIN_NET_MW)
+            and bool(r.net_power_MW <= TARGET_MAX_NET_MW)
             and r.converged
         )
     update_pareto_frontier(store)
@@ -358,14 +360,18 @@ def reevaluate_targets(store: ResultStore):
 # ── Search Space Generation ───────────────────────────────────────────────
 
 def generate_search_space(store: Optional[ResultStore] = None,
-                          strategies: Optional[list[str]] = None) -> list[OptConfig]:
+                          strategies: Optional[list[str]] = None,
+                          heat_rejections: Optional[list[str]] = None) -> list[OptConfig]:
     """Generate full search space, filtered by validity and dedup.
 
     Smart ordering: promising fluids and moderate pinch points first.
     Strategies parameter allows limiting which procurement strategies to search.
+    heat_rejections parameter allows limiting which heat rejection types to search.
     """
     if strategies is None:
         strategies = list(PROCUREMENT_STRATEGIES)
+    if heat_rejections is None:
+        heat_rejections = list(HEAT_REJECTIONS)
 
     configs = []
 
@@ -383,7 +389,7 @@ def generate_search_space(store: Optional[ResultStore] = None,
     for strat in strategies:
         for fluid in fluid_order:
             for topo in ["recuperated", "dual_pressure", "basic"]:
-                for hr in HEAT_REJECTIONS:
+                for hr in heat_rejections:
                     for vap in vap_order:
                         for acc in acc_order:
                             for pre in pre_order:
@@ -401,16 +407,19 @@ def generate_search_space(store: Optional[ResultStore] = None,
     return configs
 
 
-def total_search_space_size(strategies: Optional[list[str]] = None) -> int:
+def total_search_space_size(strategies: Optional[list[str]] = None,
+                            heat_rejections: Optional[list[str]] = None) -> int:
     """Count total valid configurations (without dedup)."""
     if strategies is None:
         strategies = list(PROCUREMENT_STRATEGIES)
+    if heat_rejections is None:
+        heat_rejections = list(HEAT_REJECTIONS)
     count = 0
     _recup_topos = {"recuperated", "dual_pressure"}
     for strat in strategies:
         for fluid in WORKING_FLUIDS:
             for topo in TOPOLOGIES:
-                for hr in HEAT_REJECTIONS:
+                for hr in heat_rejections:
                     cfg = OptConfig(fluid, topo, hr, 10, 15, 10, 15, strat)
                     if not cfg.is_valid():
                         continue
@@ -556,10 +565,12 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
 
     schedule_fit = bool(weeks <= TARGET_SCHEDULE_WEEKS)
     net_power_ok = bool(net_mw >= TARGET_MIN_NET_MW)
+    net_power_max_ok = bool(net_mw <= TARGET_MAX_NET_MW)
     target_fit = bool(
         total_adjusted_kw <= TARGET_CAPEX_PER_KW
         and schedule_fit
         and net_power_ok
+        and net_power_max_ok
         and converged
     )
 
@@ -708,7 +719,8 @@ AI_GUIDED_BATCH_SIZE = 10
 
 
 def generate_seed_batch(store: ResultStore,
-                        strategies: Optional[list[str]] = None) -> list[OptConfig]:
+                        strategies: Optional[list[str]] = None,
+                        heat_rejections: Optional[list[str]] = None) -> list[OptConfig]:
     """Return 10 diverse seed configs covering the design space.
 
     Covers strategies x key fluids with moderate pinches.
@@ -717,7 +729,10 @@ def generate_seed_batch(store: ResultStore,
     """
     if strategies is None:
         strategies = list(PROCUREMENT_STRATEGIES)
+    if heat_rejections is None:
+        heat_rejections = list(HEAT_REJECTIONS)
 
+    default_hr = heat_rejections[0]
     seeds = []
 
     # Priority seeds: isopentane/recuperated across all strategies (show procurement impact)
@@ -725,7 +740,7 @@ def generate_seed_batch(store: ResultStore,
         cfg = OptConfig(
             working_fluid="isopentane",
             topology="recuperated",
-            heat_rejection="direct_acc",
+            heat_rejection=default_hr,
             vaporizer_pinch_F=10,
             acc_approach_F=15,
             preheater_pinch_F=10,
@@ -742,7 +757,7 @@ def generate_seed_batch(store: ResultStore,
         if fluid == "isopentane":
             continue  # already covered above
         recup = 15.0
-        cfg = OptConfig(fluid, "recuperated", "direct_acc", 10, 15, 10, recup,
+        cfg = OptConfig(fluid, "recuperated", default_hr, 10, 15, 10, recup,
                         "direct_self_perform")
         if cfg.is_valid() and not store.has_config(cfg.config_hash()):
             seeds.append(cfg)
@@ -759,14 +774,15 @@ def generate_seed_batch(store: ResultStore,
         for fluid, topo, vap, acc, pre, recup, strat in alternates:
             if len(seeds) >= AI_GUIDED_BATCH_SIZE:
                 break
-            cfg = OptConfig(fluid, topo, "direct_acc", vap, acc, pre, recup, strat)
+            cfg = OptConfig(fluid, topo, default_hr, vap, acc, pre, recup, strat)
             if cfg.is_valid() and not store.has_config(cfg.config_hash()):
                 seeds.append(cfg)
 
     return seeds[:AI_GUIDED_BATCH_SIZE]
 
 
-def build_ai_system_prompt(design_basis: dict) -> str:
+def build_ai_system_prompt(design_basis: dict,
+                            heat_rejections: Optional[list[str]] = None) -> str:
     """System prompt for the AI optimizer agent.
 
     Includes DBD design rules and complexity penalty framework.
@@ -832,7 +848,7 @@ because $1,550 + $68 complexity = $1,618 > $1,600.
 SEARCH SPACE:
 - Working fluids: {', '.join(WORKING_FLUIDS)}
 - Topologies: basic, recuperated, dual_pressure
-- Heat rejection: direct_acc, propane_intermediate, hybrid_wet_dry
+- Heat rejection: {', '.join(heat_rejections or HEAT_REJECTIONS)}
 - Procurement strategies: {', '.join(PROCUREMENT_STRATEGIES)}
 - Vaporizer pinch: 5-20 °F (integers)
 - ACC approach: 10-30 °F (integers)
@@ -850,9 +866,10 @@ Procurement strategy changes cost factors but NOT thermodynamic performance. Sam
 TARGETS:
 - Total adjusted cost: <= ${TARGET_CAPEX_PER_KW:,.0f}/kW (installed + complexity NPV)
 - Construction schedule: <= {TARGET_SCHEDULE_WEEKS} weeks
-- Minimum net power: >= {TARGET_MIN_NET_MW:.0f} MW
+- Net power range: {TARGET_MIN_NET_MW:.0f} – {TARGET_MAX_NET_MW:.0f} MW
 
 INSTRUCTIONS:
+- RIGHT-SIZING: Prefer configs closer to the minimum net power target over oversized designs. Configs above {TARGET_MAX_NET_MW:.0f} MW are NOT target hits.
 - Analyze the results from previous rounds to identify patterns and promising regions
 - Propose exactly {AI_GUIDED_BATCH_SIZE} new configurations to test next
 - Focus on regions near the best-performing configs (exploit) while also testing new combinations (explore)
@@ -1017,7 +1034,8 @@ def build_ai_context(store: ResultStore, round_number: int) -> str:
 
 
 def call_ai_optimizer(store: ResultStore, round_number: int,
-                      design_basis: dict, api_key: str = None) -> dict:
+                      design_basis: dict, api_key: str = None,
+                      heat_rejections: Optional[list[str]] = None) -> dict:
     """Call Claude to analyze results and propose next batch of configs.
 
     Returns dict with keys: configs, round_summary, insights, converged.
@@ -1051,7 +1069,7 @@ def call_ai_optimizer(store: ResultStore, round_number: int,
         response = client.messages.create(
             model="claude-sonnet-4-20250514",
             max_tokens=4096,
-            system=build_ai_system_prompt(design_basis),
+            system=build_ai_system_prompt(design_basis, heat_rejections=heat_rejections),
             messages=[{"role": "user", "content": build_ai_context(store, round_number)}],
         )
 
@@ -1160,3 +1178,302 @@ def parse_ai_configs(ai_response: dict, store: ResultStore) -> list[OptConfig]:
     needed = AI_GUIDED_BATCH_SIZE - len(configs)
     configs.extend(_generate_random_unexplored(store, needed))
     return configs[:AI_GUIDED_BATCH_SIZE]
+
+
+# ── DBD Update Proposal Generator ─────────────────────────────────────────
+
+def generate_dbd_update_proposal(store: ResultStore, design_basis: dict,
+                                  api_key: str = None) -> dict:
+    """Call Claude with the current DBD + optimizer report to propose structured
+    Design Basis Document updates.
+
+    Returns a proposal container:
+    {
+        generated_at: str,
+        optimizer_stats: dict,
+        items: [
+            {id, section, action, target_path, description,
+             old_value, new_value, confidence, evidence,
+             decision, requires_approval}
+        ],
+        session_summary: str,
+        status: "pending"
+    }
+
+    Falls back to a deterministic history-only proposal if API is unavailable.
+    """
+    import uuid
+    from datetime import datetime, timezone
+
+    try:
+        from design_basis_document import load_dbd
+        dbd = load_dbd()
+    except Exception:
+        dbd = {}
+
+    report = generate_report(store)
+    context = build_ai_context(store, round_number=-1)
+    stats = store.stats()
+
+    # Build the proposal shell
+    proposal = {
+        "generated_at": datetime.now(timezone.utc).isoformat(),
+        "optimizer_stats": stats,
+        "items": [],
+        "session_summary": "",
+        "status": "pending",
+    }
+
+    # Always include a deterministic Section 8 (opt_history) APPEND entry
+    best = store.get_best_adjusted() or store.get_best_per_kw()
+    best_cfg = best.config if best else {}
+    history_entry = {
+        "date": datetime.now(timezone.utc).strftime("%Y-%m-%d"),
+        "event": f"Optimizer session: {stats['total_runs']} configs tested",
+        "finding": (
+            f"Best adjusted: ${best.total_adjusted_per_kW:,.0f}/kW "
+            f"({best_cfg.get('working_fluid', '?')}/{best_cfg.get('topology', '?')}/"
+            f"{best_cfg.get('heat_rejection', '?')}, "
+            f"strategy={best.procurement_strategy}). "
+            f"{stats['target_hits']} target hits out of {stats['converged']} converged."
+        ) if best else f"No converged results from {stats['total_runs']} configs.",
+        "action": (
+            f"Best config: {best_cfg.get('working_fluid', '?')}/"
+            f"{best_cfg.get('topology', '?')} at "
+            f"${best.total_adjusted_per_kW:,.0f}/kW adjusted"
+        ) if best else "No viable configurations found — review constraints.",
+    }
+    fallback_history_item = {
+        "id": str(uuid.uuid4())[:8],
+        "section": "section_8_opt_history",
+        "action": "APPEND",
+        "target_path": "entries",
+        "description": f"Log optimizer session ({stats['total_runs']} configs tested)",
+        "old_value": None,
+        "new_value": history_entry,
+        "confidence": "HIGH",
+        "evidence": f"{stats['total_runs']} configs tested, {stats['target_hits']} target hits",
+        "decision": "pending",
+        "requires_approval": False,
+    }
+
+    # Try calling Claude for richer proposals
+    try:
+        import anthropic
+    except ImportError:
+        proposal["items"].append(fallback_history_item)
+        proposal["session_summary"] = generate_session_summary(store, dbd, proposal["items"])
+        return proposal
+
+    if not api_key:
+        try:
+            import streamlit as st
+            api_key = st.secrets.get("ANTHROPIC_API_KEY")
+        except Exception:
+            pass
+    if not api_key:
+        api_key = os.environ.get("ANTHROPIC_API_KEY")
+    if not api_key:
+        proposal["items"].append(fallback_history_item)
+        proposal["session_summary"] = generate_session_summary(store, dbd, proposal["items"])
+        return proposal
+
+    dbd_json = json.dumps(dbd, indent=2, default=str)
+    report_json = json.dumps(report, indent=2, default=str)
+
+    system_prompt = f"""You are a Design Basis Document (DBD) maintenance engineer for an ORC geothermal power project.
+
+Given the current DBD and optimizer results, propose specific updates to the DBD.
+
+RULES:
+- You may ONLY propose changes to these sections:
+  * section_3_equipment (UPDATE only, HIGH confidence + strong evidence required)
+  * section_6_info_requests (NEW items for data gaps, CLOSE for resolved items)
+  * section_7_kb_inventory (UPDATE coverage/gaps based on new data)
+  * section_8_opt_history (APPEND new entries — always include at least one)
+- Sections 1, 2, 4, 5 are user-approved only — NEVER propose changes to these.
+- Each proposal item must have: section, action (UPDATE/NEW/APPEND/CLOSE),
+  target_path (dot-separated path within the section), description,
+  old_value (current value or null), new_value (proposed value),
+  confidence (HIGH/MEDIUM/LOW), evidence (what data supports this change).
+- For APPEND actions on list fields: new_value is the item to append.
+- For CLOSE actions on info_requests: set status to "closed" and add closed_date.
+- Be conservative with section_3_equipment — only propose when optimizer data strongly
+  supports a change (e.g., consistent results across many configs).
+
+Return ONLY a JSON object:
+{{
+  "items": [
+    {{
+      "section": "section_8_opt_history",
+      "action": "APPEND",
+      "target_path": "entries",
+      "description": "Log optimizer session results",
+      "old_value": null,
+      "new_value": {{"date": "...", "event": "...", "finding": "...", "action": "..."}},
+      "confidence": "HIGH",
+      "evidence": "Direct optimizer data"
+    }}
+  ]
+}}"""
+
+    user_message = f"""## Current Design Basis Document
+{dbd_json}
+
+## Optimizer Results Summary
+{report_json}
+
+## Detailed Optimizer Context
+{context}
+
+Based on these optimizer results, propose DBD updates."""
+
+    try:
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=4096,
+            system=system_prompt,
+            messages=[{"role": "user", "content": user_message}],
+        )
+        response_text = response.content[0].text
+
+        from synthesis import _extract_json
+        parsed = _extract_json(response_text)
+        raw_items = parsed.get("items", [])
+
+        # Process each item: add id, decision, requires_approval
+        for item in raw_items:
+            item["id"] = str(uuid.uuid4())[:8]
+            item["decision"] = "pending"
+            section = item.get("section", "")
+            # Sections 1-5 require user approval; 6-8 are Claude-maintained
+            item["requires_approval"] = section in (
+                "section_1_identity", "section_2_philosophy",
+                "section_3_equipment", "section_4_constraints",
+                "section_5_cost_anchors",
+            )
+            proposal["items"].append(item)
+
+        # Ensure we always have the history entry
+        has_history = any(
+            i.get("section") == "section_8_opt_history" for i in proposal["items"]
+        )
+        if not has_history:
+            proposal["items"].append(fallback_history_item)
+
+    except Exception as e:
+        logger.warning(f"DBD update proposal API call failed: {e}")
+        proposal["items"].append(fallback_history_item)
+
+    proposal["session_summary"] = generate_session_summary(store, dbd, proposal["items"])
+    return proposal
+
+
+def generate_session_summary(store: ResultStore, design_basis: dict,
+                              proposals: list[dict]) -> str:
+    """Deterministic formatter: produce a plain-text session summary (no API call).
+
+    Includes session stats, best config, accepted proposals, and next-run
+    recommendations.
+    """
+    from datetime import datetime, timezone
+
+    stats = store.stats()
+    best = store.get_best_adjusted() or store.get_best_per_kw()
+    pareto = store.get_pareto()
+
+    lines = []
+    lines.append("=" * 60)
+    lines.append("ORC OPTIMIZER SESSION SUMMARY")
+    lines.append("=" * 60)
+    lines.append(f"Date: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}")
+
+    # Determine mode from session state (best-effort)
+    try:
+        import streamlit as st
+        mode = st.session_state.get("opt_mode", "unknown")
+        ai_rounds = st.session_state.get("opt_ai_round", 0)
+        config_times = st.session_state.get("opt_config_times", [])
+    except Exception:
+        mode = "unknown"
+        ai_rounds = 0
+        config_times = []
+
+    lines.append(f"Mode: {mode}")
+    if mode == "ai_guided":
+        lines.append(f"AI Rounds: {ai_rounds}")
+    if config_times:
+        total_time = sum(config_times)
+        lines.append(f"Duration: {total_time:.0f}s ({total_time/60:.1f} min)")
+
+    lines.append("")
+    lines.append("--- RESULTS ---")
+    lines.append(f"Total configs tested:  {stats['total_runs']}")
+    lines.append(f"Converged:             {stats['converged']}")
+    lines.append(f"Failed:                {stats['failed']}")
+    lines.append(f"Target hits:           {stats['target_hits']}")
+    lines.append(f"Pareto-optimal points: {stats['pareto_count']}")
+
+    if best:
+        cfg = best.config or {}
+        lines.append("")
+        lines.append("--- BEST CONFIGURATION (by adjusted $/kW) ---")
+        lines.append(f"Fluid:              {cfg.get('working_fluid', '?')}")
+        lines.append(f"Topology:           {cfg.get('topology', '?')}")
+        lines.append(f"Heat rejection:     {cfg.get('heat_rejection', '?')}")
+        lines.append(f"Strategy:           {best.procurement_strategy}")
+        lines.append(f"Installed $/kW:     ${best.capex_per_kW:,.0f}")
+        lines.append(f"Complexity $/kW:    ${best.complexity_per_kW:,.0f}")
+        lines.append(f"Adjusted $/kW:      ${best.total_adjusted_per_kW:,.0f}")
+        lines.append(f"Equipment $/kW:     ${best.equipment_per_kW:,.0f}")
+        lines.append(f"Cycle efficiency:   {best.cycle_efficiency*100:.1f}%")
+        lines.append(f"Net power:          {best.net_power_MW:.1f} MW")
+        lines.append(f"Gross power:        {best.gross_power_MW:.1f} MW")
+        lines.append(f"Schedule:           {best.construction_weeks} weeks")
+        lines.append(f"NPV:                ${best.npv_USD:,.0f}")
+        lines.append(f"LCOE:               ${best.lcoe_per_MWh:.1f}/MWh")
+        lines.append(f"Target met:         {'YES' if best.target_fit else 'NO'}")
+
+        vap = cfg.get("vaporizer_pinch_F", "?")
+        acc = cfg.get("acc_approach_F", "?")
+        pre = cfg.get("preheater_pinch_F", "?")
+        recup = cfg.get("recuperator_pinch_F", "?")
+        lines.append(f"Pinch points:       vap={vap}F, acc={acc}F, pre={pre}F, recup={recup}F")
+
+    # DBD updates summary
+    accepted = [p for p in proposals if p.get("decision") in ("accepted", "modified")]
+    rejected = [p for p in proposals if p.get("decision") == "rejected"]
+    pending = [p for p in proposals if p.get("decision") == "pending"]
+    if proposals:
+        lines.append("")
+        lines.append("--- DBD UPDATES ---")
+        lines.append(f"Total proposed:  {len(proposals)}")
+        lines.append(f"Accepted:        {len(accepted)}")
+        lines.append(f"Rejected:        {len(rejected)}")
+        lines.append(f"Pending:         {len(pending)}")
+        for p in accepted:
+            lines.append(f"  [{p.get('action', '?')}] {p.get('section', '?')}: {p.get('description', '?')}")
+
+    # Recommendations for next run
+    lines.append("")
+    lines.append("--- RECOMMENDED NEXT RUN ---")
+    if best and best.target_fit:
+        lines.append("Target already met. Consider:")
+        lines.append("  - Fine-tune pinch points around best config (±2F)")
+        lines.append("  - Verify results with vendor quotes")
+        lines.append("  - Run sensitivity analysis on key assumptions")
+    elif best:
+        gap = best.total_adjusted_per_kW - TARGET_CAPEX_PER_KW
+        lines.append(f"Gap to target: ${gap:,.0f}/kW")
+        if gap < 200:
+            lines.append("  - Close to target — try finer pinch point sweeps around best config")
+        else:
+            lines.append("  - Significant gap — explore different procurement strategies or simpler topologies")
+            lines.append("  - Consider if any open info requests could change assumptions")
+    else:
+        lines.append("No converged results — review input constraints and brine conditions")
+
+    lines.append("")
+    lines.append("=" * 60)
+    return "\n".join(lines)
