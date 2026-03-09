@@ -84,6 +84,31 @@ def design_basis_to_inputs(design_basis: dict) -> dict:
     if "discount_rate" in design_basis:
         inp["discount_rate"] = design_basis["discount_rate"]
 
+    # Efficiency params (pass through — already in decimal)
+    for key in ["eta_turbine", "eta_pump", "generator_efficiency"]:
+        if key in design_basis:
+            inp[key] = design_basis[key]
+
+    # Pinch points (pass through — already in °F)
+    if "dt_pinch_vaporizer" in design_basis:
+        inp["dt_pinch_vaporizer"] = design_basis["dt_pinch_vaporizer"]
+    if "dt_pinch_preheater" in design_basis:
+        inp["dt_pinch_preheater"] = design_basis["dt_pinch_preheater"]
+    if "dt_pinch_acc" in design_basis:
+        inp["dt_pinch_acc_a"] = design_basis["dt_pinch_acc"]
+        inp["dt_pinch_acc_b"] = design_basis["dt_pinch_acc"]
+
+    # Cost overrides — only pass through when NO procurement strategy will be
+    # specified.  When a strategy IS used (optimizer path), the strategy's cost
+    # factors must control equipment and construction costs; sidebar defaults
+    # would shadow them and collapse all four strategies to identical numbers.
+    # The caller can still force overrides via tool_input if truly intended.
+    inp["_design_basis_uc"] = {}
+    for key in ["uc_turbine_per_kw", "uc_acc_per_bay", "uc_hx_multiplier",
+                "uc_civil_structural_per_kw", "uc_ei_installation_per_kw"]:
+        if key in design_basis:
+            inp["_design_basis_uc"][key] = design_basis[key]
+
     return inp
 
 
@@ -145,9 +170,17 @@ def tool_input_to_inputs(tool_input: dict, config: str) -> dict:
         for key, default in prop_dp_defaults.items():
             inp[key] = default * prop_frac
 
+    # Working fluid override
+    if "working_fluid" in tool_input:
+        inp["working_fluid"] = tool_input["working_fluid"]
+
     # Economics overrides
     if "energy_value_per_MWh" in tool_input:
         inp["electricity_price"] = tool_input["energy_value_per_MWh"]
+
+    # Procurement strategy
+    if "procurement_strategy" in tool_input:
+        inp["procurement_strategy"] = tool_input["procurement_strategy"]
 
     return inp
 
@@ -177,6 +210,13 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
     tunable_inputs = tool_input_to_inputs(tool_input, config)
     inputs = {**base_inputs, **tunable_inputs}
 
+    # Apply sidebar uc_* overrides ONLY when no procurement strategy is active.
+    # When a strategy is specified (optimizer path), the strategy's cost factors
+    # must control costs — sidebar defaults would shadow them.
+    stashed_uc = inputs.pop("_design_basis_uc", {})
+    if "procurement_strategy" not in inputs:
+        inputs.update(stashed_uc)
+
     # ── Validate ────────────────────────────────────────────────────────
     warnings_list = validate_inputs(inputs)
 
@@ -203,18 +243,22 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
     perf = result["performance"]
     duct = result["duct"]
 
+    # ── Fan power & parasitic balance (compute BEFORE costs for bay count) ──
+    Q_reject = perf["Q_reject_mmbtu_hr"]
+    T_ambient = inputs.get("T_ambient", 95)
+    fan_result = calculate_fan_power(Q_reject, T_ambient, inputs)
+
+    # Inject computed fan bay count into inputs for per-bay ACC costing
+    inputs["n_fan_bays_computed"] = fan_result["n_fans_used"]
+
+    power_bal = compute_power_balance(perf, fan_result, inputs, config=config)
+
     # ── Calculate costs ─────────────────────────────────────────────────
     if config == "A":
         costs = calculate_costs_a(states, perf, inputs, duct_result=duct)
     else:
         propane_states = result["propane_states"]
         costs = calculate_costs_b(states, propane_states, perf, inputs, duct_result=duct)
-
-    # ── Fan power & parasitic balance ───────────────────────────────────
-    Q_reject = perf["Q_reject_mmbtu_hr"]
-    T_ambient = inputs.get("T_ambient", 95)
-    fan_result = calculate_fan_power(Q_reject, T_ambient, inputs)
-    power_bal = compute_power_balance(perf, fan_result, inputs, config=config)
 
     net_power_kw = power_bal["P_net"]
     gross_power_kw = power_bal["P_gross"]
@@ -280,6 +324,11 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
         # Economics
         "capex_total_USD": costs["total_installed"],
         "capex_per_kW": lc["specific_cost_per_kw"],
+        "equipment_cost_USD": costs.get("equipment_cost", costs.get("equipment_subtotal", 0)),
+        "equipment_per_kW": (
+            costs.get("equipment_cost", 0) / net_power_kw
+            if net_power_kw > 0 else 0
+        ),
         "npv_USD": lc["net_npv"],
         "lcoe_per_MWh": lc["lcoe"],
 
@@ -293,6 +342,8 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
         # ── Extended detail (not in spec but useful for debate context) ──
         "_detail": {
             "config": config,
+            "working_fluid": inputs.get("working_fluid", "isopentane"),
+            "procurement_strategy": inputs.get("procurement_strategy", "oem_lump_sum"),
             "T_cond_F": perf["T_cond"],
             "T_evap_F": perf["T_evap"],
             "P_high_psia": perf["P_high"],
@@ -308,9 +359,47 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
             "equipment_subtotal": costs.get("equipment_subtotal", 0),
             "ductwork_cost": costs.get("ductwork", 0),
             "structural_steel_cost": costs.get("structural_steel", 0),
+            "power_balance": power_bal,
             "annual_energy_mwh": lc["annual_energy_mwh"],
             "annual_revenue": lc["annual_revenue"],
             "annuity_factor": lc["annuity_factor"],
+            # Cost line items for optimizer BOM tracking
+            "cost_turbine_generator": costs.get("turbine_generator", 0),
+            "cost_iso_pump": costs.get("iso_pump", 0),
+            "cost_vaporizer": costs.get("vaporizer", 0),
+            "cost_preheater": costs.get("preheater", 0),
+            "cost_recuperator": costs.get("recuperator", 0),
+            "cost_acc": costs.get("acc", 0),
+            "cost_ductwork": costs.get("ductwork", 0),
+            "cost_structural_steel": costs.get("structural_steel", 0),
+            "cost_intermediate_hx": costs.get("intermediate_hx", 0),
+            "cost_propane_system": costs.get("propane_system", 0),
+            "cost_bop_piping": costs.get("bop_piping", 0),
+            "cost_civil_structural": costs.get("civil_structural", 0),
+            "cost_ei_installation": costs.get("ei_installation", 0),
+            "cost_construction_labor": costs.get("construction_labor", 0),
+            "cost_foundation": costs.get("foundation", 0),
+            "cost_engineering": costs.get("engineering", 0),
+            "cost_construction_mgmt": costs.get("construction_mgmt", 0),
+            "cost_commissioning": costs.get("commissioning", 0),
+            "cost_contingency": costs.get("contingency", 0),
+            "cost_wf_inventory": costs.get("wf_inventory", 0),
+            "cost_controls_instrumentation": costs.get("controls_instrumentation", 0),
+            "cost_electrical_equipment": costs.get("electrical_equipment", 0),
+            "cost_equipment_subtotal": costs.get("equipment_subtotal", 0),
+            "cost_total_installed": costs.get("total_installed", 0),
+            "cost_td": 355 * net_power_kw if net_power_kw > 0 else 0,
+            "cost_gathering": 860 * net_power_kw if net_power_kw > 0 else 0,
+            "cost_total_project": (
+                costs.get("total_installed", 0)
+                + 355 * net_power_kw
+                + 860 * net_power_kw
+            ) if net_power_kw > 0 else costs.get("total_project_cost", 0),
+            "acc_n_bays": costs.get("acc_n_bays", fan_result.get("n_fans_used", 0)),
+            "schedule_phases": (
+                sched["config_a"]["phases"] if config == "A"
+                else sched["config_b"]["phases"]
+            ),
         },
     }
 
@@ -421,6 +510,17 @@ RUN_ORC_ANALYSIS_TOOL = {
             "energy_value_per_MWh": {
                 "type": "number",
                 "description": "Energy value for NPV/LCOE calculation ($/MWh). Overrides design basis if provided.",
+            },
+            "procurement_strategy": {
+                "type": "string",
+                "enum": ["oem_lump_sum", "direct_lump_sum", "oem_self_perform", "direct_self_perform"],
+                "description": (
+                    "Procurement strategy affecting cost factors. "
+                    "oem_lump_sum = OEM package + EPC contractor (baseline ~$2,500/kW). "
+                    "direct_lump_sum = direct vendor purchase + EPC contractor. "
+                    "oem_self_perform = OEM package + owner T&M self-perform. "
+                    "direct_self_perform = direct vendor + owner self-perform (lowest cost)."
+                ),
             },
         },
         "required": ["config"],
