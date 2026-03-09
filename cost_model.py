@@ -1,7 +1,14 @@
 """
 Equipment sizing and cost estimation for ORC Config A and Config B.
-All costs in 2024 USD (installed). Uses parametric unit-cost factors
+All costs in 2024 USD. Uses parametric unit-cost factors
 that can be overridden via the inputs dict (uc_* keys).
+
+Cost stack (calibrated to Turboden 93 MW lump-sum EPC project data):
+  1. Equipment package (~$1,150/kW — TG set, HX, ACC, pumps, controls, electrical)
+  2. Installation adders (BOP piping, civil, E&I, construction, engineering, commissioning)
+  3. Contingency on all above (AACE Class 4)
+  → Total installed surface facility cost (~$2,500/kW before optimization)
+  + T&D and gathering (display-only, not in surface facility optimization)
 """
 
 import math
@@ -11,48 +18,161 @@ from scipy.optimize import minimize_scalar, brentq
 # Parallel turbine/ACC trains sharing common vaporizer + preheater
 N_TRAINS = 2
 
-# -- Unit cost factor defaults (2024 USD, installed) --------------------------
-# These serve as reference defaults; user overrides via uc_* keys in inputs.
+# -- Unit cost factor defaults (2024 USD) ------------------------------------
+# Equipment unit costs calibrated to Turboden 93 MW lump-sum EPC project data.
+# Installation adders calibrated to geothermal EPC field actuals.
 
 COST_FACTORS = {
-    "vaporizer_per_ft2": 35,
-    "preheater_per_ft2": 30,
-    "recup_per_ft2": 25,
-    "hx_per_ft2": 40,              # intermediate HX (pressure rated)
-    "acc_per_ft2": 12,
-    "turbine_per_kw": 1200,
-    "iso_pump_per_hp": 1500,
-    "pump_per_hp": 1500,
-    "iso_duct_per_ft2": 180,       # $/ft2 of duct surface area
-    "prop_pipe_per_ft2": 120,      # $/ft2 of propane pipe surface area
-    "prop_piping_pct": 20,         # % of IHX cost for propane piping+pump
-    "steel_per_lb": 4.50,
-    "foundation_pct": 8,
-    "engineering_pct": 12,
-    "construction_mgmt_pct": 8,
-    "contingency_pct": 15,
+    # ── Equipment unit costs (produce ORC equipment package ~$1,150/kW) ──
+    "vaporizer_per_ft2": 75,        # shell-and-tube, brine service, ASME VIII
+    "preheater_per_ft2": 65,        # liquid-liquid, corrosion-resistant
+    "recup_per_ft2": 55,            # welded plate or S&T, organic vapor-liquid
+    "hx_per_ft2": 40,               # intermediate HX (pressure rated)
+    "acc_per_ft2": 12,              # legacy — used by app.py sidebar only
+    "acc_per_bay": 575000,           # A-frame w/ fans, motors, staging control, structure
+    "turbine_per_kw": 340,          # TG package: turbine, gearbox, generator, lube, enclosure
+    "iso_pump_per_hp": 600,         # API 610 process pump package
+    "pump_per_hp": 600,
+    "iso_duct_per_ft2": 70,         # field-erected duct, insulated
+    "prop_pipe_per_ft2": 55,        # propane piping, insulated
+    "prop_piping_pct": 20,          # % of IHX cost for propane piping+pump
+    "steel_per_lb": 7.00,           # erected, primed, painted, fireproofed
+    "wf_inventory_per_kw": 15,      # working fluid charge (isopentane ~$5/lb)
+    "controls_instrumentation_per_kw": 50,  # DCS, PLCs, field instruments, SCADA
+    "fan_control_per_kw": 0.15,              # staging control: PLC logic only (no VFDs)
+    "electrical_equipment_per_kw": 65,      # MV switchgear, MCC, transformers, cable
+    # ── Installation & construction adders (~$1,350/kW) ──
+    "bop_piping_pct": 16,               # % of equipment — BOP piping & valves
+    "civil_structural_per_kw": 260,     # $/kW gross — civil, foundations, structures
+    "ei_installation_per_kw": 190,      # $/kW gross — E&I installation labor
+    "construction_labor_per_kw": 285,   # $/kW gross — construction labor & CM
+    "engineering_pct": 10,              # % of equipment — engineering & procurement
+    "commissioning_per_kw": 65,         # $/kW gross — commissioning & startup
+    "contingency_pct": 10,              # % of all above — AACE Class 4
+    # ── Project cost display items (NOT in surface facility optimization) ──
+    "td_per_kw": 355,                   # $/kW — transmission & distribution
+    "gathering_per_kw": 860,            # $/kW — wellfield gathering system
+    # ── Hybrid wet/dry & dual pressure parametric factors ──
+    "water_system_per_kw": 50,          # $/kW gross for hybrid wet/dry water system
+    "hybrid_acc_bay_reduction": 0.17,   # 17% fewer ACC bays for hybrid
+    "dual_pressure_hx_per_kw": 20,     # $/kW gross additional HX for dual-pressure
+    "dual_pressure_schedule_weeks": 3,  # additional weeks for dual-pressure
+    "dual_pressure_efficiency_gain": 0.03,  # +3% absolute efficiency gain
+    # ── Legacy keys (backward compat for app.py sidebar uc_* overrides) ──
+    "foundation_pct": 5,
+    "construction_mgmt_pct": 5,
 }
+
+# ── Procurement Strategy Override Sets ──────────────────────────────────────
+# Each strategy provides overrides to merge onto COST_FACTORS.
+# Priority chain: user sidebar uc_* > strategy override > COST_FACTORS baseline
+#
+# oem_lump_sum: OEM integrated package + EPC lump-sum contractor (baseline)
+# direct_lump_sum: Direct vendor purchase + EPC lump-sum contractor
+# oem_self_perform: OEM integrated package + Owner T&M self-perform
+# direct_self_perform: Direct vendor purchase + Owner T&M self-perform
+
+PROCUREMENT_STRATEGIES = {
+    "oem_lump_sum": {},  # Baseline — uses COST_FACTORS as-is
+
+    "direct_lump_sum": {
+        # Equipment: strip OEM integration margin (30-40% reduction)
+        "turbine_per_kw": 200,
+        "vaporizer_per_ft2": 50,
+        "preheater_per_ft2": 43,
+        "recup_per_ft2": 37,
+        "hx_per_ft2": 27,
+        "acc_per_bay": 347200,       # Worldwide validated bid (already direct)
+        "iso_pump_per_hp": 420,
+        "pump_per_hp": 420,
+        "controls_instrumentation_per_kw": 40,
+        "electrical_equipment_per_kw": 55,
+        # Construction: lump-sum (same as baseline)
+    },
+
+    "oem_self_perform": {
+        # Equipment: OEM package (same as baseline)
+        # Construction: self-perform T&M (no contractor markup)
+        "bop_piping_pct": 12,
+        "civil_structural_per_kw": 90,
+        "ei_installation_per_kw": 115,
+        "construction_labor_per_kw": 185,
+        "engineering_pct": 7,
+        "commissioning_per_kw": 48,
+        "contingency_pct": 9,
+    },
+
+    "direct_self_perform": {
+        # Both direct equipment AND self-perform construction
+        "turbine_per_kw": 200,
+        "vaporizer_per_ft2": 50,
+        "preheater_per_ft2": 43,
+        "recup_per_ft2": 37,
+        "hx_per_ft2": 27,
+        "acc_per_bay": 347200,
+        "iso_pump_per_hp": 420,
+        "pump_per_hp": 420,
+        "controls_instrumentation_per_kw": 40,
+        "electrical_equipment_per_kw": 55,
+        "bop_piping_pct": 12,
+        "civil_structural_per_kw": 90,
+        "ei_installation_per_kw": 115,
+        "construction_labor_per_kw": 185,
+        "engineering_pct": 7,
+        "commissioning_per_kw": 48,
+        "contingency_pct": 9,
+    },
+}
+
+STRATEGY_LABELS = {
+    "oem_lump_sum": "OEM + Lump-Sum",
+    "direct_lump_sum": "Direct + Lump-Sum",
+    "oem_self_perform": "OEM + Self-Perform",
+    "direct_self_perform": "Direct + Self-Perform",
+}
+
+STRATEGY_SHORT_LABELS = {
+    "oem_lump_sum": "OEM+LS",
+    "direct_lump_sum": "DIR+LS",
+    "oem_self_perform": "OEM+SP",
+    "direct_self_perform": "DIR+SP",
+}
+
+
+def get_effective_cost_factors(strategy: str = "oem_lump_sum") -> dict:
+    """Return COST_FACTORS merged with the given procurement strategy overrides.
+
+    Priority chain: user sidebar uc_* override > strategy override > COST_FACTORS baseline.
+    This function handles the strategy layer; uc_* overrides are applied in calculate_costs_*.
+    """
+    overrides = PROCUREMENT_STRATEGIES.get(strategy, {})
+    if not overrides:
+        return dict(COST_FACTORS)
+    merged = dict(COST_FACTORS)
+    merged.update(overrides)
+    return merged
+
 
 U_VALUES = {
     "acc": 80,               # effective U incl. fin enhancement (bare-tube basis)
     "intermediate_hx": 150,
-    "recuperator": 40,
+    "recuperator": 60,       # organic vapor-liquid, compact design
     "vaporizer": 150,
-    "preheater": 80,
+    "preheater": 250,        # liquid-liquid service, high-pressure organic
 }
 
 
 def _default_inputs():
     return {
-        "T_geo_in": 300,
-        "m_dot_geo": 200,
+        "T_geo_in": 420,
+        "m_dot_geo": 1100,
         "cp_brine": 1.0,
-        "T_geo_out_min": 160,
+        "T_geo_out_min": 180,
         "T_ambient": 95,
-        "dt_pinch_vaporizer": 10,
-        "dt_pinch_preheater": 10,
-        "dt_pinch_acc_a": 15,
-        "dt_pinch_acc_b": 15,
+        "dt_pinch_vaporizer": 8,
+        "dt_pinch_preheater": 6,
+        "dt_pinch_acc_a": 30,
+        "dt_pinch_acc_b": 30,
         "dt_pinch_recup": 15,
         "dt_approach_intermediate": 10,
         "eta_turbine": 0.82,
@@ -181,10 +301,15 @@ def compute_power_balance(perf, fan_result, inputs, config="A"):
     Every power/efficiency metric flows from this single function.
     All values in kW unless noted.
 
-    Config A: P_net = P_gross - W_iso_pump - W_fans - W_auxiliary
-    Config B: P_net = P_gross - W_iso_pump - W_prop_pump - W_fans - W_auxiliary
+    Config A: P_net = P_generator - W_iso_pump - W_fans - W_auxiliary
+    Config B: P_net = P_generator - W_iso_pump - W_prop_pump - W_fans - W_auxiliary
+
+    Generator efficiency (0.96) accounts for gearbox, generator, and
+    transformer losses between turbine shaft and switchgear.
     """
-    P_gross = perf["gross_power_kw"]
+    generator_efficiency = inputs.get("generator_efficiency", 0.96)
+    P_shaft = perf["gross_power_kw"]
+    P_gross = P_shaft * generator_efficiency  # electrical output at switchgear
 
     # ISO pump (both configs)
     if config == "B":
@@ -223,7 +348,9 @@ def compute_power_balance(perf, fan_result, inputs, config="A"):
     parasitic_pct = W_total_parasitic / P_gross * 100 if P_gross > 0 else 0
 
     return {
+        "P_shaft": P_shaft,
         "P_gross": P_gross,
+        "generator_efficiency": generator_efficiency,
         "W_iso_pump": W_iso_pump,
         "W_prop_pump": W_prop_pump,
         "W_prop_pump_calc": W_prop_pump_calc,
@@ -322,37 +449,116 @@ def _structural_steel_cost(segments, inp=None):
     return total_cost, total_weight
 
 
-def _apply_indirect_costs(costs, inp):
-    """Apply foundation, E&P, CM, and contingency layers to costs dict.
+def _apply_indirect_costs(costs, inp, gross_power_kw=0, net_power_kw=None):
+    """Apply installation adders and contingency to equipment costs.
+
+    Cost stack (per user's vendor bid calibration):
+      1. Equipment subtotal (from line items above)
+      2. BOP piping & valves (% of equipment)
+      3. Civil & structural ($/kW gross)
+      4. E&I installation labor ($/kW gross)
+      5. Construction labor & CM ($/kW gross)
+      6. Engineering & procurement (% of equipment)
+      7. Commissioning & startup ($/kW gross)
+      8. Contingency (% of all above)
 
     Expects costs dict to already have 'equipment_subtotal'.
     Mutates costs in-place and returns it.
+
+    If legacy uc_foundation_pct / uc_construction_mgmt_pct keys are present
+    in inp (from app.py sidebar), uses the legacy percentage-based structure
+    instead.
     """
     equip_sub = costs["equipment_subtotal"]
+    costs["equipment_cost"] = equip_sub  # for vendor bid comparison
+    gross_kw = max(gross_power_kw, 1)  # available in both branches
 
-    # Foundation
-    fdn_pct = inp.get("uc_foundation_pct", COST_FACTORS["foundation_pct"])
-    costs["foundation"] = equip_sub * fdn_pct / 100
+    # Detect legacy mode: if user has set foundation_pct or construction_mgmt_pct
+    # via the sidebar, fall back to the old percentage-based structure.
+    use_legacy = ("uc_foundation_pct" in inp or "uc_construction_mgmt_pct" in inp)
 
-    subtotal_with_fdn = equip_sub + costs["foundation"]
-    costs["subtotal_with_foundation"] = subtotal_with_fdn
+    if use_legacy:
+        # Legacy percentage-based structure (backward compat with app.py sidebar)
+        fdn_pct = inp.get("uc_foundation_pct", COST_FACTORS["foundation_pct"])
+        costs["foundation"] = equip_sub * fdn_pct / 100
+        costs["civil_structural"] = costs["foundation"]  # alias
 
-    # Engineering & procurement
-    eng_pct = inp.get("uc_engineering_pct", COST_FACTORS["engineering_pct"])
-    costs["engineering"] = subtotal_with_fdn * eng_pct / 100
+        subtotal_with_fdn = equip_sub + costs["foundation"]
+        costs["subtotal_with_foundation"] = subtotal_with_fdn
 
-    # Construction management
-    cm_pct = inp.get("uc_construction_mgmt_pct", COST_FACTORS["construction_mgmt_pct"])
-    costs["construction_mgmt"] = subtotal_with_fdn * cm_pct / 100
+        eng_pct = inp.get("uc_engineering_pct", COST_FACTORS["engineering_pct"])
+        costs["engineering"] = subtotal_with_fdn * eng_pct / 100
 
-    total_before_cont = subtotal_with_fdn + costs["engineering"] + costs["construction_mgmt"]
-    costs["total_before_contingency"] = total_before_cont
+        cm_pct = inp.get("uc_construction_mgmt_pct", COST_FACTORS["construction_mgmt_pct"])
+        costs["construction_mgmt"] = subtotal_with_fdn * cm_pct / 100
+        costs["construction_labor"] = costs["construction_mgmt"]  # alias
 
-    # Contingency
-    cont_pct = inp.get("uc_contingency_pct", COST_FACTORS["contingency_pct"])
-    costs["contingency"] = total_before_cont * cont_pct / 100
+        # Zero out new-stack items not in legacy mode
+        costs["bop_piping"] = 0
+        costs["ei_installation"] = 0
+        costs["commissioning"] = 0
 
-    costs["total_installed"] = total_before_cont + costs["contingency"]
+        total_before_cont = subtotal_with_fdn + costs["engineering"] + costs["construction_mgmt"]
+        costs["total_before_contingency"] = total_before_cont
+
+        cont_pct = inp.get("uc_contingency_pct", COST_FACTORS["contingency_pct"])
+        costs["contingency"] = total_before_cont * cont_pct / 100
+        costs["total_installed"] = total_before_cont + costs["contingency"]
+    else:
+        # New installation cost stack (calibrated to vendor EPC data)
+        # Uses strategy-aware cost factors (procurement_strategy in inp)
+        strategy = inp.get("procurement_strategy", "oem_lump_sum")
+        cf = get_effective_cost_factors(strategy)
+
+        # BOP piping & valves (% of equipment)
+        bop_pct = cf["bop_piping_pct"]
+        costs["bop_piping"] = equip_sub * bop_pct / 100
+
+        # Civil & structural ($/kW gross × kW = $)
+        civil_per_kw = inp.get("uc_civil_structural_per_kw", cf["civil_structural_per_kw"])
+        costs["civil_structural"] = civil_per_kw * gross_kw
+        costs["foundation"] = costs["civil_structural"]  # legacy alias
+
+        # E&I installation labor ($/kW gross × kW = $)
+        ei_per_kw = inp.get("uc_ei_installation_per_kw", cf["ei_installation_per_kw"])
+        costs["ei_installation"] = ei_per_kw * gross_kw
+
+        # Construction labor & CM ($/kW gross × kW = $)
+        labor_per_kw = cf["construction_labor_per_kw"]
+        costs["construction_labor"] = labor_per_kw * gross_kw
+        costs["construction_mgmt"] = costs["construction_labor"]  # legacy alias
+
+        # Engineering & procurement (% of equipment)
+        eng_pct = cf["engineering_pct"]
+        costs["engineering"] = equip_sub * eng_pct / 100
+
+        # Commissioning & startup ($/kW gross × kW = $)
+        comm_per_kw = cf["commissioning_per_kw"]
+        costs["commissioning"] = comm_per_kw * gross_kw
+
+        total_before_cont = (
+            equip_sub + costs["bop_piping"] + costs["civil_structural"]
+            + costs["ei_installation"] + costs["construction_labor"]
+            + costs["engineering"] + costs["commissioning"]
+        )
+        costs["total_before_contingency"] = total_before_cont
+
+        # Contingency (% of all above)
+        cont_pct = cf["contingency_pct"]
+        costs["contingency"] = total_before_cont * cont_pct / 100
+        costs["total_installed"] = total_before_cont + costs["contingency"]
+
+    # ── Display-only project cost adders (NOT in surface facility total) ──
+    # T&D and gathering use net power basis (deliverable capacity)
+    net_kw = net_power_kw if net_power_kw and net_power_kw > 0 else gross_kw
+    td_per_kw = COST_FACTORS.get("td_per_kw", 0)
+    gathering_per_kw = COST_FACTORS.get("gathering_per_kw", 0)
+    costs["td_cost"] = td_per_kw * net_kw
+    costs["gathering_cost"] = gathering_per_kw * net_kw
+    costs["total_project_cost"] = (
+        costs["total_installed"] + costs["td_cost"] + costs["gathering_cost"]
+    )
+
     return costs
 
 
@@ -368,16 +574,24 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     m_dot = perf["m_dot_iso"]
     m_dot_train = m_dot / N_TRAINS  # per-train mass flow
 
+    # Get effective cost factors for the selected procurement strategy
+    strategy = inp.get("procurement_strategy", "oem_lump_sum")
+    cf = get_effective_cost_factors(strategy)
+
     costs = {}
+    costs["procurement_strategy"] = strategy
 
     # Turbine-generator (per-train, x N_TRAINS)
-    uc_turb = inp.get("uc_turbine_per_kw", COST_FACTORS["turbine_per_kw"])
+    uc_turb = inp.get("uc_turbine_per_kw", cf["turbine_per_kw"])
     costs["turbine_generator"] = perf["gross_power_kw"] * uc_turb  # N * (P/N * uc) = P * uc
 
     # Isopentane pump (per-train, x N_TRAINS)
     pump_power_btu_hr = m_dot * perf["w_pump"]  # N * (m/N * w) = m * w
     pump_hp = pump_power_btu_hr / 2544.43
-    costs["iso_pump"] = pump_hp * COST_FACTORS["iso_pump_per_hp"]
+    costs["iso_pump"] = pump_hp * cf["iso_pump_per_hp"]
+
+    # HX cost multiplier (applies to all heat exchangers)
+    hx_mult = inp.get("uc_hx_multiplier", 1.0)
 
     # Vaporizer (State 7 -> 1) -- SHARED, sized at total flow
     Q_vap = m_dot * perf["q_vaporizer"] / 1e6          # MMBtu/hr
@@ -385,7 +599,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     dT2_vap = perf["T_brine_mid"] - states["7"].T
     lmtd_vap = _lmtd(dT1_vap, dT2_vap)
     vap_area = _hx_area(Q_vap, lmtd_vap, U_VALUES["vaporizer"])
-    uc_vap = inp.get("uc_vaporizer_per_ft2", COST_FACTORS["vaporizer_per_ft2"])
+    uc_vap = inp.get("uc_vaporizer_per_ft2", cf["vaporizer_per_ft2"]) * hx_mult
     costs["vaporizer"] = vap_area * uc_vap
     costs["vaporizer_area_ft2"] = vap_area
 
@@ -395,7 +609,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     dT2_pre = perf["T_geo_out_calc"] - states["6"].T
     lmtd_pre = _lmtd(dT1_pre, dT2_pre)
     pre_area = _hx_area(Q_pre, lmtd_pre, U_VALUES["preheater"])
-    uc_pre = inp.get("uc_preheater_per_ft2", COST_FACTORS["preheater_per_ft2"])
+    uc_pre = inp.get("uc_preheater_per_ft2", cf["preheater_per_ft2"]) * hx_mult
     costs["preheater"] = pre_area * uc_pre
     costs["preheater_area_ft2"] = pre_area
 
@@ -406,7 +620,7 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
         dT2_r = states["3"].T - states["5"].T
         lmtd_recup = _lmtd(dT1_r, dT2_r)
         recup_area_train = _hx_area(Q_recup_train, lmtd_recup, U_VALUES["recuperator"])
-        uc_rec = inp.get("uc_recuperator_per_ft2", COST_FACTORS["recup_per_ft2"])
+        uc_rec = inp.get("uc_recuperator_per_ft2", cf["recup_per_ft2"]) * hx_mult
         costs["recuperator"] = recup_area_train * uc_rec * N_TRAINS
         costs["recuperator_area_ft2"] = recup_area_train * N_TRAINS  # plant total
     else:
@@ -416,9 +630,18 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     # ACC (per-train, x N_TRAINS)
     Q_cond_train = m_dot_train * perf["q_cond"] / 1e6   # MMBtu/hr per train
     acc_area_train = _acc_face_area(Q_cond_train, perf["T_cond"], inp["T_ambient"])
-    uc_acc = inp.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"])
-    costs["acc"] = acc_area_train * uc_acc * N_TRAINS
     costs["acc_area_ft2"] = acc_area_train * N_TRAINS  # plant total
+    if "uc_acc_per_bay" in inp:
+        # Per-bay model: use fan bay count from parasitic calc or estimate
+        n_bays = inp.get("n_fan_bays_computed", 10)
+        acc_per_bay = inp["uc_acc_per_bay"]
+        costs["acc"] = n_bays * acc_per_bay
+        costs["acc_n_bays"] = n_bays
+    else:
+        # Default per-bay costing uses strategy-aware cost factor
+        n_bays = inp.get("n_fan_bays_computed", 10)
+        costs["acc"] = n_bays * cf["acc_per_bay"]
+        costs["acc_n_bays"] = n_bays
 
     # Ductwork (segments are per-train from thermo, cost x N_TRAINS)
     costs["ductwork_segments"] = {}
@@ -442,16 +665,26 @@ def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     costs["intermediate_hx_area_ft2"] = 0
     costs["propane_system"] = 0
 
+    # Working fluid inventory (sized per gross kW)
+    costs["wf_inventory"] = cf.get("wf_inventory_per_kw", 0) * perf["gross_power_kw"]
+
+    # Controls & instrumentation (DCS, PLCs, field instruments, SCADA)
+    costs["controls_instrumentation"] = cf.get("controls_instrumentation_per_kw", 0) * perf["gross_power_kw"]
+
+    # Electrical equipment (MV switchgear, MCC, transformers, cable)
+    costs["electrical_equipment"] = cf.get("electrical_equipment_per_kw", 0) * perf["gross_power_kw"]
+
     # Equipment subtotal
     equipment_keys = [
         "turbine_generator", "iso_pump", "vaporizer", "preheater",
         "recuperator", "acc", "ductwork", "structural_steel",
         "intermediate_hx", "propane_system",
+        "wf_inventory", "controls_instrumentation", "electrical_equipment",
     ]
     costs["equipment_subtotal"] = sum(costs[k] for k in equipment_keys)
 
-    # Apply indirect cost layers
-    _apply_indirect_costs(costs, inp)
+    # Apply installation & indirect cost layers
+    _apply_indirect_costs(costs, inp, gross_power_kw=perf["gross_power_kw"])
 
     # Equipment count (2 trains: 2 turbines, 2 pumps, 2 recups, 2 ACCs + 1 vap + 1 pre)
     costs["equipment_count"] = 4 * N_TRAINS + 2  # = 10
@@ -473,16 +706,24 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     m_dot_iso_train = m_dot_iso / N_TRAINS
     m_dot_prop_train = m_dot_prop / N_TRAINS
 
+    # Get effective cost factors for the selected procurement strategy
+    strategy = inp.get("procurement_strategy", "oem_lump_sum")
+    cf = get_effective_cost_factors(strategy)
+
     costs = {}
+    costs["procurement_strategy"] = strategy
 
     # Turbine-generator (per-train, x N_TRAINS)
-    uc_turb = inp.get("uc_turbine_per_kw", COST_FACTORS["turbine_per_kw"])
+    uc_turb = inp.get("uc_turbine_per_kw", cf["turbine_per_kw"])
     costs["turbine_generator"] = perf["gross_power_kw"] * uc_turb  # N * (P/N * uc) = P * uc
 
     # Isopentane pump (per-train, x N_TRAINS)
     pump_power_iso = m_dot_iso * perf["w_pump_iso"]  # N * (m/N * w) = m * w
     pump_hp_iso = pump_power_iso / 2544.43
-    costs["iso_pump"] = pump_hp_iso * COST_FACTORS["iso_pump_per_hp"]
+    costs["iso_pump"] = pump_hp_iso * cf["iso_pump_per_hp"]
+
+    # HX cost multiplier (applies to all heat exchangers)
+    hx_mult = inp.get("uc_hx_multiplier", 1.0)
 
     # Vaporizer -- SHARED, sized at total flow
     Q_vap = m_dot_iso * perf["q_vaporizer"] / 1e6          # MMBtu/hr
@@ -490,7 +731,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     dT2_vap = perf["T_brine_mid"] - states["7"].T
     lmtd_vap = _lmtd(dT1_vap, dT2_vap)
     vap_area = _hx_area(Q_vap, lmtd_vap, U_VALUES["vaporizer"])
-    uc_vap = inp.get("uc_vaporizer_per_ft2", COST_FACTORS["vaporizer_per_ft2"])
+    uc_vap = inp.get("uc_vaporizer_per_ft2", cf["vaporizer_per_ft2"]) * hx_mult
     costs["vaporizer"] = vap_area * uc_vap
     costs["vaporizer_area_ft2"] = vap_area
 
@@ -500,7 +741,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     dT2_pre = perf["T_geo_out_calc"] - states["6"].T
     lmtd_pre = _lmtd(dT1_pre, dT2_pre)
     pre_area = _hx_area(Q_pre, lmtd_pre, U_VALUES["preheater"])
-    uc_pre = inp.get("uc_preheater_per_ft2", COST_FACTORS["preheater_per_ft2"])
+    uc_pre = inp.get("uc_preheater_per_ft2", cf["preheater_per_ft2"]) * hx_mult
     costs["preheater"] = pre_area * uc_pre
     costs["preheater_area_ft2"] = pre_area
 
@@ -511,7 +752,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
         dT2_r = states["3"].T - states["5"].T
         lmtd_recup = _lmtd(dT1_r, dT2_r)
         recup_area_train = _hx_area(Q_recup_train, lmtd_recup, U_VALUES["recuperator"])
-        uc_rec = inp.get("uc_recuperator_per_ft2", COST_FACTORS["recup_per_ft2"])
+        uc_rec = inp.get("uc_recuperator_per_ft2", cf["recup_per_ft2"]) * hx_mult
         costs["recuperator"] = recup_area_train * uc_rec * N_TRAINS
         costs["recuperator_area_ft2"] = recup_area_train * N_TRAINS  # plant total
     else:
@@ -522,7 +763,7 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     Q_int_train = m_dot_iso_train * perf["q_cond_iso"] / 1e6  # MMBtu/hr per train
     lmtd_int = inp.get("dt_approach_intermediate", 10)
     int_area_train = _hx_area(Q_int_train, lmtd_int, U_VALUES["intermediate_hx"])
-    uc_ihx = inp.get("uc_ihx_per_ft2", COST_FACTORS["hx_per_ft2"])
+    uc_ihx = inp.get("uc_ihx_per_ft2", cf["hx_per_ft2"]) * hx_mult
     costs["intermediate_hx"] = int_area_train * uc_ihx * N_TRAINS
     costs["intermediate_hx_area_ft2"] = int_area_train * N_TRAINS  # plant total
 
@@ -530,12 +771,20 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     Q_prop_train = m_dot_prop_train * (propane_states["A"].h - propane_states["B"].h) / 1e6
     T_propane_cond = perf["T_propane_cond"]
     acc_area_train = _acc_face_area(Q_prop_train, T_propane_cond, inp["T_ambient"])
-    uc_acc = inp.get("uc_acc_per_ft2", COST_FACTORS["acc_per_ft2"])
-    costs["acc"] = acc_area_train * uc_acc * N_TRAINS
     costs["acc_area_ft2"] = acc_area_train * N_TRAINS  # plant total
+    if "uc_acc_per_bay" in inp:
+        n_bays = inp.get("n_fan_bays_computed", 10)
+        acc_per_bay = inp["uc_acc_per_bay"]
+        costs["acc"] = n_bays * acc_per_bay
+        costs["acc_n_bays"] = n_bays
+    else:
+        # Default per-bay costing uses strategy-aware cost factor
+        n_bays = inp.get("n_fan_bays_computed", 10)
+        costs["acc"] = n_bays * cf["acc_per_bay"]
+        costs["acc_n_bays"] = n_bays
 
     # Propane system (piping + pump) as % of IHX cost -- already plant total
-    prop_pct = inp.get("uc_prop_piping_pct", COST_FACTORS["prop_piping_pct"])
+    prop_pct = inp.get("uc_prop_piping_pct", cf["prop_piping_pct"])
     costs["propane_system"] = costs["intermediate_hx"] * prop_pct / 100
 
     # Ductwork (segments are per-train from thermo, cost x N_TRAINS)
@@ -555,16 +804,26 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     costs["structural_steel"] = steel_cost_train * N_TRAINS
     costs["structural_steel_weight_lb"] = steel_weight_train * N_TRAINS
 
+    # Working fluid inventory (sized per gross kW)
+    costs["wf_inventory"] = cf.get("wf_inventory_per_kw", 0) * perf["gross_power_kw"]
+
+    # Controls & instrumentation (DCS, PLCs, field instruments, SCADA)
+    costs["controls_instrumentation"] = cf.get("controls_instrumentation_per_kw", 0) * perf["gross_power_kw"]
+
+    # Electrical equipment (MV switchgear, MCC, transformers, cable)
+    costs["electrical_equipment"] = cf.get("electrical_equipment_per_kw", 0) * perf["gross_power_kw"]
+
     # Equipment subtotal
     equipment_keys = [
         "turbine_generator", "iso_pump", "vaporizer", "preheater",
         "recuperator", "acc", "ductwork", "structural_steel",
         "intermediate_hx", "propane_system",
+        "wf_inventory", "controls_instrumentation", "electrical_equipment",
     ]
     costs["equipment_subtotal"] = sum(costs[k] for k in equipment_keys)
 
-    # Apply indirect cost layers
-    _apply_indirect_costs(costs, inp)
+    # Apply installation & indirect cost layers
+    _apply_indirect_costs(costs, inp, gross_power_kw=perf["gross_power_kw"])
 
     # Equipment count (2 trains: 2 turbines, 2 iso pumps, 2 recups, 2 IHX, 2 ACC,
     #                  2 prop pumps + 1 vap + 1 pre + prop piping)

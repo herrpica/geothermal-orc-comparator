@@ -6,3 +6,12 @@ __pycache__/
 dist/
 build/
 .claude/
+knowledge/data/
+
+# Generated artifacts
+*.bak
+converged_design.json
+deck_summary.json
+fine_sweep_results.json
+debate_transcript.txt
+step_change_analysis.json

@@ -785,20 +785,25 @@ def build_analysis_sidebar(shared_inputs=None):
                                            min_value=0.01, value=1.0, step=0.05, format="%.2f")
                 if "T_geo_out_min" not in shared:
                     T_geo_out_min = st.number_input("Min brine outlet temperature (degF)",
-                                                    min_value=1, value=160, step=5,
-                                                    help="Silica/scaling constraint")
+                                                    min_value=160, max_value=250, value=180, step=5,
+                                                    help="Silica/scaling constraint (160°F floor)")
                 else:
                     T_geo_out_min = shared["T_geo_out_min"]
+                if T_geo_out_min < 180:
+                    st.warning("Below silica saturation limit — scaling risk. "
+                               "Requires anti-scaling treatment or brine chemistry verification.")
 
             with st.expander("Cycle Parameters"):
                 if "eta_turbine" not in shared:
-                    eta_turbine = st.number_input("Turbine isentropic efficiency",
-                                                  min_value=0.01, value=0.91, step=0.01, format="%.2f")
+                    eta_turbine_pct = st.number_input("Turbine isentropic efficiency (%)",
+                                                      min_value=70, max_value=90, value=82, step=1)
+                    eta_turbine = eta_turbine_pct / 100.0
                 else:
                     eta_turbine = shared["eta_turbine"]
                 if "eta_pump" not in shared:
-                    eta_pump = st.number_input("Pump isentropic efficiency",
-                                               min_value=0.01, value=0.84, step=0.01, format="%.2f")
+                    eta_pump_pct = st.number_input("Pump isentropic efficiency (%)",
+                                                    min_value=60, max_value=85, value=75, step=1)
+                    eta_pump = eta_pump_pct / 100.0
                 else:
                     eta_pump = shared["eta_pump"]
                 superheat = st.number_input("Turbine inlet superheat (degF above sat)",
@@ -813,14 +818,24 @@ def build_analysis_sidebar(shared_inputs=None):
                     T_ambient = shared["T_ambient"]
 
             with st.expander("Pinch Points"):
-                dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)",
-                                                 min_value=1, value=15, step=1)
-                dt_pinch_acc_b = st.number_input("ACC pinch Config B (degF)",
-                                                 min_value=1, value=15, step=1)
-                dt_pinch_vaporizer = st.number_input("Vaporizer pinch (degF)",
-                                                     min_value=1, value=10, step=1)
-                dt_pinch_preheater = st.number_input("Preheater pinch (degF)",
-                                                     min_value=1, value=10, step=1)
+                if "dt_pinch_acc" in shared:
+                    dt_pinch_acc_a = shared["dt_pinch_acc"]
+                    dt_pinch_acc_b = shared["dt_pinch_acc"]
+                else:
+                    dt_pinch_acc_a = st.number_input("ACC pinch Config A (degF)",
+                                                     min_value=10, max_value=45, value=30, step=1)
+                    dt_pinch_acc_b = st.number_input("ACC pinch Config B (degF)",
+                                                     min_value=10, max_value=45, value=30, step=1)
+                if "dt_pinch_vaporizer" in shared:
+                    dt_pinch_vaporizer = shared["dt_pinch_vaporizer"]
+                else:
+                    dt_pinch_vaporizer = st.number_input("Vaporizer pinch (degF)",
+                                                         min_value=4, max_value=20, value=8, step=1)
+                if "dt_pinch_preheater" in shared:
+                    dt_pinch_preheater = shared["dt_pinch_preheater"]
+                else:
+                    dt_pinch_preheater = st.number_input("Preheater pinch (degF)",
+                                                         min_value=3, max_value=15, value=6, step=1)
                 dt_pinch_recup = st.number_input("Recuperator pinch (degF)",
                                                  min_value=1, value=15, step=1)
                 dt_approach_intermediate = st.number_input(
@@ -961,8 +976,6 @@ def build_analysis_sidebar(shared_inputs=None):
                     "Recuperator ($/ft2)", min_value=1, value=25, step=1, key="uc_recuperator")
                 uc_ihx_per_ft2 = st.number_input(
                     "IHX ($/ft2, pressure rated)", min_value=1, value=40, step=1, key="uc_ihx")
-                uc_acc_per_ft2 = st.number_input(
-                    "ACC ($/ft2 face area)", min_value=1, value=12, step=1, key="uc_acc")
 
                 st.markdown("**Duct and Piping Costs**")
                 uc_iso_duct_per_ft2 = st.number_input(
@@ -1019,6 +1032,11 @@ def build_analysis_sidebar(shared_inputs=None):
         "superheat": superheat,
         "eta_turbine": eta_turbine,
         "eta_pump": eta_pump,
+        "generator_efficiency": shared.get("generator_efficiency", 0.96),
+        "uc_hx_multiplier": shared.get("uc_hx_multiplier", 1.0),
+        "uc_acc_per_bay": shared.get("uc_acc_per_bay", 347200),
+        "uc_civil_structural_per_kw": shared.get("uc_civil_structural_per_kw", 175),
+        "uc_ei_installation_per_kw": shared.get("uc_ei_installation_per_kw", 125),
         "v_tailpipe": v_tailpipe,
         "v_acc_header": v_acc_header,
         "L_tailpipe_a": L_tailpipe_a,
@@ -1051,7 +1069,6 @@ def build_analysis_sidebar(shared_inputs=None):
         "uc_preheater_per_ft2": uc_preheater_per_ft2,
         "uc_recuperator_per_ft2": uc_recuperator_per_ft2,
         "uc_ihx_per_ft2": uc_ihx_per_ft2,
-        "uc_acc_per_ft2": uc_acc_per_ft2,
         "uc_iso_duct_per_ft2": uc_iso_duct_per_ft2,
         "uc_prop_pipe_per_ft2": uc_prop_pipe_per_ft2,
         "uc_prop_piping_pct": uc_prop_piping_pct,

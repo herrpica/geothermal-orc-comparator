@@ -1,0 +1,147 @@
+PROCUREMENT STRATEGY COST MODEL — CALIBRATION REFERENCE
+========================================================
+
+Domain: economics_market
+Tags: procurement_strategy, self_perform, direct_purchase, geoblock, validated
+
+1. STRATEGY DEFINITIONS
+-----------------------
+
+OEM Lump-Sum (oem_lump_sum):
+  Equipment: OEM integrated package (Turboden, Exergy, ORMAT)
+  Construction: EPC lump-sum contractor
+  OEM integration margin: 30-40% on equipment
+  EPC contractor markup: 25-35% on construction
+  Target: ~$2,500/kW installed (surface facility)
+  Validated: Turboden 93 MW at $2,566/kW actual
+
+Direct Lump-Sum (direct_lump_sum):
+  Equipment: Direct vendor purchase (turbine from OEM, HX from fabricator, ACC from Worldwide)
+  Construction: EPC lump-sum contractor
+  Eliminates OEM integration margin on equipment
+  Retains EPC markup on construction
+  Target: ~$1,800-2,200/kW installed
+
+OEM Self-Perform (oem_self_perform):
+  Equipment: OEM integrated package
+  Construction: Owner T&M self-perform (Fervo's own construction team)
+  Retains OEM integration margin on equipment
+  Eliminates EPC contractor markup on construction
+  Target: ~$1,900-2,200/kW installed
+
+Direct Self-Perform (direct_self_perform):
+  Equipment: Direct vendor purchase
+  Construction: Owner T&M self-perform
+  Eliminates both OEM and EPC margins
+  Requires in-house procurement & construction management capability
+  Target: ~$1,600-1,900/kW installed (GeoBlock thesis)
+
+
+2. VALIDATED EQUIPMENT COSTS (DIRECT PURCHASE)
+-----------------------------------------------
+
+Turbine-Generator Package:
+  Exergy radial outflow: ~$77/kW (validated, 100+ installations)
+  Conventional axial: ~$200-250/kW (Baker Hughes, Mitsubishi)
+  Model uses $200/kW for direct_lump_sum/direct_self_perform
+
+Heat Exchangers (direct from fabricator):
+  Vaporizer: $50/ft2 (shell-and-tube, brine service, ASME VIII)
+  Preheater: $43/ft2 (liquid-liquid, corrosion-resistant)
+  Recuperator: $37/ft2 (welded plate or S&T)
+  Intermediate HX: $27/ft2 (pressure rated)
+  vs OEM pricing: $75/$65/$55/$40 per ft2
+
+Air-Cooled Condenser:
+  Worldwide Air Coolers validated bid: $347,200/bay
+  Already direct pricing (used for all direct strategies)
+  vs OEM pricing: $575,000/bay (includes margin + integration)
+
+Pumps:
+  Direct API 610: $420/hp
+  vs OEM pricing: $600/hp
+
+Controls & Instrumentation:
+  Direct: $40/kW (DCS, PLCs, field instruments, SCADA)
+  vs OEM: $50/kW
+
+Electrical Equipment:
+  Direct: $55/kW (MV switchgear, MCC, transformers, cable)
+  vs OEM: $65/kW
+
+
+3. SELF-PERFORM CONSTRUCTION MODEL (T&M RATES)
+-----------------------------------------------
+
+BOP Piping & Valves: 12% of equipment (vs 16% EPC)
+  Savings from direct pipe procurement and owner-managed labor
+
+Civil & Structural: $90/kW gross (vs $260/kW EPC)
+  Bulk earthwork and concrete at T&M rates
+  No contractor mobilization/demobilization markup
+
+E&I Installation: $115/kW gross (vs $190/kW EPC)
+  Direct hire electricians and instrument techs
+  Owner provides supervision
+
+Construction Labor: $185/kW gross (vs $285/kW EPC)
+  T&M basis, no lump-sum profit margin
+  Includes owner CM staff overhead
+
+Engineering & Procurement: 7% of equipment (vs 10% EPC)
+  In-house engineering team, direct vendor management
+
+Commissioning & Startup: $48/kW gross (vs $65/kW EPC)
+  Owner-led commissioning with vendor field service
+
+Contingency: 9% (vs 10% EPC)
+  Lower due to owner risk tolerance and schedule control
+
+
+4. GEOBLOCK THESIS
+------------------
+
+Core premise: Geothermal developer with construction capability can
+achieve $700-1,000/kW cost advantage over traditional OEM+EPC model.
+
+Direct + Self-Perform eliminates:
+  - OEM integration margin (30-40% on equipment)
+  - EPC contractor profit (25-35% on construction)
+  - Duplicated project management overhead
+  - Markup on markup (contingency on inflated base)
+
+Required capabilities:
+  - Procurement team with equipment vendor relationships
+  - Construction management staff experienced in power plant erection
+  - QA/QC program meeting ASME, NEC, and local jurisdiction requirements
+  - Field engineering support during construction
+  - Commissioning and startup expertise
+
+Risk factors:
+  - Owner assumes construction risk (schedule, quality, safety)
+  - Equipment warranty management is owner's responsibility
+  - No single-point-of-contact for performance guarantee
+  - May need to carry higher contingency if team is inexperienced
+
+
+5. COST FACTOR SUMMARY TABLE
+-----------------------------
+
+Cost Factor                  | OEM+EPC  | Direct+EPC | OEM+T&M  | Direct+T&M
+-----------------------------|----------|------------|----------|----------
+turbine_per_kw              |    $340  |      $200  |    $340  |      $200
+vaporizer_per_ft2           |     $75  |       $50  |     $75  |       $50
+preheater_per_ft2           |     $65  |       $43  |     $65  |       $43
+recup_per_ft2               |     $55  |       $37  |     $55  |       $37
+hx_per_ft2                  |     $40  |       $27  |     $40  |       $27
+acc_per_bay                 | $575,000 |  $347,200  | $575,000 |  $347,200
+pump_per_hp                 |    $600  |      $420  |    $600  |      $420
+controls_per_kw             |     $50  |       $40  |     $50  |       $40
+electrical_per_kw           |     $65  |       $55  |     $65  |       $55
+bop_piping_pct              |     16%  |       16%  |     12%  |       12%
+civil_structural_per_kw     |    $260  |      $260  |     $90  |       $90
+ei_installation_per_kw      |    $190  |      $190  |    $115  |      $115
+construction_labor_per_kw   |    $285  |      $285  |    $185  |      $185
+engineering_pct             |     10%  |       10%  |      7%  |        7%
+commissioning_per_kw        |     $65  |       $65  |     $48  |       $48
+contingency_pct             |     10%  |       10%  |      9%  |        9%

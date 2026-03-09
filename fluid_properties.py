@@ -75,6 +75,7 @@ FLUID_MAP = {
     "isobutane": "Isobutane",
     "n-pentane": "n-Pentane",
     "r245fa": "R245fa",
+    "cyclopentane": "CycloPentane",
 }
 
 

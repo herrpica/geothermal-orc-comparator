@@ -383,6 +383,15 @@ def build_dialectic_sidebar(shared_inputs=None):
             },
         }
 
+        # Thread efficiency, pinch, and cost params from shared_inputs
+        if shared_inputs:
+            for key in ["eta_turbine", "eta_pump", "generator_efficiency",
+                        "dt_pinch_vaporizer", "dt_pinch_preheater", "dt_pinch_acc",
+                        "uc_turbine_per_kw", "uc_acc_per_bay", "uc_hx_multiplier",
+                        "uc_civil_structural_per_kw", "uc_ei_installation_per_kw"]:
+                if key in shared_inputs:
+                    design_basis[key] = shared_inputs[key]
+
         return design_basis
 
 
