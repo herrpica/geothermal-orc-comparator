@@ -144,13 +144,13 @@ with st.sidebar:
     with st.expander("Cycle"):
         eta_turbine_pct = st.number_input(
             "Turbine isentropic efficiency (%)",
-            min_value=70, max_value=90, value=82, step=1,
+            min_value=70, max_value=95, value=90, step=1,
             key="shared_eta_turbine",
         )
         eta_turbine = eta_turbine_pct / 100.0
         eta_pump_pct = st.number_input(
             "Pump isentropic efficiency (%)",
-            min_value=60, max_value=85, value=75, step=1,
+            min_value=60, max_value=90, value=82, step=1,
             key="shared_eta_pump",
         )
         eta_pump = eta_pump_pct / 100.0
@@ -164,17 +164,17 @@ with st.sidebar:
     with st.expander("Pinch Points"):
         dt_pinch_vaporizer = st.number_input(
             "Vaporizer pinch (°F)",
-            min_value=4, max_value=20, value=8, step=1,
+            min_value=4, max_value=20, value=14, step=1,
             key="shared_dt_pinch_vaporizer",
         )
         dt_pinch_preheater = st.number_input(
             "Preheater pinch (°F)",
-            min_value=3, max_value=15, value=6, step=1,
+            min_value=3, max_value=15, value=14, step=1,
             key="shared_dt_pinch_preheater",
         )
         dt_pinch_acc = st.number_input(
             "ACC approach (°F)",
-            min_value=10, max_value=45, value=30, step=1,
+            min_value=10, max_value=45, value=22, step=1,
             key="shared_dt_pinch_acc",
         )
 
@@ -208,12 +208,12 @@ with st.sidebar:
     with st.expander("Economics"):
         electricity_price = st.number_input(
             "Electricity price ($/MWh)",
-            min_value=1, value=35, step=5,
+            min_value=1, value=105, step=5,
             key="shared_electricity_price",
         )
         discount_rate = st.number_input(
             "Discount rate (%)",
-            min_value=0, value=8, step=1,
+            min_value=0, value=11, step=1,
             key="shared_discount_rate",
         )
         project_life = st.number_input(
