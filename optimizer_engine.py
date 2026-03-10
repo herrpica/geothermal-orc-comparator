@@ -892,21 +892,43 @@ TARGETS:
 - Net power: {TARGET_MIN_NET_MW:.0f} – {TARGET_MAX_NET_MW:.0f} MW (HARD CONSTRAINT — both min AND max)
 
 CRITICAL — RIGHT-SIZING CONSTRAINT:
-Configs that produce MORE than {TARGET_MAX_NET_MW:.0f} MW net are FAILURES — they are oversized and do NOT count as target hits.
-The goal is the CHEAPEST config that lands WITHIN {TARGET_MIN_NET_MW:.0f}–{TARGET_MAX_NET_MW:.0f} MW, not the cheapest config overall.
-To reduce net power output: use wider pinch points (higher vaporizer pinch, higher ACC approach, higher preheater pinch).
-Wider pinches = less heat transfer = less power = smaller/cheaper equipment.
-If previous results all exceed {TARGET_MAX_NET_MW:.0f} MW, aggressively widen pinches until output drops into the band.
+Configs outside {TARGET_MIN_NET_MW:.0f}–{TARGET_MAX_NET_MW:.0f} MW net are NOT target hits. The goal is the cheapest config
+that lands WITHIN the band, not the cheapest config overall.
+
+ENGINEERING REASONING — How pinch points control output:
+- Wider vaporizer pinch -> less heat into the cycle -> less power
+- Wider ACC approach -> higher condensing temp -> less power but cheaper ACC
+- Wider preheater pinch -> less liquid preheating -> less power
+- Wider recuperator pinch -> less internal heat recovery -> less power (recuperated/dual only)
+- Each pinch shift of ~2°F typically moves net power by 1-3 MW depending on the fluid
+Use this to interpolate: if a config at vap=12 produced 58 MW, try vap=14 to nudge it down ~2 MW.
+
+EXPLORATION STRATEGY:
+1. NEAR-MISS ITERATION (highest priority): When a config lands within ~3 MW of the band,
+   it is a promising lead. Propose 2-3 pinch variations around it (shift one pinch at a time
+   by 1-3°F) to walk the output into the target band. Small steps find the sweet spot.
+2. NOVEL FLUID/TOPOLOGY EXPLORATION: Do not abandon a fluid after one or two tries.
+   Each fluid has different thermodynamic character — a fluid that undershoots at basic
+   topology might hit the band with recuperation, or with tighter pinches. Think about WHY
+   a fluid produced the output it did, and reason about what change would move it toward the band.
+   You never know where the secret lies — an unconventional combination may outperform the obvious one.
+3. SENSITIVITY LEARNING: Track how each fluid responds to pinch changes. If isopentane/basic
+   at vap=10/acc=20 gives 50 MW, and vap=8/acc=15 gives 52 MW, the sensitivity is roughly
+   2 MW per 5°F of combined pinch tightening. Use this to predict where the band entry point is.
+4. COST-POWER TRADEOFF: Within the band, wider pinches mean smaller heat exchangers and
+   lower cost. So once you find configs IN the band, push pinches wider while staying above
+   {TARGET_MIN_NET_MW:.0f} MW to minimize $/kW. The cheapest in-band config wins.
 
 INSTRUCTIONS:
-- Analyze the results from previous rounds to identify patterns and promising regions
+- Analyze results from previous rounds — look for patterns, sensitivities, and promising leads
 - Propose exactly {AI_GUIDED_BATCH_SIZE} new configurations to test next
-- EVERY proposed config should be designed to land within {TARGET_MIN_NET_MW:.0f}–{TARGET_MAX_NET_MW:.0f} MW net power
-- Focus on regions near the best-performing IN-BAND configs (exploit) while also testing new combinations (explore)
+- Allocate your batch: ~60% near-miss iterations around promising configs, ~40% novel exploration
+- For each proposed config, briefly reason about why you expect it to land in or near the band
+- Do not give up on a fluid/topology after 1-2 failures — reason about what went wrong and adapt
 - Favor simpler topologies (basic > recuperated > dual_pressure) unless complexity is justified
 - Avoid re-testing configurations that have already been run
-- Set "converged" to true ONLY when further exploration is unlikely to improve on the best IN-BAND result
-  (e.g., you've thoroughly tested variations around the optimum within the MW band)
+- Set "converged" to true ONLY when you have thoroughly explored variations around your best
+  in-band configs AND tested multiple fluids/topologies, and further search is unlikely to improve
 
 Return ONLY a JSON object with this structure:
 {{
@@ -963,6 +985,34 @@ def build_ai_context(store: ResultStore, round_number: int) -> str:
             lines.append(
                 f"- **WARNING: No configs yet in the {TARGET_MIN_NET_MW:.0f}-{TARGET_MAX_NET_MW:.0f} MW target band. "
                 f"Focus on pinch/topology combinations that REDUCE net power into the band.**"
+            )
+
+    # Near misses & promising leads — configs close to the MW band
+    near_misses = []
+    for r in converged:
+        delta = 0
+        if r.net_power_MW > TARGET_MAX_NET_MW:
+            delta = r.net_power_MW - TARGET_MAX_NET_MW
+        elif r.net_power_MW < TARGET_MIN_NET_MW:
+            delta = TARGET_MIN_NET_MW - r.net_power_MW
+        else:
+            continue  # already in-band, not a "miss"
+        if delta <= 5.0:  # within 5 MW of the band edge
+            near_misses.append((r, delta, "over" if r.net_power_MW > TARGET_MAX_NET_MW else "under"))
+
+    if near_misses:
+        near_misses.sort(key=lambda x: x[1])  # closest first
+        lines.append(f"\n### Near Misses & Promising Leads ({len(near_misses)} configs within 5 MW of band)")
+        lines.append("ITERATE around these — small pinch adjustments (1-3°F) can walk them into the band:")
+        for r, delta, direction in near_misses[:8]:
+            rc = r.config
+            hint = "widen pinches to reduce output" if direction == "over" else "tighten pinches to increase output"
+            lines.append(
+                f"- {rc.get('working_fluid')}/{rc.get('topology')} "
+                f"vap={rc.get('vaporizer_pinch_F')} acc={rc.get('acc_approach_F')} "
+                f"pre={rc.get('preheater_pinch_F')} recup={rc.get('recuperator_pinch_F')} -> "
+                f"{r.net_power_MW:.1f} MW ({delta:.1f} MW {direction}) "
+                f"${r.total_adjusted_per_kW:,.0f}/kW — {hint}"
             )
 
     # Pareto frontier
@@ -1039,12 +1089,15 @@ def build_ai_context(store: ResultStore, round_number: int) -> str:
                            "oem_self_perform": "OEM+SP", "direct_self_perform": "DIR+SP"
                            }.get(r.procurement_strategy, r.procurement_strategy)
             if r.converged:
+                mw_label = "IN-BAND" if TARGET_MIN_NET_MW <= r.net_power_MW <= TARGET_MAX_NET_MW else (
+                    f"{r.net_power_MW - TARGET_MAX_NET_MW:+.1f} over" if r.net_power_MW > TARGET_MAX_NET_MW
+                    else f"{r.net_power_MW - TARGET_MIN_NET_MW:+.1f} under")
                 lines.append(
                     f"- {rc.get('working_fluid')}/{rc.get('topology')}/{rc.get('heat_rejection')}/{strat_short} "
                     f"vap={rc.get('vaporizer_pinch_F')} acc={rc.get('acc_approach_F')} "
-                    f"pre={rc.get('preheater_pinch_F')} recup={rc.get('recuperator_pinch_F')} → "
+                    f"pre={rc.get('preheater_pinch_F')} recup={rc.get('recuperator_pinch_F')} -> "
                     f"${r.capex_per_kW:,.0f}/kW, {r.cycle_efficiency*100:.1f}% eff, "
-                    f"{r.net_power_MW:.1f} MW, {r.construction_weeks} wk"
+                    f"{r.net_power_MW:.1f} MW [{mw_label}], {r.construction_weeks} wk"
                 )
             else:
                 err_short = r.error[:60] if r.error else "unknown"
