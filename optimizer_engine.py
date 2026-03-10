@@ -250,14 +250,27 @@ class ResultStore:
         converged = self.get_converged()
         if not converged:
             return None
-        return min(converged, key=lambda r: r.capex_per_kW)
+        # Prefer configs that fit the MW band; fall back to all converged
+        in_band = [r for r in converged
+                   if r.net_power_MW >= TARGET_MIN_NET_MW
+                   and r.net_power_MW <= TARGET_MAX_NET_MW]
+        pool = in_band if in_band else converged
+        return min(pool, key=lambda r: r.capex_per_kW)
 
     def get_best_adjusted(self) -> Optional[OptResult]:
-        """Best config by total adjusted $/kW (installed + complexity NPV)."""
+        """Best config by total adjusted $/kW (installed + complexity NPV).
+
+        Prefers configs within the MW target band. Falls back to all converged
+        only if no in-band configs exist.
+        """
         converged = self.get_converged()
         if not converged:
             return None
-        return min(converged, key=lambda r: r.total_adjusted_per_kW)
+        in_band = [r for r in converged
+                   if r.net_power_MW >= TARGET_MIN_NET_MW
+                   and r.net_power_MW <= TARGET_MAX_NET_MW]
+        pool = in_band if in_band else converged
+        return min(pool, key=lambda r: r.total_adjusted_per_kW)
 
     def get_best_npv(self) -> Optional[OptResult]:
         converged = self.get_converged()
@@ -296,7 +309,11 @@ class ResultStore:
 # ── Pareto Frontier ───────────────────────────────────────────────────────
 
 def update_pareto_frontier(store: ResultStore):
-    """Recompute Pareto-optimal flags: maximize efficiency, minimize adjusted $/kW."""
+    """Recompute Pareto-optimal flags: maximize efficiency, minimize adjusted $/kW.
+
+    Only configs within the MW target band participate. Falls back to all
+    converged if no in-band configs exist yet.
+    """
     converged = store.get_converged()
     if not converged:
         return
@@ -305,11 +322,17 @@ def update_pareto_frontier(store: ResultStore):
     for r in store.results:
         r.pareto_optimal = False
 
+    # Prefer in-band configs for the frontier
+    in_band = [r for r in converged
+               if r.net_power_MW >= TARGET_MIN_NET_MW
+               and r.net_power_MW <= TARGET_MAX_NET_MW]
+    pool = in_band if in_band else converged
+
     # A point is Pareto-optimal if no other point dominates it
     # (higher efficiency AND lower total_adjusted_per_kW)
-    for r in converged:
+    for r in pool:
         dominated = False
-        for other in converged:
+        for other in pool:
             if other is r:
                 continue
             if (other.cycle_efficiency >= r.cycle_efficiency and
@@ -866,17 +889,24 @@ Procurement strategy changes cost factors but NOT thermodynamic performance. Sam
 TARGETS:
 - Total adjusted cost: <= ${TARGET_CAPEX_PER_KW:,.0f}/kW (installed + complexity NPV)
 - Construction schedule: <= {TARGET_SCHEDULE_WEEKS} weeks
-- Net power range: {TARGET_MIN_NET_MW:.0f} – {TARGET_MAX_NET_MW:.0f} MW
+- Net power: {TARGET_MIN_NET_MW:.0f} – {TARGET_MAX_NET_MW:.0f} MW (HARD CONSTRAINT — both min AND max)
+
+CRITICAL — RIGHT-SIZING CONSTRAINT:
+Configs that produce MORE than {TARGET_MAX_NET_MW:.0f} MW net are FAILURES — they are oversized and do NOT count as target hits.
+The goal is the CHEAPEST config that lands WITHIN {TARGET_MIN_NET_MW:.0f}–{TARGET_MAX_NET_MW:.0f} MW, not the cheapest config overall.
+To reduce net power output: use wider pinch points (higher vaporizer pinch, higher ACC approach, higher preheater pinch).
+Wider pinches = less heat transfer = less power = smaller/cheaper equipment.
+If previous results all exceed {TARGET_MAX_NET_MW:.0f} MW, aggressively widen pinches until output drops into the band.
 
 INSTRUCTIONS:
-- RIGHT-SIZING: Prefer configs closer to the minimum net power target over oversized designs. Configs above {TARGET_MAX_NET_MW:.0f} MW are NOT target hits.
 - Analyze the results from previous rounds to identify patterns and promising regions
 - Propose exactly {AI_GUIDED_BATCH_SIZE} new configurations to test next
-- Focus on regions near the best-performing configs (exploit) while also testing new combinations (explore)
+- EVERY proposed config should be designed to land within {TARGET_MIN_NET_MW:.0f}–{TARGET_MAX_NET_MW:.0f} MW net power
+- Focus on regions near the best-performing IN-BAND configs (exploit) while also testing new combinations (explore)
 - Favor simpler topologies (basic > recuperated > dual_pressure) unless complexity is justified
 - Avoid re-testing configurations that have already been run
-- Set "converged" to true ONLY when further exploration is unlikely to improve on the best result
-  (e.g., you've thoroughly tested variations around the optimum)
+- Set "converged" to true ONLY when further exploration is unlikely to improve on the best IN-BAND result
+  (e.g., you've thoroughly tested variations around the optimum within the MW band)
 
 Return ONLY a JSON object with this structure:
 {{
@@ -908,11 +938,14 @@ def build_ai_context(store: ResultStore, round_number: int) -> str:
     lines.append(f"Total configs tested: {stats['total_runs']}")
     lines.append(f"Converged: {stats['converged']} | Failed: {stats['failed']} | Target hits: {stats['target_hits']}")
 
-    # Best config (by adjusted $/kW)
-    best = store.get_best_adjusted()
+    # Best config — prefer in-band (53-57 MW), show both if different
+    best = store.get_best_adjusted()  # already prefers in-band
     if best:
         bcfg = best.config
-        lines.append(f"\n### Best Config So Far (by total adjusted $/kW)")
+        in_band = (best.net_power_MW >= TARGET_MIN_NET_MW
+                   and best.net_power_MW <= TARGET_MAX_NET_MW)
+        band_label = "IN-BAND" if in_band else "OUT-OF-BAND"
+        lines.append(f"\n### Best Config So Far ({band_label}, by total adjusted $/kW)")
         lines.append(
             f"- {bcfg.get('working_fluid')}/{bcfg.get('topology')}/{bcfg.get('heat_rejection')} "
             f"strategy={bcfg.get('procurement_strategy', 'oem_lump_sum')} "
@@ -926,6 +959,11 @@ def build_ai_context(store: ResultStore, round_number: int) -> str:
             f"Efficiency: {best.cycle_efficiency*100:.1f}% | Net: {best.net_power_MW:.1f} MW | "
             f"Schedule: {best.construction_weeks} wk | NPV: ${best.npv_USD:,.0f}"
         )
+        if not in_band:
+            lines.append(
+                f"- **WARNING: No configs yet in the {TARGET_MIN_NET_MW:.0f}-{TARGET_MAX_NET_MW:.0f} MW target band. "
+                f"Focus on pinch/topology combinations that REDUCE net power into the band.**"
+            )
 
     # Pareto frontier
     pareto = store.get_pareto()
