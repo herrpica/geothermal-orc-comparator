@@ -148,9 +148,9 @@ def tool_input_to_inputs(tool_input: dict, config: str) -> dict:
     if "pump_isentropic_efficiency" in tool_input:
         inp["eta_pump"] = tool_input["pump_isentropic_efficiency"]
 
-    # turbine_trains: N_TRAINS is hardcoded at 2 in the existing solver.
-    # We note it here but cannot change it without modifying thermodynamics.py.
-    # The bridge will pass it through as metadata in the output.
+    # Turbine trains (1, 2, or 3 parallel trains)
+    if "turbine_trains" in tool_input:
+        inp["n_trains"] = tool_input["turbine_trains"]
 
     # Pressure drop fractions — scale default equipment dP values
     # Default dP values (psi) from thermodynamics._default_inputs():
@@ -378,6 +378,7 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
             "config": config,
             "working_fluid": inputs.get("working_fluid", "isopentane"),
             "procurement_strategy": inputs.get("procurement_strategy", "oem_lump_sum"),
+            "n_trains": inputs.get("n_trains", 2),
             "T_cond_F": perf["T_cond"],
             "T_evap_F": perf["T_evap"],
             "P_high_psia": perf["P_high"],
@@ -582,7 +583,8 @@ RUN_ORC_ANALYSIS_TOOL = {
             },
             "turbine_trains": {
                 "type": "integer",
-                "description": "Number of parallel turbine/ACC trains. Currently fixed at 2.",
+                "enum": [1, 2, 3],
+                "description": "Number of parallel turbine/ACC trains (1, 2, or 3). Affects per-unit turbine sizing and ductwork.",
             },
             "isopentane_pressure_drop_fraction": {
                 "type": "number",

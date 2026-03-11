@@ -88,6 +88,7 @@ class OptConfig:
     preheater_pinch_F: float
     recuperator_pinch_F: float  # 999 for basic topology
     procurement_strategy: str = "oem_lump_sum"
+    n_trains: int = 2
 
     def config_hash(self) -> str:
         """SHA256[:16] for deduplication."""
@@ -95,7 +96,7 @@ class OptConfig:
             f"{self.working_fluid}|{self.topology}|{self.heat_rejection}|"
             f"{self.vaporizer_pinch_F}|{self.acc_approach_F}|"
             f"{self.preheater_pinch_F}|{self.recuperator_pinch_F}|"
-            f"{self.procurement_strategy}"
+            f"{self.procurement_strategy}|{self.n_trains}"
         )
         return hashlib.sha256(key.encode()).hexdigest()[:16]
 
@@ -114,6 +115,7 @@ class OptConfig:
             "acc_approach_delta_F": self.acc_approach_F,
             "preheater_approach_delta_F": self.preheater_pinch_F,
             "procurement_strategy": self.procurement_strategy,
+            "turbine_trains": self.n_trains,
         }
         # dual_pressure and recuperated both use recuperator pinch
         if self.topology in ("recuperated", "dual_pressure"):
@@ -134,6 +136,9 @@ class OptConfig:
         # Validate procurement strategy
         if self.procurement_strategy not in PROCUREMENT_STRATEGIES:
             return False
+        # Validate train count
+        if self.n_trains not in (1, 2, 3):
+            return False
         return True
 
     def label(self) -> str:
@@ -147,7 +152,9 @@ class OptConfig:
         topo = topo_map.get(self.topology, self.topology)
         hr = hr_map.get(self.heat_rejection, self.heat_rejection)
         strat = strat_map.get(self.procurement_strategy, self.procurement_strategy)
-        return f"{self.working_fluid}/{topo}/{hr}/{strat}/vap{self.vaporizer_pinch_F}/acc{self.acc_approach_F}"
+        trains = f"{self.n_trains}T" if self.n_trains != 2 else ""
+        label = f"{self.working_fluid}/{topo}/{hr}/{strat}/vap{self.vaporizer_pinch_F}/acc{self.acc_approach_F}"
+        return f"{label}/{trains}" if trains else label
 
 
 @dataclass
@@ -172,8 +179,9 @@ class OptResult:
     complexity_per_kW: float = 0.0
     total_adjusted_per_kW: float = 0.0  # capex_per_kW + complexity_per_kW
     procurement_strategy: str = "oem_lump_sum"
-    hp_turbine_mw: float = 0.0       # per-unit HP turbine size (hp_gross / N_TRAINS)
-    lp_turbine_mw: float = 0.0       # per-unit LP turbine size (lp_gross / N_TRAINS)
+    n_trains: int = 2
+    hp_turbine_mw: float = 0.0       # per-unit HP turbine size (hp_gross / n_trains)
+    lp_turbine_mw: float = 0.0       # per-unit LP turbine size (lp_gross / n_trains)
     n_turbine_units: int = 0          # total turbine count (2 for single-P, 4 for dual-P)
     turbine_market_ok: bool = True    # all units <= TURBINE_MARKET_LIMIT_MW
     bom_per_kw: dict = field(default_factory=dict)
@@ -363,12 +371,12 @@ def reevaluate_targets(store: ResultStore):
     Also recomputes complexity_per_kW and total_adjusted_per_kW from config data,
     and turbine sizing fields for backward compat with stored results.
     """
-    N_TRAINS_SIZE = 2
     for r in store.results:
         # Recompute complexity from stored config
         cfg_data = r.config or {}
         topo = cfg_data.get("topology", "basic")
         hr = cfg_data.get("heat_rejection", "direct_acc")
+        n_trains = cfg_data.get("n_trains", r.n_trains if r.n_trains else 2)
         complexity = 0.0
         if topo == "recuperated":
             complexity += COMPLEXITY_PENALTIES["recuperator"]
@@ -380,6 +388,7 @@ def reevaluate_targets(store: ResultStore):
             complexity += COMPLEXITY_PENALTIES["hybrid_wet_dry"]
         r.complexity_per_kW = complexity
         r.total_adjusted_per_kW = r.capex_per_kW + complexity
+        r.n_trains = n_trains
 
         # Recompute turbine sizing if not already set
         if r.n_turbine_units == 0 and r.converged and r.gross_power_MW > 0:
@@ -388,17 +397,17 @@ def reevaluate_targets(store: ResultStore):
                 td = r.thermal_detail or {}
                 hp_kw = td.get("hp_gross_power_kw", r.gross_power_MW * 1000 * 0.6)
                 lp_kw = td.get("lp_gross_power_kw", r.gross_power_MW * 1000 * 0.4)
-                r.hp_turbine_mw = round(hp_kw / 1000 / N_TRAINS_SIZE, 2) if hp_kw else 0
-                r.lp_turbine_mw = round(lp_kw / 1000 / N_TRAINS_SIZE, 2) if lp_kw else 0
-                r.n_turbine_units = 4
+                r.hp_turbine_mw = round(hp_kw / 1000 / n_trains, 2) if hp_kw else 0
+                r.lp_turbine_mw = round(lp_kw / 1000 / n_trains, 2) if lp_kw else 0
+                r.n_turbine_units = 2 * n_trains
                 r.turbine_market_ok = (
                     r.hp_turbine_mw <= TURBINE_MARKET_LIMIT_MW
                     and r.lp_turbine_mw <= TURBINE_MARKET_LIMIT_MW
                 )
             else:
-                r.hp_turbine_mw = round(r.gross_power_MW / N_TRAINS_SIZE, 2)
+                r.hp_turbine_mw = round(r.gross_power_MW / n_trains, 2)
                 r.lp_turbine_mw = 0.0
-                r.n_turbine_units = 2
+                r.n_turbine_units = n_trains
                 r.turbine_market_ok = r.hp_turbine_mw <= TURBINE_MARKET_LIMIT_MW
 
         r.schedule_fit = bool(r.construction_weeks <= TARGET_SCHEDULE_WEEKS)
@@ -416,17 +425,21 @@ def reevaluate_targets(store: ResultStore):
 
 def generate_search_space(store: Optional[ResultStore] = None,
                           strategies: Optional[list[str]] = None,
-                          heat_rejections: Optional[list[str]] = None) -> list[OptConfig]:
+                          heat_rejections: Optional[list[str]] = None,
+                          n_trains_options: Optional[list[int]] = None) -> list[OptConfig]:
     """Generate full search space, filtered by validity and dedup.
 
     Smart ordering: promising fluids and moderate pinch points first.
     Strategies parameter allows limiting which procurement strategies to search.
     heat_rejections parameter allows limiting which heat rejection types to search.
+    n_trains_options parameter allows selecting which train counts to include.
     """
     if strategies is None:
         strategies = list(PROCUREMENT_STRATEGIES)
     if heat_rejections is None:
         heat_rejections = list(HEAT_REJECTIONS)
+    if n_trains_options is None:
+        n_trains_options = [2]
 
     configs = []
 
@@ -441,50 +454,55 @@ def generate_search_space(store: Optional[ResultStore] = None,
     # Topologies that use recuperator pinch sweeps
     _recup_topos = {"recuperated", "dual_pressure"}
 
-    for strat in strategies:
-        for fluid in fluid_order:
-            for topo in ["recuperated", "dual_pressure", "basic"]:
-                for hr in heat_rejections:
-                    for vap in vap_order:
-                        for acc in acc_order:
-                            for pre in pre_order:
-                                if topo in _recup_topos:
-                                    for recup in recup_order:
-                                        cfg = OptConfig(fluid, topo, hr, vap, acc, pre, recup, strat)
+    for n_tr in n_trains_options:
+        for strat in strategies:
+            for fluid in fluid_order:
+                for topo in ["recuperated", "dual_pressure", "basic"]:
+                    for hr in heat_rejections:
+                        for vap in vap_order:
+                            for acc in acc_order:
+                                for pre in pre_order:
+                                    if topo in _recup_topos:
+                                        for recup in recup_order:
+                                            cfg = OptConfig(fluid, topo, hr, vap, acc, pre, recup, strat, n_tr)
+                                            if cfg.is_valid():
+                                                if store is None or not store.has_config(cfg.config_hash()):
+                                                    configs.append(cfg)
+                                    else:
+                                        cfg = OptConfig(fluid, topo, hr, vap, acc, pre, 999.0, strat, n_tr)
                                         if cfg.is_valid():
                                             if store is None or not store.has_config(cfg.config_hash()):
                                                 configs.append(cfg)
-                                else:
-                                    cfg = OptConfig(fluid, topo, hr, vap, acc, pre, 999.0, strat)
-                                    if cfg.is_valid():
-                                        if store is None or not store.has_config(cfg.config_hash()):
-                                            configs.append(cfg)
     return configs
 
 
 def total_search_space_size(strategies: Optional[list[str]] = None,
-                            heat_rejections: Optional[list[str]] = None) -> int:
+                            heat_rejections: Optional[list[str]] = None,
+                            n_trains_options: Optional[list[int]] = None) -> int:
     """Count total valid configurations (without dedup)."""
     if strategies is None:
         strategies = list(PROCUREMENT_STRATEGIES)
     if heat_rejections is None:
         heat_rejections = list(HEAT_REJECTIONS)
+    if n_trains_options is None:
+        n_trains_options = [2]
     count = 0
     _recup_topos = {"recuperated", "dual_pressure"}
-    for strat in strategies:
-        for fluid in WORKING_FLUIDS:
-            for topo in TOPOLOGIES:
-                for hr in heat_rejections:
-                    cfg = OptConfig(fluid, topo, hr, 10, 15, 10, 15, strat)
-                    if not cfg.is_valid():
-                        continue
-                    n_vap = len(VAPORIZER_PINCHES)
-                    n_acc = len(ACC_APPROACHES)
-                    n_pre = len(PREHEATER_PINCHES)
-                    if topo in _recup_topos:
-                        count += n_vap * n_acc * n_pre * len(RECUPERATOR_PINCHES)
-                    else:
-                        count += n_vap * n_acc * n_pre
+    for n_tr in n_trains_options:
+        for strat in strategies:
+            for fluid in WORKING_FLUIDS:
+                for topo in TOPOLOGIES:
+                    for hr in heat_rejections:
+                        cfg = OptConfig(fluid, topo, hr, 10, 15, 10, 15, strat, n_tr)
+                        if not cfg.is_valid():
+                            continue
+                        n_vap = len(VAPORIZER_PINCHES)
+                        n_acc = len(ACC_APPROACHES)
+                        n_pre = len(PREHEATER_PINCHES)
+                        if topo in _recup_topos:
+                            count += n_vap * n_acc * n_pre * len(RECUPERATOR_PINCHES)
+                        else:
+                            count += n_vap * n_acc * n_pre
     return count
 
 
@@ -554,18 +572,18 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
         warnings.append("hybrid_wet_dry: ACC bays reduced 17%, +$50/kW water system")
 
     # ── Turbine sizing (all topologies) ──────────────────────────
-    N_TRAINS_SIZE = 2
+    n_trains = cfg.n_trains
     if cfg.topology == "dual_pressure" and converged:
         hp_gross_kw = output.get("_detail", {}).get("hp_gross_power_kw", 0)
         lp_gross_kw = output.get("_detail", {}).get("lp_gross_power_kw", 0)
-        hp_turb = hp_gross_kw / 1000 / N_TRAINS_SIZE if hp_gross_kw > 0 else 0
-        lp_turb = lp_gross_kw / 1000 / N_TRAINS_SIZE if lp_gross_kw > 0 else 0
-        n_units = 4  # 2 HP + 2 LP
+        hp_turb = hp_gross_kw / 1000 / n_trains if hp_gross_kw > 0 else 0
+        lp_turb = lp_gross_kw / 1000 / n_trains if lp_gross_kw > 0 else 0
+        n_units = 2 * n_trains  # HP + LP per train
         market_ok = hp_turb <= TURBINE_MARKET_LIMIT_MW and lp_turb <= TURBINE_MARKET_LIMIT_MW
     elif converged:
-        hp_turb = gross_mw / N_TRAINS_SIZE if gross_mw > 0 else 0
+        hp_turb = gross_mw / n_trains if gross_mw > 0 else 0
         lp_turb = 0.0
-        n_units = 2
+        n_units = n_trains
         market_ok = hp_turb <= TURBINE_MARKET_LIMIT_MW
     else:
         hp_turb = 0.0
@@ -649,6 +667,7 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
         npv_USD=round(npv, 0),
         lcoe_per_MWh=round(lcoe, 1),
         procurement_strategy=cfg.procurement_strategy,
+        n_trains=cfg.n_trains,
         hp_turbine_mw=round(hp_turb, 2),
         lp_turbine_mw=round(lp_turb, 2),
         n_turbine_units=n_units,
@@ -779,19 +798,24 @@ AI_GUIDED_BATCH_SIZE = 10
 
 def generate_seed_batch(store: ResultStore,
                         strategies: Optional[list[str]] = None,
-                        heat_rejections: Optional[list[str]] = None) -> list[OptConfig]:
+                        heat_rejections: Optional[list[str]] = None,
+                        n_trains_options: Optional[list[int]] = None) -> list[OptConfig]:
     """Return 10 diverse seed configs covering the design space.
 
     Covers strategies x key fluids with moderate pinches.
     Prioritizes isopentane/recuperated across all strategies to show cost impact.
     Deduplicates against already-run configs in store.
+    Seeds default to 2 trains (conventional baseline).
     """
     if strategies is None:
         strategies = list(PROCUREMENT_STRATEGIES)
     if heat_rejections is None:
         heat_rejections = list(HEAT_REJECTIONS)
+    if n_trains_options is None:
+        n_trains_options = [2]
 
     default_hr = heat_rejections[0]
+    default_trains = n_trains_options[0]
     seeds = []
 
     # Priority seeds: isopentane/recuperated across all strategies (show procurement impact)
@@ -805,6 +829,7 @@ def generate_seed_batch(store: ResultStore,
             preheater_pinch_F=10,
             recuperator_pinch_F=15,
             procurement_strategy=strat,
+            n_trains=default_trains,
         )
         if cfg.is_valid() and not store.has_config(cfg.config_hash()):
             seeds.append(cfg)
@@ -817,7 +842,7 @@ def generate_seed_batch(store: ResultStore,
             continue  # already covered above
         recup = 15.0
         cfg = OptConfig(fluid, "recuperated", default_hr, 10, 15, 10, recup,
-                        "direct_self_perform")
+                        "direct_self_perform", default_trains)
         if cfg.is_valid() and not store.has_config(cfg.config_hash()):
             seeds.append(cfg)
 
@@ -833,7 +858,7 @@ def generate_seed_batch(store: ResultStore,
         for fluid, topo, vap, acc, pre, recup, strat in alternates:
             if len(seeds) >= AI_GUIDED_BATCH_SIZE:
                 break
-            cfg = OptConfig(fluid, topo, default_hr, vap, acc, pre, recup, strat)
+            cfg = OptConfig(fluid, topo, default_hr, vap, acc, pre, recup, strat, default_trains)
             if cfg.is_valid() and not store.has_config(cfg.config_hash()):
                 seeds.append(cfg)
 
@@ -919,11 +944,20 @@ SEARCH SPACE:
 - Topologies: basic, recuperated, dual_pressure
 - Heat rejection: {', '.join(heat_rejections or HEAT_REJECTIONS)}
 - Procurement strategies: {', '.join(PROCUREMENT_STRATEGIES)}
+- n_trains: 1, 2, or 3 (parallel turbine/ACC trains; 2 is conventional; 1 = larger per-unit turbine, 3 = smaller units)
 - Vaporizer pinch: 5-20 °F (integers)
 - ACC approach: 10-30 °F (integers)
 - Preheater pinch: 5-15 °F (integers)
 - Recuperator pinch: 10-25 °F (integers, only for recuperated/dual_pressure; use 999 for basic)
 - INVALID: propane fluid + propane_intermediate heat rejection
+
+TRAIN COUNT ENGINEERING:
+- 1 train: single large turbine — simpler piping, fewer connections, but turbine must be < {TURBINE_MARKET_LIMIT_MW} MW.
+  Good for smaller plants or when per-unit cost savings outweigh redundancy.
+- 2 trains (default): conventional split — moderate per-unit size, some redundancy.
+- 3 trains: smaller turbines — better for high-output plants where single units exceed market limits.
+  More piping and steel, but enables proven turbine sizes.
+- For dual_pressure: turbine count = 2 × n_trains (HP + LP per train).
 
 PROCUREMENT STRATEGIES (first-class optimizer variable):
 - oem_lump_sum: OEM package + EPC contractor. Baseline ~$2,500/kW. Reflects OEM integration margin + contractor markup.
@@ -947,6 +981,7 @@ ENGINEERING REASONING — How pinch points control output:
 - Wider preheater pinch -> less liquid preheating -> less power
 - Wider recuperator pinch -> less internal heat recovery -> less power (recuperated/dual only)
 - Each pinch shift of ~2°F typically moves net power by 1-3 MW depending on the fluid
+- n_trains does NOT change net power (same total flow), but affects ductwork cost, structural steel, and turbine sizing
 Use this to interpolate: if a config at vap=12 produced 58 MW, try vap=14 to nudge it down ~2 MW.
 
 EXPLORATION STRATEGY:
@@ -984,6 +1019,7 @@ Return ONLY a JSON object with this structure:
       "topology": "recuperated",
       "heat_rejection": "direct_acc",
       "procurement_strategy": "direct_self_perform",
+      "n_trains": 2,
       "vaporizer_pinch_F": 8,
       "acc_approach_F": 15,
       "preheater_pinch_F": 5,
@@ -1138,8 +1174,9 @@ def build_ai_context(store: ResultStore, round_number: int) -> str:
                 mw_label = "IN-BAND" if TARGET_MIN_NET_MW <= r.net_power_MW <= TARGET_MAX_NET_MW else (
                     f"{r.net_power_MW - TARGET_MAX_NET_MW:+.1f} over" if r.net_power_MW > TARGET_MAX_NET_MW
                     else f"{r.net_power_MW - TARGET_MIN_NET_MW:+.1f} under")
+                trains_label = f" {r.n_trains}T" if r.n_trains != 2 else ""
                 lines.append(
-                    f"- {rc.get('working_fluid')}/{rc.get('topology')}/{rc.get('heat_rejection')}/{strat_short} "
+                    f"- {rc.get('working_fluid')}/{rc.get('topology')}/{rc.get('heat_rejection')}/{strat_short}{trains_label} "
                     f"vap={rc.get('vaporizer_pinch_F')} acc={rc.get('acc_approach_F')} "
                     f"pre={rc.get('preheater_pinch_F')} recup={rc.get('recuperator_pinch_F')} -> "
                     f"${r.capex_per_kW:,.0f}/kW, {r.cycle_efficiency*100:.1f}% eff, "
@@ -1267,6 +1304,7 @@ def parse_ai_configs(ai_response: dict, store: ResultStore) -> list[OptConfig]:
             topo = raw.get("topology", "")
             hr = raw.get("heat_rejection", "direct_acc")
             strat = raw.get("procurement_strategy", "direct_self_perform")
+            n_tr = int(raw.get("n_trains", 2))
             vap = float(raw.get("vaporizer_pinch_F", 10))
             acc = float(raw.get("acc_approach_F", 15))
             pre = float(raw.get("preheater_pinch_F", 10))
@@ -1286,6 +1324,8 @@ def parse_ai_configs(ai_response: dict, store: ResultStore) -> list[OptConfig]:
             if strat not in PROCUREMENT_STRATEGIES:
                 logger.warning(f"AI proposed invalid strategy: {strat}, defaulting to direct_self_perform")
                 strat = "direct_self_perform"
+            if n_tr not in (1, 2, 3):
+                n_tr = 2
             if not (5 <= vap <= 20):
                 vap = max(5, min(20, vap))
             if not (10 <= acc <= 30):
@@ -1295,7 +1335,7 @@ def parse_ai_configs(ai_response: dict, store: ResultStore) -> list[OptConfig]:
             if topo in _recup_topos and not (10 <= recup <= 25):
                 recup = max(10, min(25, recup))
 
-            cfg = OptConfig(fluid, topo, hr, vap, acc, pre, recup, strat)
+            cfg = OptConfig(fluid, topo, hr, vap, acc, pre, recup, strat, n_tr)
             if not cfg.is_valid():
                 logger.warning(f"AI proposed invalid combo: {fluid}/{topo}/{hr}")
                 continue

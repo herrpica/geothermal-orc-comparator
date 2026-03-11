@@ -195,14 +195,15 @@ N_TRAINS = 2  # parallel turbine/ACC trains sharing common vaporizer + preheater
 
 def calculate_duct_segments_a(states, perf, inp, fp, fluid="isopentane"):
     """
-    Config A duct segments (per-train sizing, N_TRAINS parallel trains):
+    Config A duct segments (per-train sizing, n_trains parallel trains):
       Seg 1: Tailpipe (turbine exit to recuperator) - state 2 conditions
       Seg 2: Recuperator exit header to ACC - state 3 conditions
       Seg 3: ACC distribution headers - state 3 conditions
 
     Diameters are per-train; total vol flow is plant-level.
     """
-    m_dot_lbs = perf["m_dot_iso"] / 3600 / N_TRAINS  # per-train lb/s
+    n_trains = inp.get("n_trains", N_TRAINS)
+    m_dot_lbs = perf["m_dot_iso"] / 3600 / n_trains  # per-train lb/s
     T_cond = perf["T_cond"]
     f_darcy = inp.get("f_darcy", 0.02)
 
@@ -233,18 +234,18 @@ def calculate_duct_segments_a(states, perf, inp, fp, fluid="isopentane"):
 
     return {
         "segments": segments,
-        "n_trains": N_TRAINS,
+        "n_trains": n_trains,
         "total_delta_P_psi": total_dp,
         "total_delta_T_cond_F": total_dt,
         "tailpipe_diameter_in": seg1["diameter_in"],       # per-train
         "acc_header_diameter_in": seg3["diameter_in"],     # per-train
-        "total_vol_flow_ft3s": seg1["vol_flow_ft3s"] * N_TRAINS,  # plant total
+        "total_vol_flow_ft3s": seg1["vol_flow_ft3s"] * n_trains,  # plant total
     }
 
 
 def calculate_duct_segments_b(states, prop_states, perf, inp, fp, fluid="isopentane"):
     """
-    Config B duct segments (per-train sizing, N_TRAINS parallel trains):
+    Config B duct segments (per-train sizing, n_trains parallel trains):
       Seg 1: ISO tailpipe (turbine exit to recuperator) - state 2
       Seg 2: ISO recup exit to intermediate HX - state 3
       Seg 3: Propane vapor header (IHX to ACC) - propane sat vapor
@@ -252,8 +253,9 @@ def calculate_duct_segments_b(states, prop_states, perf, inp, fp, fluid="isopent
 
     Diameters are per-train; total vol flow is plant-level.
     """
-    m_dot_iso_lbs = perf["m_dot_iso"] / 3600 / N_TRAINS  # per-train
-    m_dot_prop_lbs = perf["m_dot_prop"] / 3600 / N_TRAINS  # per-train
+    n_trains = inp.get("n_trains", N_TRAINS)
+    m_dot_iso_lbs = perf["m_dot_iso"] / 3600 / n_trains  # per-train
+    m_dot_prop_lbs = perf["m_dot_prop"] / 3600 / n_trains  # per-train
     T_cond_iso = perf["T_cond_iso"]
     T_propane_evap = perf["T_propane_evap"]
     T_propane_cond = perf["T_propane_cond"]
@@ -296,7 +298,7 @@ def calculate_duct_segments_b(states, prop_states, perf, inp, fp, fluid="isopent
 
     return {
         "segments": segments,
-        "n_trains": N_TRAINS,
+        "n_trains": n_trains,
         "total_delta_P_psi": total_dp,
         "total_delta_T_cond_F": total_dt,
         "iso_delta_T_cond_F": iso_dt,
@@ -304,8 +306,8 @@ def calculate_duct_segments_b(states, prop_states, perf, inp, fp, fluid="isopent
         "tailpipe_diameter_in": seg1["diameter_in"],           # per-train
         "acc_header_diameter_in": seg4["diameter_in"],         # per-train
         "propane_header_diameter_in": seg3["diameter_in"],     # per-train
-        "total_vol_flow_ft3s": seg1["vol_flow_ft3s"] * N_TRAINS,    # plant total
-        "propane_vol_flow_ft3s": seg3["vol_flow_ft3s"] * N_TRAINS,  # plant total
+        "total_vol_flow_ft3s": seg1["vol_flow_ft3s"] * n_trains,    # plant total
+        "propane_vol_flow_ft3s": seg3["vol_flow_ft3s"] * n_trains,  # plant total
     }
 
 

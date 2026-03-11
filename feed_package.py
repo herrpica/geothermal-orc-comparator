@@ -89,7 +89,7 @@ SEPARATION_RULES = [
     ("Brine Wellhead", "Process Area", 50, "H2S / NCG dispersion"),
 ]
 
-N_TRAINS = 2
+N_TRAINS_DEFAULT = 2  # fallback if detail lacks n_trains
 
 # I/O counts per MW (gross)
 IO_PER_MW = {"AI": 30, "AO": 8, "DI": 25, "DO": 17}
@@ -347,19 +347,20 @@ def _render_equipment_tab(detail: dict, result):
     rows = []
 
     # ── Turbine-Generator ───────────────────────────────────────
+    n_trains = detail.get("n_trains", N_TRAINS_DEFAULT)
     ref = EQUIP_REF["turbine_generator"]
     tg_cost = costs.get("turbine_generator", 0)
     tg_per_kw = tg_cost / P_net if P_net > 0 else 0
     tg_weight_lb = ref["lb_per_kw"] * P_gross
     tg_footprint = ref["ft2_per_mw"] * (P_gross / 1000)
-    tg_dim = f"{math.sqrt(tg_footprint / N_TRAINS):.0f} x {math.sqrt(tg_footprint / N_TRAINS):.0f}"
+    tg_dim = f"{math.sqrt(tg_footprint / n_trains):.0f} x {math.sqrt(tg_footprint / n_trains):.0f}"
     rows.append({
         "Tag": "TG-0101A/B", "Service": "Turbine-Generator Set",
-        "Qty": N_TRAINS,
-        "Key Parameters": f"{P_gross / N_TRAINS / 1000:.1f} MW each, "
+        "Qty": n_trains,
+        "Key Parameters": f"{P_gross / n_trains / 1000:.1f} MW each, "
                           f"eta={detail.get('eta_turbine', 0.82):.0%}",
         "Dimensions (ft)": tg_dim,
-        "Weight (tons)": f"{tg_weight_lb / 2000 / N_TRAINS:.0f} ea",
+        "Weight (tons)": f"{tg_weight_lb / 2000 / n_trains:.0f} ea",
         "Vendor(s)": ", ".join(ref["vendors"][:2]),
         "Budget ($/kW)": f"${tg_per_kw:,.0f}",
         "Lead (wk)": ref["lead_wk"],
@@ -429,7 +430,7 @@ def _render_equipment_tab(detail: dict, result):
     iso_pump_wt = iso_hp * ref["lb_per_hp"]
     rows.append({
         "Tag": "PP-0101A/B", "Service": "Isopentane Feed Pump",
-        "Qty": f"{N_TRAINS} + 1 spare",
+        "Qty": f"{n_trains} + 1 spare",
         "Key Parameters": f"{iso_gpm:,.0f} GPM, {detail.get('pump_iso_dP_psi', 0):.0f} psi dP, "
                           f"{iso_hp:.0f} HP",
         "Dimensions (ft)": f"Skid 6 x 4",
@@ -448,7 +449,7 @@ def _render_equipment_tab(detail: dict, result):
         prop_per_kw = prop_pump_cost / P_net if P_net > 0 else 0
         rows.append({
             "Tag": "PP-0102A/B", "Service": "Propane Circulation Pump",
-            "Qty": f"{N_TRAINS} + 1 spare",
+            "Qty": f"{n_trains} + 1 spare",
             "Key Parameters": f"{prop_gpm:,.0f} GPM, {detail.get('pump_prop_dP_psi', 0):.0f} psi dP, "
                               f"{prop_hp:.0f} HP",
             "Dimensions (ft)": "Skid 6 x 4",
@@ -844,12 +845,14 @@ def _render_plot_plan_tab(detail: dict, result):
     footprints = []
     total_ft2 = 0
 
+    n_trains = detail.get("n_trains", N_TRAINS_DEFAULT)
+
     # Turbine building
     tg_ft2 = EQUIP_REF["turbine_generator"]["ft2_per_mw"] * (P_gross / 1000)
     tg_side = math.sqrt(tg_ft2) if tg_ft2 > 0 else 0
     footprints.append({
         "Equipment": "Turbine-Generator Building",
-        "Count": N_TRAINS, "Each (ft x ft)": f"{tg_side:.0f} x {tg_side:.0f}",
+        "Count": n_trains, "Each (ft x ft)": f"{tg_side:.0f} x {tg_side:.0f}",
         "Total (ft2)": f"{tg_ft2:,.0f}", "Source": "Calculated",
     })
     total_ft2 += tg_ft2

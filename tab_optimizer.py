@@ -389,6 +389,19 @@ def _render_controls(design_basis: dict, store: ResultStore):
     )
     selected_hr = [hr_options[lbl] for lbl in selected_hr_labels] or list(HEAT_REJECTIONS)
 
+    # ── Train count selector ─────────────────────────────────────
+    TRAIN_LABELS = {1: "1 train", 2: "2 trains", 3: "3 trains"}
+    train_options = list(TRAIN_LABELS.keys())
+    selected_trains = st.multiselect(
+        "Turbine train configurations",
+        options=train_options,
+        default=[2],
+        format_func=lambda x: TRAIN_LABELS[x],
+        key="opt_trains_selector",
+        disabled=st.session_state["opt_running"],
+    )
+    selected_n_trains = sorted(selected_trains) or [2]
+
     # ── Action buttons ─────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
 
@@ -403,7 +416,7 @@ def _render_controls(design_basis: dict, store: ResultStore):
             use_container_width=True,
         ):
             if st.session_state["opt_mode"] == "ai_guided":
-                queue = generate_seed_batch(store, strategies=selected_strategies, heat_rejections=selected_hr)
+                queue = generate_seed_batch(store, strategies=selected_strategies, heat_rejections=selected_hr, n_trains_options=selected_n_trains)
                 st.session_state["opt_queue"] = queue
                 st.session_state["opt_total_configs"] = len(queue) + stats["total_runs"]
                 st.session_state["opt_ai_round"] = 1
@@ -412,7 +425,7 @@ def _render_controls(design_basis: dict, store: ResultStore):
                 st.session_state["opt_ai_insights"] = []
                 st.session_state["opt_ai_converged"] = False
             else:
-                queue = generate_search_space(store, strategies=selected_strategies, heat_rejections=selected_hr)
+                queue = generate_search_space(store, strategies=selected_strategies, heat_rejections=selected_hr, n_trains_options=selected_n_trains)
                 st.session_state["opt_queue"] = queue
                 st.session_state["opt_total_configs"] = len(queue) + stats["total_runs"]
             st.session_state["opt_running"] = True
@@ -663,9 +676,10 @@ def _render_controls(design_basis: dict, store: ResultStore):
 
     # ── Search space info ─────────────────────────────────────────
     with st.expander("Search Space Details"):
-        total_valid = total_search_space_size(strategies=selected_strategies, heat_rejections=selected_hr)
+        total_valid = total_search_space_size(strategies=selected_strategies, heat_rejections=selected_hr, n_trains_options=selected_n_trains)
         tested = stats["total_runs"]
-        st.write(f"Total valid configurations: **{total_valid:,}** ({len(selected_strategies)} strategies)")
+        trains_desc = "/".join(str(t) for t in selected_n_trains)
+        st.write(f"Total valid configurations: **{total_valid:,}** ({len(selected_strategies)} strategies, {trains_desc}-train)")
         st.write(f"Already tested: **{tested:,}**")
         st.write(f"Remaining: **{total_valid - tested:,}**")
 
@@ -1028,10 +1042,11 @@ def _render_pareto(store: ResultStore):
         for r in sorted(pareto, key=lambda x: x.total_adjusted_per_kW):
             cfg = r.config
             # Turbine layout string
-            if r.n_turbine_units == 4:
-                turb_str = f"2x{r.hp_turbine_mw:.1f}+2x{r.lp_turbine_mw:.1f}"
+            n_tr = r.n_trains if r.n_trains else 2
+            if r.lp_turbine_mw > 0 and r.n_turbine_units > 0:
+                turb_str = f"{n_tr}x{r.hp_turbine_mw:.1f}+{n_tr}x{r.lp_turbine_mw:.1f}"
             elif r.n_turbine_units > 0:
-                turb_str = f"2x{r.hp_turbine_mw:.1f}"
+                turb_str = f"{n_tr}x{r.hp_turbine_mw:.1f}"
             else:
                 turb_str = "-"
             mkt_str = "OK" if r.turbine_market_ok else "OVER"
@@ -1041,6 +1056,7 @@ def _render_pareto(store: ResultStore):
                 "Topology": cfg.get("topology", "?"),
                 "HR": {"direct_acc": "ACC", "propane_intermediate": "IHX", "hybrid_wet_dry": "HYB"}.get(cfg.get("heat_rejection", ""), "?"),
                 "Strategy": STRATEGY_SHORT_LABELS.get(r.procurement_strategy, r.procurement_strategy),
+                "Trains": n_tr,
                 "Eff (%)": f"{r.cycle_efficiency*100:.1f}",
                 "Equip $/kW": f"${r.equipment_per_kW:,.0f}",
                 "Inst $/kW": f"${r.capex_per_kW:,.0f}",
@@ -1106,10 +1122,11 @@ def _render_history(store: ResultStore):
             continue
 
         # Turbine layout
-        if r.converged and r.n_turbine_units == 4:
-            turb_hist = f"2x{r.hp_turbine_mw:.1f}+2x{r.lp_turbine_mw:.1f}"
+        n_tr = r.n_trains if r.n_trains else 2
+        if r.converged and r.lp_turbine_mw > 0 and r.n_turbine_units > 0:
+            turb_hist = f"{n_tr}x{r.hp_turbine_mw:.1f}+{n_tr}x{r.lp_turbine_mw:.1f}"
         elif r.converged and r.n_turbine_units > 0:
-            turb_hist = f"2x{r.hp_turbine_mw:.1f}"
+            turb_hist = f"{n_tr}x{r.hp_turbine_mw:.1f}"
         else:
             turb_hist = "-"
         rows.append({
@@ -1118,6 +1135,7 @@ def _render_history(store: ResultStore):
             "Topology": cfg.get("topology", "?"),
             "HR": {"direct_acc": "ACC", "propane_intermediate": "IHX", "hybrid_wet_dry": "HYB"}.get(cfg.get("heat_rejection", ""), "?"),
             "Strategy": STRATEGY_SHORT_LABELS.get(r.procurement_strategy, r.procurement_strategy),
+            "Trains": n_tr,
             "Vap": cfg.get("vaporizer_pinch_F", "?"),
             "ACC": cfg.get("acc_approach_F", "?"),
             "Pre": cfg.get("preheater_pinch_F", "?"),
@@ -1223,16 +1241,17 @@ def _render_top_configs_report(store: ResultStore, stats: dict):
             c12.metric("Target Fit", fit_str)
 
             # Turbine layout line
-            if r.n_turbine_units == 4:
-                mkt_icon = " OK" if r.turbine_market_ok else " OVER 20MW"
+            n_tr = r.n_trains if r.n_trains else 2
+            if r.lp_turbine_mw > 0 and r.n_turbine_units > 0:
+                mkt_icon = " OK" if r.turbine_market_ok else f" OVER {TURBINE_MARKET_LIMIT_MW:.0f}MW"
                 turb_line = (
-                    f"2x HP @ {r.hp_turbine_mw:.1f} MW + "
-                    f"2x LP @ {r.lp_turbine_mw:.1f} MW "
-                    f"({r.n_turbine_units} units){mkt_icon}"
+                    f"{n_tr}x HP @ {r.hp_turbine_mw:.1f} MW + "
+                    f"{n_tr}x LP @ {r.lp_turbine_mw:.1f} MW "
+                    f"({r.n_turbine_units} units, {n_tr} trains){mkt_icon}"
                 )
             elif r.n_turbine_units > 0:
-                mkt_icon = " OK" if r.turbine_market_ok else " OVER 20MW"
-                turb_line = f"2x @ {r.hp_turbine_mw:.1f} MW ({r.n_turbine_units} units){mkt_icon}"
+                mkt_icon = " OK" if r.turbine_market_ok else f" OVER {TURBINE_MARKET_LIMIT_MW:.0f}MW"
+                turb_line = f"{n_tr}x @ {r.hp_turbine_mw:.1f} MW ({r.n_turbine_units} units, {n_tr} trains){mkt_icon}"
             else:
                 turb_line = "-"
             st.markdown(f"**Turbine Layout:** {turb_line}")
@@ -1265,6 +1284,7 @@ def _render_top_configs_report(store: ResultStore, stats: dict):
             "Topology": topo_map.get(cfg.get("topology", ""), "?"),
             "HR": hr_map.get(cfg.get("heat_rejection", ""), "?"),
             "Strategy": STRATEGY_SHORT_LABELS.get(r.procurement_strategy, "?"),
+            "Trains": r.n_trains if r.n_trains else 2,
             "Adj $/kW": round(r.total_adjusted_per_kW),
             "Inst $/kW": round(r.capex_per_kW),
             "Equip $/kW": round(r.equipment_per_kW),
