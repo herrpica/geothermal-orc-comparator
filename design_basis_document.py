@@ -371,6 +371,92 @@ def load_dbd() -> dict:
     return DEFAULT_DBD.copy()
 
 
+def _navigate_path(obj: dict, dotted_path: str):
+    """Navigate a dotted path like 'entries' or 'heat_exchangers.U_values_Btu_hr_ft2_F'
+    into a nested dict/list structure.
+
+    Returns (parent, final_key) so the caller can read or write the target.
+    For a simple key like 'entries', returns (obj, 'entries').
+    For a path like 'a.b.c', returns (obj['a']['b'], 'c').
+    """
+    parts = dotted_path.split(".")
+    current = obj
+    for part in parts[:-1]:
+        if isinstance(current, dict):
+            current = current.get(part, {})
+        else:
+            return None, None
+    return current, parts[-1]
+
+
+def apply_dbd_updates(proposals: list[dict]) -> tuple[dict, str]:
+    """Apply accepted/modified proposals to the Design Basis Document.
+
+    Only processes items where decision is 'accepted' or 'modified'.
+
+    Actions:
+      APPEND  — append new_value to a list at section→target_path
+      UPDATE  — replace the value at section→target_path
+      NEW     — same as APPEND for list fields
+      CLOSE   — set status='closed' + closed_date on matching info request
+
+    Returns (updated_dbd, new_version).
+    """
+    dbd = load_dbd()
+
+    for item in proposals:
+        decision = item.get("decision", "pending")
+        if decision not in ("accepted", "modified"):
+            continue
+
+        section_key = item.get("section", "")
+        action = item.get("action", "").upper()
+        target_path = item.get("target_path", "")
+        new_value = item.get("new_value")
+
+        if section_key not in dbd:
+            continue
+
+        section = dbd[section_key]
+
+        if action in ("APPEND", "NEW"):
+            parent, key = _navigate_path(section, target_path)
+            if parent is None or key is None:
+                continue
+            target = parent.get(key) if isinstance(parent, dict) else None
+            if isinstance(target, list):
+                target.append(new_value)
+            elif isinstance(parent, dict):
+                # If target doesn't exist yet, create it as a list
+                parent[key] = [new_value]
+
+        elif action == "UPDATE":
+            parent, key = _navigate_path(section, target_path)
+            if parent is None or key is None:
+                continue
+            if isinstance(parent, dict):
+                parent[key] = new_value
+
+        elif action == "CLOSE":
+            # For info_requests: find the matching request and close it
+            parent, key = _navigate_path(section, target_path)
+            if parent is None or key is None:
+                continue
+            target = parent.get(key) if isinstance(parent, dict) else None
+            if isinstance(target, list):
+                # Match by data_needed field if provided in new_value
+                match_field = (new_value or {}).get("data_needed", "") if isinstance(new_value, dict) else ""
+                for entry in target:
+                    if isinstance(entry, dict) and entry.get("data_needed", "") == match_field:
+                        entry["status"] = "closed"
+                        entry["closed_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                        break
+
+    dbd["last_updated_by"] = "optimizer"
+    save_dbd(dbd)
+    return dbd, dbd.get("version", "?")
+
+
 def save_dbd(dbd: dict) -> None:
     """Write DBD to JSON, auto-incrementing version and timestamping."""
     # Auto-increment version

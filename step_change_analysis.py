@@ -124,6 +124,89 @@ METHODOLOGY_ITEMS: list[StepChangeItem] = [
         status="proven",
         category="methodology",
     ),
+    # ── Gathering system reductions ────────────────────────────────
+    StepChangeItem(
+        name="Wellfield gathering simplification",
+        description="Reduce gathering system scope: shorter brine piping runs via "
+                    "optimized well pad layout, shared headers, pre-insulated pipe. "
+                    "Baseline $860/kW includes conservative routing and full redundancy.",
+        delta_per_kW=-200,
+        delta_schedule_weeks=-4,
+        probability_pct=70,
+        proving_cost_USD=150_000,
+        basis="Compare centralized vs distributed wellfield layout; "
+              "analogous savings at Coso and Salton Sea re-piping projects",
+        status="probable",
+        category="methodology",
+    ),
+    StepChangeItem(
+        name="Eliminate injection pumps (gravity reinjection)",
+        description="If reservoir pressure allows, gravity-feed reinjection "
+                    "eliminates injection pump CAPEX and 500+ kW parasitic load. "
+                    "Requires favorable well completion depths.",
+        delta_per_kW=-120,
+        delta_schedule_weeks=-2,
+        probability_pct=45,
+        proving_cost_USD=300_000,
+        basis="Reservoir modeling required; precedent at high-enthalpy fields "
+              "with shallow injection targets",
+        status="speculative",
+        category="methodology",
+        risk_description="If reservoir pressure is too high, must add booster pumps "
+                         "and variable-speed drives — net cost increase",
+        risk_delta_per_kW=50,
+    ),
+    StepChangeItem(
+        name="Frame contract — gathering piping (8 units)",
+        description="Volume procurement of pre-fabricated brine piping spools "
+                    "for 8-unit program. Standardized diameters and fittings.",
+        delta_per_kW=-80,
+        delta_schedule_weeks=-2,
+        probability_pct=75,
+        proving_cost_USD=50_000,
+        basis="Bulk pipe procurement analogous to pipeline frame agreements",
+        status="probable",
+        category="methodology",
+    ),
+    # ── T&D reductions ─────────────────────────────────────────────
+    StepChangeItem(
+        name="Shared interconnection infrastructure",
+        description="Co-locate multiple units on single substation and transmission "
+                    "corridor. Split T&D fixed costs (transformers, protection relays, "
+                    "highline construction) across units.",
+        delta_per_kW=-100,
+        delta_schedule_weeks=0,
+        probability_pct=80,
+        proving_cost_USD=75_000,
+        basis="Multi-unit geothermal T&D sharing at Geysers, Olkaria",
+        status="proven",
+        category="methodology",
+    ),
+    StepChangeItem(
+        name="Shorter interconnection route",
+        description="Site selection optimized for proximity to existing transmission. "
+                    "Each mile of 69kV line costs ~$500K. Reduce from 5-mile baseline "
+                    "to 2 miles or less.",
+        delta_per_kW=-60,
+        delta_schedule_weeks=-4,
+        probability_pct=60,
+        proving_cost_USD=25_000,
+        basis="Transmission cost estimating per WECC; site-specific",
+        status="probable",
+        category="methodology",
+    ),
+    StepChangeItem(
+        name="Volume transformer procurement",
+        description="Negotiate GSU transformer supply for 8-unit program. "
+                    "Standardized 13.8kV/69kV design, factory-tested.",
+        delta_per_kW=-30,
+        delta_schedule_weeks=0,
+        probability_pct=85,
+        proving_cost_USD=15_000,
+        basis="Transformer OEM indicative pricing for program buy",
+        status="proven",
+        category="methodology",
+    ),
 ]
 
 

@@ -15,10 +15,11 @@ import uuid
 from typing import Any
 
 from fluid_properties import FluidProperties
-from thermodynamics import solve_config_a, solve_config_b, validate_inputs
+from thermodynamics import solve_config_a, solve_config_b, solve_dual_pressure, validate_inputs
 from cost_model import (
     calculate_costs_a,
     calculate_costs_b,
+    calculate_costs_dual_pressure,
     calculate_fan_power,
     compute_power_balance,
     lifecycle_cost,
@@ -132,7 +133,7 @@ def tool_input_to_inputs(tool_input: dict, config: str) -> dict:
 
     # ACC approach — maps to config-specific key
     if "acc_approach_delta_F" in tool_input:
-        if config == "A":
+        if config in ("A", "D"):
             inp["dt_pinch_acc_a"] = tool_input["acc_approach_delta_F"]
         else:
             inp["dt_pinch_acc_b"] = tool_input["acc_approach_delta_F"]
@@ -162,7 +163,9 @@ def tool_input_to_inputs(tool_input: dict, config: str) -> dict:
     }
 
     iso_frac = tool_input.get("isopentane_pressure_drop_fraction", 1.0)
-    for key, default in iso_dp_defaults.get(config, {}).items():
+    # Config D uses same defaults as Config A
+    config_for_dp = "A" if config == "D" else config
+    for key, default in iso_dp_defaults.get(config_for_dp, {}).items():
         inp[key] = default * iso_frac
 
     if config == "B":
@@ -224,6 +227,8 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
     try:
         if config == "A":
             result = solve_config_a(inputs, fp)
+        elif config == "D":
+            result = solve_dual_pressure(inputs, fp)
         else:
             result = solve_config_b(inputs, fp)
     except Exception as e:
@@ -253,11 +258,38 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
 
     power_bal = compute_power_balance(perf, fan_result, inputs, config=config)
 
+    # ── Pump sizing (for FEED package / equipment list) ──────────────────
+    eta_pump = inputs.get("eta_pump", 0.82)
+    if config == "B":
+        # Config B has separate iso and propane pressure keys
+        iso_pump = pump_sizing(
+            perf["m_dot_iso"], states["4"].rho,
+            perf.get("P_high_iso", perf["P_high"]),
+            perf.get("P_low_iso", perf["P_low"]),
+            perf.get("w_pump_iso", perf["w_pump"]),
+            eta_pump,
+        )
+        propane_states = result["propane_states"]
+        prop_pump = pump_sizing(
+            perf["m_dot_prop"], propane_states["B"].rho,
+            perf["P_prop_evap"], perf["P_prop_cond"],
+            perf["w_pump_prop"], eta_pump,
+        )
+    else:
+        # Config A and D share the same iso pump pattern
+        iso_pump = pump_sizing(
+            perf["m_dot_iso"], states["4"].rho,
+            perf["P_high"], perf["P_low"],
+            perf["w_pump"], eta_pump,
+        )
+        prop_pump = {"flow_gpm": 0, "dP_psi": 0, "power_kw": 0, "power_hp": 0}
+
     # ── Calculate costs ─────────────────────────────────────────────────
     if config == "A":
         costs = calculate_costs_a(states, perf, inputs, duct_result=duct)
+    elif config == "D":
+        costs = calculate_costs_dual_pressure(result, inputs)
     else:
-        propane_states = result["propane_states"]
         costs = calculate_costs_b(states, propane_states, perf, inputs, duct_result=duct)
 
     net_power_kw = power_bal["P_net"]
@@ -271,6 +303,8 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
     sched = construction_schedule(duct)
     if config == "A":
         critical_weeks = sched["config_a"]["total_weeks"]
+    elif config == "D":
+        critical_weeks = sched["config_d"]["total_weeks"]
     else:
         critical_weeks = sched["config_b"]["total_weeks"]
 
@@ -279,7 +313,7 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
 
     # ── ACC area (with air rise LMTD) ───────────────────────────────────
     dT_air = inputs.get("dT_air", 25)
-    if config == "A":
+    if config in ("A", "D"):
         T_cond_for_acc = perf["T_cond"]
     else:
         T_cond_for_acc = perf.get("T_propane_cond", perf["T_cond"])
@@ -387,21 +421,68 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
             "cost_controls_instrumentation": costs.get("controls_instrumentation", 0),
             "cost_electrical_equipment": costs.get("electrical_equipment", 0),
             "cost_equipment_subtotal": costs.get("equipment_subtotal", 0),
+            "cost_plant_installed": costs.get("plant_installed", 0),
+            "cost_gathering": costs.get("gathering", 0),
+            "cost_td": costs.get("td", 0),
             "cost_total_installed": costs.get("total_installed", 0),
-            "cost_td": 355 * net_power_kw if net_power_kw > 0 else 0,
-            "cost_gathering": 860 * net_power_kw if net_power_kw > 0 else 0,
-            "cost_total_project": (
-                costs.get("total_installed", 0)
-                + 355 * net_power_kw
-                + 860 * net_power_kw
-            ) if net_power_kw > 0 else costs.get("total_project_cost", 0),
             "acc_n_bays": costs.get("acc_n_bays", fan_result.get("n_fans_used", 0)),
             "schedule_phases": (
                 sched["config_a"]["phases"] if config == "A"
+                else sched["config_d"]["phases"] if config == "D"
                 else sched["config_b"]["phases"]
             ),
+            # ── FEED package enrichment ───────────────────────────────
+            # Serialized state points (T °F, P psia, h BTU/lb, rho lb/ft³, phase)
+            "states": {k: {"T": sp.T, "P": sp.P, "h": sp.h, "rho": sp.rho,
+                           "phase": sp.phase, "label": sp.label}
+                       for k, sp in states.items()},
+            # Duct segments
+            "duct_segments": duct.get("segments", []),
+            "duct_n_trains": duct.get("n_trains", 2),
+            "duct_total_delta_P_psi": duct.get("total_delta_P_psi", 0),
+            "duct_total_delta_T_cond_F": duct.get("total_delta_T_cond_F", 0),
+            # Fan sizing
+            "fan_n_fans_used": fan_result.get("n_fans_used", 0),
+            "fan_W_fans_kw": fan_result.get("W_fans_kw", 0),
+            "fan_area_each_ft2": fan_result.get("fan_area_each_ft2", 0),
+            # Pump sizing (isopentane)
+            "pump_iso_flow_gpm": iso_pump.get("flow_gpm", 0),
+            "pump_iso_dP_psi": iso_pump.get("dP_psi", 0),
+            "pump_iso_power_kw": iso_pump.get("power_kw", 0),
+            "pump_iso_power_hp": iso_pump.get("power_hp", 0),
+            # Structural steel weight
+            "structural_steel_weight_lb": costs.get("structural_steel_weight_lb", 0),
+            # Brine temperatures for stream table
+            "T_geo_in_F": inputs.get("T_geo_in", 420),
+            "T_geo_out_min_F": inputs.get("T_geo_out_min", 180),
+            "m_dot_geo_lb_s": inputs.get("m_dot_geo", 1100),
+            "T_ambient_F": T_ambient,
+            "eta_turbine": inputs.get("eta_turbine", 0.82),
+            "eta_pump": eta_pump,
         },
     }
+
+    if config == "D":
+        output["_detail"].update({
+            "hp_gross_power_kw": perf.get("hp_gross_power_kw", 0),
+            "lp_gross_power_kw": perf.get("lp_gross_power_kw", 0),
+            "hp_net_power_kw": perf.get("hp_net_power_kw", 0),
+            "lp_net_power_kw": perf.get("lp_net_power_kw", 0),
+            "T_evap_hp_F": perf.get("T_evap_hp", 0),
+            "T_evap_lp_F": perf.get("T_evap_lp", 0),
+            "T_split_F": perf.get("T_split", 0),
+            "P_high_hp_psia": perf.get("P_high_hp", 0),
+            "P_high_lp_psia": perf.get("P_high_lp", 0),
+            "hp_m_dot_iso_lb_hr": perf.get("hp_m_dot_iso", 0),
+            "lp_m_dot_iso_lb_hr": perf.get("lp_m_dot_iso", 0),
+            # FEED enrichment — dual-pressure HP/LP states
+            "hp_states": {k: {"T": sp.T, "P": sp.P, "h": sp.h, "rho": sp.rho,
+                              "phase": sp.phase, "label": sp.label}
+                         for k, sp in result.get("hp_states", {}).items()},
+            "lp_states": {k: {"T": sp.T, "P": sp.P, "h": sp.h, "rho": sp.rho,
+                              "phase": sp.phase, "label": sp.label}
+                         for k, sp in result.get("lp_states", {}).items()},
+        })
 
     if config == "B":
         output["_detail"].update({
@@ -412,6 +493,14 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
             "intermediate_hx_cost": costs.get("intermediate_hx", 0),
             "propane_system_cost": costs.get("propane_system", 0),
             "thermosiphon": power_bal.get("thermosiphon", False),
+            # FEED enrichment — propane loop
+            "prop_states": {k: {"T": sp.T, "P": sp.P, "h": sp.h, "rho": sp.rho,
+                                "phase": sp.phase, "label": sp.label}
+                           for k, sp in propane_states.items()},
+            "pump_prop_flow_gpm": prop_pump.get("flow_gpm", 0),
+            "pump_prop_dP_psi": prop_pump.get("dP_psi", 0),
+            "pump_prop_power_kw": prop_pump.get("power_kw", 0),
+            "pump_prop_power_hp": prop_pump.get("power_hp", 0),
         })
 
     return output

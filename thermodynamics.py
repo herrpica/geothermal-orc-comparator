@@ -23,7 +23,7 @@ from dataclasses import dataclass
 from typing import Dict, List, Optional
 import math
 import numpy as np
-from scipy.optimize import brentq
+from scipy.optimize import brentq, minimize_scalar
 
 
 @dataclass
@@ -878,6 +878,193 @@ def solve_config_b(inputs: dict, fp) -> dict:
         "performance": perf,
         "duct": duct,
         "hydraulic": hydraulic,
+    }
+
+
+def solve_dual_pressure(inputs: dict, fp) -> dict:
+    """
+    Solve a dual-pressure ORC with HP and LP stages sharing brine and ACC.
+
+    Brine flows: T_geo_in -> [HP Vap] -> [HP Pre] -> T_split -> [LP Vap] -> [LP Pre] -> T_geo_out
+    HP cycle: recuperated (pump -> recup cold -> preH -> vap -> turbine -> recup hot -> cond)
+    LP cycle: basic (pump -> preH -> vap -> turbine -> cond)
+    Both share a single ACC at T_cond.
+
+    Optimizes T_split (brine handoff temperature) for maximum total net power.
+    """
+    inp = {**_default_inputs(), **inputs}
+    fluid = inp.get("working_fluid", "isopentane")
+
+    # Get critical temperature for guard check
+    try:
+        T_crit = fp.critical_point(fluid)["T_crit"]
+    except Exception:
+        T_crit = 369.1  # isopentane fallback
+
+    # Shared condensing temperature (Config A style — no duct penalty iteration)
+    T_cond = inp["T_ambient"] + inp["dt_pinch_acc_a"]
+
+    if T_cond >= T_crit - 20:
+        raise ValueError(
+            f"Condensing temperature ({T_cond:.1f}°F) too close to "
+            f"critical temperature ({T_crit:.1f}°F) for {fluid}."
+        )
+
+    T_geo_in = inp["T_geo_in"]
+    T_geo_out_min_orig = inp["T_geo_out_min"]
+
+    def _eval_split(T_split):
+        """Evaluate total net power at given T_split. Returns negative for minimization."""
+        try:
+            # HP stage: brine from T_geo_in down to T_split, with recuperator
+            hp_inp = dict(inp)
+            hp_inp["T_geo_out_min"] = T_split
+
+            # LP stage: brine from T_split down to T_geo_out_min, no recuperator
+            lp_inp = dict(inp)
+            lp_inp["T_geo_in"] = T_split
+            lp_inp["T_geo_out_min"] = T_geo_out_min_orig
+            lp_inp["dt_pinch_recup"] = 999  # disable recuperator for LP
+
+            hp_states, hp_perf = _solve_cycle_core(hp_inp, fp, fluid, T_cond)
+            lp_states, lp_perf = _solve_cycle_core(lp_inp, fp, fluid, T_cond)
+
+            # Both stages must produce positive net power
+            if hp_perf["net_power_kw"] <= 0 or lp_perf["net_power_kw"] <= 0:
+                return 1e12
+
+            total_net = hp_perf["net_power_kw"] + lp_perf["net_power_kw"]
+            return -total_net  # minimize negative = maximize power
+        except Exception:
+            return 1e12  # infeasible
+
+    # Search bounds: T_split must leave room for both stages
+    T_split_lo = T_cond + 40
+    T_split_hi = T_geo_in - 40
+
+    if T_split_lo >= T_split_hi:
+        raise ValueError(
+            f"Dual-pressure infeasible: not enough temperature span. "
+            f"T_cond={T_cond:.0f}F, T_geo_in={T_geo_in:.0f}F, "
+            f"need at least 80F spread."
+        )
+
+    opt_result = minimize_scalar(
+        _eval_split,
+        bounds=(T_split_lo, T_split_hi),
+        method='bounded',
+        options={'xatol': 0.5, 'maxiter': 50},
+    )
+    T_split_opt = opt_result.x
+
+    # Re-solve at optimal T_split to get final states
+    hp_inp = dict(inp)
+    hp_inp["T_geo_out_min"] = T_split_opt
+
+    lp_inp = dict(inp)
+    lp_inp["T_geo_in"] = T_split_opt
+    lp_inp["T_geo_out_min"] = T_geo_out_min_orig
+    lp_inp["dt_pinch_recup"] = 999
+
+    hp_states, hp_perf = _solve_cycle_core(hp_inp, fp, fluid, T_cond)
+    lp_states, lp_perf = _solve_cycle_core(lp_inp, fp, fluid, T_cond)
+
+    # Guards
+    if lp_perf["T_evap"] <= T_cond + 10:
+        raise ValueError(
+            f"LP evaporating temp ({lp_perf['T_evap']:.1f}F) too close to "
+            f"condensing temp ({T_cond:.1f}F). Dual-pressure not viable."
+        )
+    # HP T_evap near critical is expected — _find_T_evap already clamps to T_crit-5.
+    # Only reject if net power is non-positive (degenerate solution).
+    if hp_perf["net_power_kw"] <= 0 or lp_perf["net_power_kw"] <= 0:
+        raise ValueError(
+            f"Dual-pressure degenerate: HP net={hp_perf['net_power_kw']:.0f} kW, "
+            f"LP net={lp_perf['net_power_kw']:.0f} kW."
+        )
+
+    # Build combined performance dict for downstream compatibility
+    hp_gross = hp_perf["gross_power_kw"]
+    lp_gross = lp_perf["gross_power_kw"]
+    hp_net = hp_perf["net_power_kw"]
+    lp_net = lp_perf["net_power_kw"]
+
+    total_gross = hp_gross + lp_gross
+    total_net = hp_net + lp_net
+    total_m_dot = hp_perf["m_dot_iso"] + lp_perf["m_dot_iso"]
+
+    # Combined Q_geo_in for efficiency calc
+    Q_geo_hp = hp_perf["m_dot_iso"] * hp_perf["q_evap"]  # BTU/hr
+    Q_geo_lp = lp_perf["m_dot_iso"] * lp_perf["q_evap"]
+    Q_geo_total = Q_geo_hp + Q_geo_lp
+    eta_combined = (total_net * 3412.14) / Q_geo_total if Q_geo_total > 0 else 0
+
+    combined_perf = {
+        # Primary performance (for downstream compat)
+        "gross_power_kw": total_gross,
+        "net_power_kw": total_net,
+        "eta_thermal": eta_combined,
+        "m_dot_iso": total_m_dot,
+        "m_dot_iso_lbs": total_m_dot / 3600,
+        # Use HP stage values for compat keys that downstream expects
+        "w_turbine": hp_perf["w_turbine"],
+        "w_pump": hp_perf["w_pump"],
+        "w_net": hp_perf["w_net"],
+        # Combined heat duties
+        "q_evap": (Q_geo_total / total_m_dot) if total_m_dot > 0 else 0,
+        "q_vaporizer": hp_perf["q_vaporizer"],  # HP vaporizer for compat
+        "q_preheater": hp_perf["q_preheater"],
+        "q_cond": hp_perf["q_cond"],
+        "q_recup": hp_perf["q_recup"],
+        "Q_reject_mmbtu_hr": hp_perf["Q_reject_mmbtu_hr"] + lp_perf["Q_reject_mmbtu_hr"],
+        "Q_recup_mmbtu_hr": hp_perf.get("Q_recup_mmbtu_hr", 0),
+        # Pressures (HP as primary)
+        "P_high": hp_perf["P_high"],
+        "P_low": hp_perf["P_low"],
+        "pressure_ratio": hp_perf["pressure_ratio"],
+        # Temperatures
+        "T_cond": T_cond,
+        "T_evap": hp_perf["T_evap"],  # HP T_evap for compat
+        "T_brine_mid": hp_perf["T_brine_mid"],
+        "T_geo_out_calc": lp_perf["T_geo_out_calc"],
+        "T_brine_mid_hp": hp_perf["T_brine_mid"],
+        "T_split": T_split_opt,
+        # Dual-pressure specific
+        "hp_gross_power_kw": hp_gross,
+        "lp_gross_power_kw": lp_gross,
+        "hp_net_power_kw": hp_net,
+        "lp_net_power_kw": lp_net,
+        "T_evap_hp": hp_perf["T_evap"],
+        "T_evap_lp": lp_perf["T_evap"],
+        "P_high_hp": hp_perf["P_high"],
+        "P_high_lp": lp_perf["P_high"],
+        "hp_m_dot_iso": hp_perf["m_dot_iso"],
+        "lp_m_dot_iso": lp_perf["m_dot_iso"],
+        "hp_w_pump": hp_perf["w_pump"],
+        "lp_w_pump": lp_perf["w_pump"],
+        # Volume flow (use HP for compat)
+        "vol_flow_turbine_exit": hp_perf["vol_flow_turbine_exit"],
+        # Pinch violations (OR of both stages)
+        "vaporizer_pinch": min(hp_perf["vaporizer_pinch"], lp_perf["vaporizer_pinch"]),
+        "vaporizer_pinch_violation": hp_perf["vaporizer_pinch_violation"] or lp_perf["vaporizer_pinch_violation"],
+        "preheater_pinch": min(hp_perf["preheater_pinch"], lp_perf["preheater_pinch"]),
+        "preheater_pinch_violation": hp_perf["preheater_pinch_violation"] or lp_perf["preheater_pinch_violation"],
+        "brine_outlet_violation": hp_perf["brine_outlet_violation"] or lp_perf["brine_outlet_violation"],
+        "brine_effectiveness": total_net / inp["m_dot_geo"] if inp["m_dot_geo"] > 0 else 0,
+        "converged": True,
+        "duct_penalty_F": 0,
+        "hydraulic_penalty_F": 0,
+    }
+
+    return {
+        "hp_states": hp_states,
+        "lp_states": lp_states,
+        "hp_performance": hp_perf,
+        "lp_performance": lp_perf,
+        "states": hp_states,  # primary states for compatibility
+        "performance": combined_perf,
+        "duct": {"segments": [], "tailpipe_diameter_in": 0},
+        "T_split": T_split_opt,
     }
 
 

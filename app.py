@@ -13,6 +13,7 @@ from plotly.subplots import make_subplots
 import numpy as np
 import pandas as pd
 import json
+import math
 import re
 import os
 import sys
@@ -1091,6 +1092,716 @@ def build_analysis_sidebar(shared_inputs=None):
 
 
 # ============================================================================
+# PROCESS DATA SHEETS
+# ============================================================================
+
+def _render_process_data_sheets(states_a, states_b, prop_states,
+                                 perf_a, perf_b, pwr_a, pwr_b,
+                                 costs_a, costs_b, inputs,
+                                 duct_a=None, duct_b=None,
+                                 fan_a=None, fan_b=None,
+                                 pump_iso_a=None, pump_iso_b=None,
+                                 pump_prop_b=None):
+    """Render professional Process Data Sheets: Stream Table, Duty Summary, Power Summary, Equipment Data Sheets."""
+
+    def _lmtd(dT1, dT2):
+        if abs(dT1 - dT2) < 0.01:
+            return dT1
+        if dT1 <= 0 or dT2 <= 0:
+            return 0.0
+        return (dT1 - dT2) / math.log(dT1 / dT2)
+
+    BRINE_RHO = 55.0  # lb/ft³ approximation for hot brine
+
+    # ---- Stream Table -------------------------------------------------------
+    st.subheader("Stream Table")
+
+    def _brine_gpm(m_dot_lb_hr):
+        return m_dot_lb_hr / (BRINE_RHO * 7.481 * 60)
+
+    def _fluid_gpm(m_dot_lb_hr, rho):
+        if rho > 0:
+            return m_dot_lb_hr / (rho * 7.481 * 60)
+        return 0.0
+
+    m_dot_brine_lb_hr = inputs["m_dot_geo"] * 3600
+    T_geo_in = inputs["T_geo_in"]
+
+    # Config A stream table
+    rows_a = []
+    # Brine streams
+    rows_a.append({"Stream": 1, "Description": "Brine Inlet", "Fluid": "Brine",
+                    "T (°F)": round(T_geo_in, 1), "P (psia)": "—",
+                    "Flow (lb/hr)": round(m_dot_brine_lb_hr, 0),
+                    "Flow (gpm)": round(_brine_gpm(m_dot_brine_lb_hr), 0),
+                    "Phase": "Liquid", "h (BTU/lb)": "—", "ρ (lb/ft³)": BRINE_RHO})
+    rows_a.append({"Stream": 2, "Description": "Brine at Vaporizer Outlet", "Fluid": "Brine",
+                    "T (°F)": round(perf_a["T_brine_mid"], 1), "P (psia)": "—",
+                    "Flow (lb/hr)": round(m_dot_brine_lb_hr, 0),
+                    "Flow (gpm)": round(_brine_gpm(m_dot_brine_lb_hr), 0),
+                    "Phase": "Liquid", "h (BTU/lb)": "—", "ρ (lb/ft³)": BRINE_RHO})
+    rows_a.append({"Stream": 3, "Description": "Brine Outlet", "Fluid": "Brine",
+                    "T (°F)": round(perf_a["T_geo_out_calc"], 1), "P (psia)": "—",
+                    "Flow (lb/hr)": round(m_dot_brine_lb_hr, 0),
+                    "Flow (gpm)": round(_brine_gpm(m_dot_brine_lb_hr), 0),
+                    "Phase": "Liquid", "h (BTU/lb)": "—", "ρ (lb/ft³)": BRINE_RHO})
+    # Isopentane streams
+    m_dot_iso_a = perf_a["m_dot_iso"]
+    iso_labels = [
+        ("4", "Turbine Inlet (Iso)", "1"),
+        ("5", "Turbine Outlet (Iso)", "2"),
+        ("6", "Recuperator Hot Out (Iso)", "3"),
+        ("7", "Condenser Outlet (Iso)", "4"),
+        ("8", "Pump Outlet (Iso)", "5"),
+        ("9", "Preheater Inlet (Iso)", "6"),
+        ("10", "Vaporizer Inlet (Iso)", "7"),
+    ]
+    for stream_num, desc, state_key in iso_labels:
+        sp = states_a[state_key]
+        rows_a.append({"Stream": int(stream_num), "Description": desc, "Fluid": "Isopentane",
+                        "T (°F)": round(sp.T, 1), "P (psia)": round(sp.P, 1),
+                        "Flow (lb/hr)": round(m_dot_iso_a, 0),
+                        "Flow (gpm)": round(_fluid_gpm(m_dot_iso_a, sp.rho), 0),
+                        "Phase": sp.phase, "h (BTU/lb)": round(sp.h, 1),
+                        "ρ (lb/ft³)": round(sp.rho, 2)})
+
+    stream_df_a = pd.DataFrame(rows_a)
+
+    # Config B stream table
+    rows_b = []
+    # Brine streams (same 3)
+    rows_b.append({"Stream": 1, "Description": "Brine Inlet", "Fluid": "Brine",
+                    "T (°F)": round(T_geo_in, 1), "P (psia)": "—",
+                    "Flow (lb/hr)": round(m_dot_brine_lb_hr, 0),
+                    "Flow (gpm)": round(_brine_gpm(m_dot_brine_lb_hr), 0),
+                    "Phase": "Liquid", "h (BTU/lb)": "—", "ρ (lb/ft³)": BRINE_RHO})
+    rows_b.append({"Stream": 2, "Description": "Brine at Vaporizer Outlet", "Fluid": "Brine",
+                    "T (°F)": round(perf_b["T_brine_mid"], 1), "P (psia)": "—",
+                    "Flow (lb/hr)": round(m_dot_brine_lb_hr, 0),
+                    "Flow (gpm)": round(_brine_gpm(m_dot_brine_lb_hr), 0),
+                    "Phase": "Liquid", "h (BTU/lb)": "—", "ρ (lb/ft³)": BRINE_RHO})
+    rows_b.append({"Stream": 3, "Description": "Brine Outlet", "Fluid": "Brine",
+                    "T (°F)": round(perf_b["T_geo_out_calc"], 1), "P (psia)": "—",
+                    "Flow (lb/hr)": round(m_dot_brine_lb_hr, 0),
+                    "Flow (gpm)": round(_brine_gpm(m_dot_brine_lb_hr), 0),
+                    "Phase": "Liquid", "h (BTU/lb)": "—", "ρ (lb/ft³)": BRINE_RHO})
+    # Isopentane streams (same 7)
+    m_dot_iso_b = perf_b["m_dot_iso"]
+    for stream_num, desc, state_key in iso_labels:
+        sp = states_b[state_key]
+        rows_b.append({"Stream": int(stream_num), "Description": desc, "Fluid": "Isopentane",
+                        "T (°F)": round(sp.T, 1), "P (psia)": round(sp.P, 1),
+                        "Flow (lb/hr)": round(m_dot_iso_b, 0),
+                        "Flow (gpm)": round(_fluid_gpm(m_dot_iso_b, sp.rho), 0),
+                        "Phase": sp.phase, "h (BTU/lb)": round(sp.h, 1),
+                        "ρ (lb/ft³)": round(sp.rho, 2)})
+    # Propane streams
+    m_dot_prop = perf_b["m_dot_prop"]
+    prop_labels = [
+        (11, "Propane Evaporator Outlet", "A"),
+        (12, "Propane Condenser Outlet", "B"),
+        (13, "Propane Pump Outlet", "C"),
+    ]
+    for stream_num, desc, state_key in prop_labels:
+        sp = prop_states[state_key]
+        rows_b.append({"Stream": stream_num, "Description": desc, "Fluid": "Propane",
+                        "T (°F)": round(sp.T, 1), "P (psia)": round(sp.P, 1),
+                        "Flow (lb/hr)": round(m_dot_prop, 0),
+                        "Flow (gpm)": round(_fluid_gpm(m_dot_prop, sp.rho), 0),
+                        "Phase": sp.phase, "h (BTU/lb)": round(sp.h, 1),
+                        "ρ (lb/ft³)": round(sp.rho, 2)})
+
+    stream_df_b = pd.DataFrame(rows_b)
+
+    col_sa, col_sb = st.columns(2)
+    with col_sa:
+        st.caption("Config A — Direct ACC")
+        st.dataframe(stream_df_a, use_container_width=True, hide_index=True)
+    with col_sb:
+        st.caption("Config B — Propane Intermediate")
+        st.dataframe(stream_df_b, use_container_width=True, hide_index=True)
+
+    # ---- Duty Summary -------------------------------------------------------
+    st.subheader("Heat Exchanger Duty Summary")
+
+    dT_air = inputs.get("dT_air", 40)
+    T_ambient = inputs["T_ambient"]
+
+    def _build_duty_row(name, duty_mmbtu, hot_in, hot_out, cold_in, cold_out, area_ft2, is_acc=False, acc_n_bays=None):
+        dT1 = hot_in - cold_out
+        dT2 = hot_out - cold_in
+        lmtd = _lmtd(dT1, dT2)
+        ua = (duty_mmbtu * 1e6 / lmtd / 1000) if lmtd > 0 else 0  # kBTU/hr-°F
+        if is_acc:
+            shells_est = acc_n_bays if acc_n_bays else "—"
+            shells_label = "Bays"
+        else:
+            shells_est = math.ceil(area_ft2 / 5000) if area_ft2 > 0 else 0
+            shells_label = "Shells (est.)"
+        return {
+            "Equipment": name,
+            "Duty (MMBtu/hr)": round(duty_mmbtu, 2),
+            "Hot In (°F)": round(hot_in, 1),
+            "Hot Out (°F)": round(hot_out, 1),
+            "Cold In (°F)": round(cold_in, 1),
+            "Cold Out (°F)": round(cold_out, 1),
+            "LMTD (°F)": round(lmtd, 1),
+            "UA (kBTU/hr-°F)": round(ua, 1),
+            "Area (ft²)": round(area_ft2, 0),
+            shells_label: shells_est,
+        }
+
+    # Config A duties
+    duty_vap_a = perf_a["m_dot_iso"] * perf_a["q_vaporizer"] / 1e6
+    duty_pre_a = perf_a["m_dot_iso"] * perf_a["q_preheater"] / 1e6
+    duty_rec_a = perf_a["m_dot_iso"] * perf_a["q_recup"] / 1e6
+    duty_acc_a = perf_a["Q_reject_mmbtu_hr"]
+
+    duty_rows_a = [
+        _build_duty_row("Vaporizer", duty_vap_a,
+                        T_geo_in, perf_a["T_brine_mid"],
+                        states_a["7"].T, states_a["1"].T,
+                        costs_a.get("vaporizer_area_ft2", 0)),
+        _build_duty_row("Preheater", duty_pre_a,
+                        perf_a["T_brine_mid"], perf_a["T_geo_out_calc"],
+                        states_a["6"].T, states_a["7"].T,
+                        costs_a.get("preheater_area_ft2", 0)),
+        _build_duty_row("Recuperator", duty_rec_a,
+                        states_a["2"].T, states_a["3"].T,
+                        states_a["5"].T, states_a["6"].T,
+                        costs_a.get("recuperator_area_ft2", 0)),
+        _build_duty_row("ACC", duty_acc_a,
+                        states_a["3"].T, states_a["4"].T,
+                        T_ambient, T_ambient + dT_air,
+                        costs_a.get("acc_area_ft2", 0),
+                        is_acc=True, acc_n_bays=costs_a.get("acc_n_bays")),
+    ]
+    duty_df_a = pd.DataFrame(duty_rows_a)
+
+    # Config B duties
+    duty_vap_b = perf_b["m_dot_iso"] * perf_b["q_vaporizer"] / 1e6
+    duty_pre_b = perf_b["m_dot_iso"] * perf_b["q_preheater"] / 1e6
+    duty_rec_b = perf_b["m_dot_iso"] * perf_b["q_recup"] / 1e6
+    duty_ihx_b = perf_b["m_dot_iso"] * perf_b["q_cond_iso"] / 1e6
+    Q_reject_air_b = perf_b["m_dot_prop"] * (prop_states["A"].h - prop_states["B"].h) / 1e6
+
+    duty_rows_b = [
+        _build_duty_row("Vaporizer", duty_vap_b,
+                        T_geo_in, perf_b["T_brine_mid"],
+                        states_b["7"].T, states_b["1"].T,
+                        costs_b.get("vaporizer_area_ft2", 0)),
+        _build_duty_row("Preheater", duty_pre_b,
+                        perf_b["T_brine_mid"], perf_b["T_geo_out_calc"],
+                        states_b["6"].T, states_b["7"].T,
+                        costs_b.get("preheater_area_ft2", 0)),
+        _build_duty_row("Recuperator", duty_rec_b,
+                        states_b["2"].T, states_b["3"].T,
+                        states_b["5"].T, states_b["6"].T,
+                        costs_b.get("recuperator_area_ft2", 0)),
+        _build_duty_row("Intermediate HX", duty_ihx_b,
+                        states_b["3"].T, states_b["4"].T,
+                        prop_states["C"].T, prop_states["A"].T,
+                        costs_b.get("intermediate_hx_area_ft2", 0)),
+        _build_duty_row("ACC (Propane)", Q_reject_air_b,
+                        prop_states["A"].T, prop_states["B"].T,
+                        T_ambient, T_ambient + dT_air,
+                        costs_b.get("acc_area_ft2", 0),
+                        is_acc=True, acc_n_bays=costs_b.get("acc_n_bays")),
+    ]
+    duty_df_b = pd.DataFrame(duty_rows_b)
+
+    col_da, col_db = st.columns(2)
+    with col_da:
+        st.caption("Config A")
+        st.dataframe(duty_df_a, use_container_width=True, hide_index=True)
+    with col_db:
+        st.caption("Config B")
+        st.dataframe(duty_df_b, use_container_width=True, hide_index=True)
+
+    # ---- Power Summary ------------------------------------------------------
+    st.subheader("Power Summary")
+
+    def _build_power_table(pwr, config="A"):
+        gross = pwr["P_gross"]
+        rows = [
+            {"Item": "Gross Turbine Output", "Value (kW)": round(gross, 1),
+             "% of Gross": "100.0%"},
+            {"Item": "Generator Losses", "Value (kW)": round(pwr["P_gross"] - pwr["P_shaft"], 1),
+             "% of Gross": f"{(pwr['P_gross'] - pwr['P_shaft']) / gross * 100:.1f}%" if gross else "—"},
+            {"Item": "Isopentane Pump", "Value (kW)": round(-pwr["W_iso_pump"], 1),
+             "% of Gross": f"-{pwr['W_iso_pump'] / gross * 100:.1f}%" if gross else "—"},
+        ]
+        if config == "B":
+            rows.append({"Item": "Propane Pump", "Value (kW)": round(-pwr["W_prop_pump"], 1),
+                         "% of Gross": f"-{pwr['W_prop_pump'] / gross * 100:.1f}%" if gross else "—"})
+        rows.extend([
+            {"Item": "ACC Fans", "Value (kW)": round(-pwr["W_fans"], 1),
+             "% of Gross": f"-{pwr['W_fans'] / gross * 100:.1f}%" if gross else "—"},
+            {"Item": "Auxiliary Loads", "Value (kW)": round(-pwr["W_auxiliary"], 1),
+             "% of Gross": f"-{pwr['W_auxiliary'] / gross * 100:.1f}%" if gross else "—"},
+            {"Item": "Total Parasitic", "Value (kW)": round(-pwr["W_total_parasitic"], 1),
+             "% of Gross": f"-{pwr['W_total_parasitic'] / gross * 100:.1f}%" if gross else "—"},
+            {"Item": "Net Output", "Value (kW)": round(pwr["P_net"], 1),
+             "% of Gross": f"{pwr['P_net'] / gross * 100:.1f}%" if gross else "—"},
+        ])
+        return pd.DataFrame(rows)
+
+    power_df_a = _build_power_table(pwr_a, "A")
+    power_df_b = _build_power_table(pwr_b, "B")
+
+    col_pa, col_pb = st.columns(2)
+    with col_pa:
+        st.caption("Config A")
+        st.dataframe(power_df_a, use_container_width=True, hide_index=True)
+        st.metric("Net Efficiency", f"{pwr_a['eta_thermal']*100:.1f}%")
+        st.metric("Brine Effectiveness", f"{pwr_a['brine_effectiveness']:.2f} kW/(lb/s)")
+        st.metric("Parasitic Ratio", f"{pwr_a['parasitic_pct']:.1f}%")
+    with col_pb:
+        st.caption("Config B")
+        st.dataframe(power_df_b, use_container_width=True, hide_index=True)
+        st.metric("Net Efficiency", f"{pwr_b['eta_thermal']*100:.1f}%")
+        st.metric("Brine Effectiveness", f"{pwr_b['brine_effectiveness']:.2f} kW/(lb/s)")
+        st.metric("Parasitic Ratio", f"{pwr_b['parasitic_pct']:.1f}%")
+
+    # ---- Equipment Data Sheets -----------------------------------------------
+    if duct_a is not None and fan_a is not None and pump_iso_a is not None:
+        st.subheader("Equipment Data Sheets")
+
+        N_TRAINS = 2
+
+        EQUIP_REF = {
+            "turbine_generator": {
+                "vendors": ["Exergy", "Turboden", "Ormat", "Baker Hughes"],
+                "lead_wk": 14,
+                "lb_per_kw": 35,
+                "ft2_per_mw": 200,
+                "questions": ["Radial vs axial expander", "Gearbox configuration", "Generator voltage (4160V vs 13.8kV)"],
+            },
+            "vaporizer": {
+                "vendors": ["Koch Heat Transfer", "Kelvion", "Bronswerk"],
+                "lead_wk": 12,
+                "lb_per_ft2": 3.0,
+                "tube_length_ft": 20,
+                "max_shell_area_ft2": 5000,
+                "questions": ["Corrosion allowance for brine", "Tube material (CS vs duplex SS)", "TEMA type (BEM vs AES)"],
+            },
+            "preheater": {
+                "vendors": ["Koch Heat Transfer", "Kelvion", "Bronswerk"],
+                "lead_wk": 12,
+                "lb_per_ft2": 2.5,
+                "tube_length_ft": 20,
+                "max_shell_area_ft2": 5000,
+                "questions": ["Scaling potential at lower brine temps", "Cleaning access / removable bundle", "TEMA type (BEM vs AES)"],
+            },
+            "recuperator": {
+                "vendors": ["Alfa Laval", "Koch Heat Transfer", "Kelvion"],
+                "lead_wk": 10,
+                "lb_per_ft2": 2.0,
+                "tube_length_ft": 16,
+                "max_shell_area_ft2": 5000,
+                "questions": ["Welded plate vs shell-and-tube", "Fouling factor (clean iso-to-iso service)", "Per-train vs shared"],
+            },
+            "ihx": {
+                "vendors": ["Koch Heat Transfer", "Kelvion", "Bronswerk"],
+                "lead_wk": 12,
+                "lb_per_ft2": 2.5,
+                "tube_length_ft": 20,
+                "max_shell_area_ft2": 5000,
+                "questions": ["Shell-side fluid (iso vs propane)", "Design pressure for propane side", "TEMA type"],
+            },
+            "acc": {
+                "vendors": ["Worldwide Air Coolers", "SPX Cooling", "Harsco"],
+                "lead_wk": 14,
+                "tons_per_bay": 12,
+                "questions": ["A-frame vs horizontal configuration", "Fin material (aluminum vs galvanized)", "Freeze protection strategy"],
+            },
+            "iso_pump": {
+                "vendors": ["Flowserve", "Sulzer", "Byron Jackson"],
+                "lead_wk": 10,
+                "lb_per_hp": 12,
+                "questions": ["API 610 compliance", "Mechanical seal type (dual pressurized)", "Installed spare requirement"],
+            },
+            "prop_pump": {
+                "vendors": ["Flowserve", "Sulzer", "Byron Jackson"],
+                "lead_wk": 10,
+                "lb_per_hp": 12,
+                "questions": ["Thermosiphon eliminates pump?", "Canned motor option for propane", "API 610 compliance"],
+            },
+            "controls": {
+                "vendors": ["Honeywell", "ABB", "Emerson", "Siemens"],
+                "lead_wk": 8,
+                "questions": ["DCS vs PLC architecture", "SCADA integration scope", "Remote monitoring requirements"],
+            },
+            "electrical": {
+                "vendors": ["ABB", "Eaton", "Schneider Electric", "Siemens"],
+                "lead_wk": 16,
+                "questions": ["GSU transformer voltage (34.5kV vs 69kV)", "Interconnection study status", "Arc flash hazard analysis"],
+            },
+            "structural_steel": {
+                "vendors": ["Local fabricator (competitive bid)"],
+                "lead_wk": 10,
+                "questions": ["Seismic zone classification", "Wind load design criteria", "Fireproofing requirements"],
+            },
+            "wf_inventory": {
+                "vendors": ["Targa Resources", "Enterprise Products"],
+                "lead_wk": 4,
+                "questions": ["Initial charge volume calculation", "On-site storage tank sizing", "Purity specification (99.5%+ isopentane)"],
+            },
+        }
+
+        def _build_equipment_cards(config_label, costs, perf, states, pwr, inp,
+                                    duct, fan, pump_iso, pump_prop=None, prop_st=None):
+            """Build list of equipment card dicts for one configuration."""
+            cards = []
+            gross_kw = pwr["P_gross"]
+            gross_mw = gross_kw / 1000
+            prefix = config_label  # "A" or "B"
+
+            # --- Turbine-Generator ---
+            ref = EQUIP_REF["turbine_generator"]
+            per_unit_kw = gross_kw / N_TRAINS
+            per_unit_mw = per_unit_kw / 1000
+            footprint = ref["ft2_per_mw"] * per_unit_mw
+            side_ft = footprint ** 0.5
+            weight_tons = per_unit_kw * ref["lb_per_kw"] / 2000
+            p_high = perf.get("P_high", perf.get("P_high_iso", 0))
+            p_low = perf.get("P_low", perf.get("P_low_iso", 0))
+            pr = p_high / p_low if p_low > 0 else 0
+            for i in range(N_TRAINS):
+                cards.append({
+                    "tag": f"TG-{prefix}10{i+1}",
+                    "service": "ORC Turbine-Generator Set",
+                    "equip_type": "turbine_generator",
+                    "sizing": {
+                        "Rated Power": f"{per_unit_kw:.0f} kW ({per_unit_mw:.1f} MW)",
+                        "Inlet Pressure": f"{p_high:.0f} psia",
+                        "Exhaust Pressure": f"{p_low:.1f} psia",
+                        "Pressure Ratio": f"{pr:.1f}",
+                    },
+                    "dimensions": f"{side_ft:.0f}L × {side_ft:.0f}W × 8H ft (approx.)",
+                    "weight_tons": weight_tons,
+                    "cost_dollars": costs["turbine_generator"] / N_TRAINS,
+                    "cost_per_kw": costs["turbine_generator"] / gross_kw if gross_kw else 0,
+                })
+
+            # --- Shell-and-tube heat exchangers ---
+            hx_items = [
+                ("vaporizer", f"HX-{prefix}101", "Brine / Isopentane Vaporizer",
+                 "vaporizer_area_ft2", "vaporizer"),
+                ("preheater", f"HX-{prefix}102", "Brine / Isopentane Preheater",
+                 "preheater_area_ft2", "preheater"),
+                ("recuperator", f"HX-{prefix}103", "Isopentane Recuperator (per train)",
+                 "recuperator_area_ft2", "recuperator"),
+            ]
+            if config_label == "B" and "intermediate_hx_area_ft2" in costs:
+                hx_items.append(
+                    ("ihx", f"HX-{prefix}105", "Intermediate Heat Exchanger (Iso/Propane)",
+                     "intermediate_hx_area_ft2", "intermediate_hx"),
+                )
+
+            for ref_key, tag, service, area_key, cost_key in hx_items:
+                ref = EQUIP_REF[ref_key]
+                area = costs.get(area_key, 0)
+                max_shell = ref["max_shell_area_ft2"]
+                n_shells = math.ceil(area / max_shell) if area > 0 else 1
+                area_per_shell = area / n_shells if n_shells > 0 else 0
+                shell_dia = 2.5 + (area_per_shell / 600) ** 0.5 if area_per_shell > 0 else 3.0
+                tube_len = ref["tube_length_ft"]
+                weight_tons = area * ref["lb_per_ft2"] / 2000
+                # Count — recuperator is per-train (×N_TRAINS)
+                n_units = N_TRAINS if ref_key == "recuperator" else 1
+                # Design pressure: max side pressure + 10% margin
+                if ref_key == "vaporizer":
+                    design_p = max(p_high, 200) * 1.1  # brine ~200 psia typical
+                elif ref_key == "preheater":
+                    design_p = max(states["6"].P if "6" in states else p_high, 200) * 1.1
+                elif ref_key == "recuperator":
+                    design_p = p_high * 1.1
+                elif ref_key == "ihx" and prop_st:
+                    p_prop = perf.get("P_prop_evap", 200)
+                    design_p = max(p_low, p_prop) * 1.1
+                else:
+                    design_p = p_high * 1.1
+
+                sizing = {
+                    "Area": f"{area:,.0f} ft²",
+                    "Shells": f"{n_shells} × {area_per_shell:,.0f} ft² each",
+                    "Design Pressure": f"{design_p:.0f} psia",
+                }
+                # Add duty info
+                m_dot_iso = perf["m_dot_iso"]
+                if ref_key == "vaporizer":
+                    duty = m_dot_iso * perf["q_vaporizer"] / 1e6
+                elif ref_key == "preheater":
+                    duty = m_dot_iso * perf["q_preheater"] / 1e6
+                elif ref_key == "recuperator":
+                    duty = m_dot_iso * perf["q_recup"] / 1e6
+                elif ref_key == "ihx":
+                    duty = m_dot_iso * perf.get("q_cond_iso", 0) / 1e6
+                else:
+                    duty = 0
+                sizing["Duty"] = f"{duty:.1f} MMBtu/hr"
+
+                for u in range(n_units):
+                    unit_tag = f"{tag}" if n_units == 1 else f"{tag}-{u+1}"
+                    cards.append({
+                        "tag": unit_tag,
+                        "service": service,
+                        "equip_type": ref_key,
+                        "sizing": sizing,
+                        "dimensions": f"{n_shells} shell(s), {shell_dia:.1f} ft dia × {tube_len} ft long",
+                        "weight_tons": weight_tons / n_units if n_units > 1 else weight_tons,
+                        "cost_dollars": costs.get(cost_key, 0) / n_units if n_units > 1 else costs.get(cost_key, 0),
+                        "cost_per_kw": costs.get(cost_key, 0) / gross_kw if gross_kw else 0,
+                    })
+
+            # --- ACC ---
+            ref = EQUIP_REF["acc"]
+            n_bays = costs.get("acc_n_bays", 0)
+            acc_area = costs.get("acc_area_ft2", 0)
+            acc_fluid = "Propane" if config_label == "B" else "Isopentane"
+            q_reject = perf.get("Q_reject_mmbtu_hr", 0)
+            if config_label == "B" and prop_st:
+                q_reject = perf["m_dot_prop"] * (prop_st["A"].h - prop_st["B"].h) / 1e6
+            cards.append({
+                "tag": f"ACC-{prefix}101",
+                "service": f"Air-Cooled Condenser ({acc_fluid})",
+                "equip_type": "acc",
+                "sizing": {
+                    "Heat Rejection": f"{q_reject:.1f} MMBtu/hr",
+                    "Face Area": f"{acc_area:,.0f} ft²",
+                    "Number of Bays": f"{n_bays}",
+                    "Fans per Bay": f"{fan.get('n_fans_used', 0) // max(n_bays, 1) if n_bays else '—'}",
+                    "Total Fans": f"{fan.get('n_fans_used', 0)}",
+                    "Fan Power": f"{fan.get('W_fans_kw', 0):.0f} kW",
+                },
+                "dimensions": f"{n_bays} bays × (40L × 12W × 35H ft)",
+                "weight_tons": n_bays * ref["tons_per_bay"],
+                "cost_dollars": costs.get("acc", 0),
+                "cost_per_kw": costs.get("acc", 0) / gross_kw if gross_kw else 0,
+            })
+
+            # --- Isopentane Pump ---
+            ref = EQUIP_REF["iso_pump"]
+            hp = pump_iso.get("power_hp", 0)
+            for i in range(N_TRAINS):
+                cards.append({
+                    "tag": f"P-{prefix}10{i+1}",
+                    "service": "Isopentane Feed Pump (per train)",
+                    "equip_type": "iso_pump",
+                    "sizing": {
+                        "Flow": f"{pump_iso.get('flow_gpm', 0) / N_TRAINS:.0f} gpm",
+                        "Differential Pressure": f"{pump_iso.get('dP_psi', 0):.0f} psi",
+                        "Power": f"{hp / N_TRAINS:.0f} HP ({pump_iso.get('power_kw', 0) / N_TRAINS:.0f} kW)",
+                    },
+                    "dimensions": "4L × 3W × 3H ft (typical API 610)",
+                    "weight_tons": (hp / N_TRAINS) * ref["lb_per_hp"] / 2000,
+                    "cost_dollars": costs.get("iso_pump", 0) / N_TRAINS,
+                    "cost_per_kw": costs.get("iso_pump", 0) / gross_kw if gross_kw else 0,
+                })
+
+            # --- Propane Pump (Config B only) ---
+            if config_label == "B" and pump_prop:
+                ref = EQUIP_REF["prop_pump"]
+                hp_prop = pump_prop.get("power_hp", 0)
+                thermo = pwr.get("thermosiphon", False)
+                cards.append({
+                    "tag": f"P-{prefix}103",
+                    "service": "Propane Circulation Pump" + (" (standby — thermosiphon)" if thermo else ""),
+                    "equip_type": "prop_pump",
+                    "sizing": {
+                        "Flow": f"{pump_prop.get('flow_gpm', 0):.0f} gpm",
+                        "Differential Pressure": f"{pump_prop.get('dP_psi', 0):.0f} psi",
+                        "Power": f"{hp_prop:.0f} HP" + (" (thermosiphon — 0 kW operating)" if thermo else f" ({pump_prop.get('power_kw', 0):.0f} kW)"),
+                    },
+                    "dimensions": "4L × 3W × 3H ft (typical API 610)",
+                    "weight_tons": hp_prop * ref["lb_per_hp"] / 2000,
+                    "cost_dollars": costs.get("propane_system", 0) * 0.15,  # pump ~15% of propane system
+                    "cost_per_kw": costs.get("propane_system", 0) * 0.15 / gross_kw if gross_kw else 0,
+                })
+
+            # --- Ductwork (single card, summary table) ---
+            if duct and duct.get("segments"):
+                seg_rows = []
+                total_duct_cost = costs.get("ductwork", 0)
+                for seg in duct["segments"]:
+                    seg_rows.append({
+                        "Segment": seg["name"],
+                        "Diameter (in)": f"{seg['diameter_in']:.0f}",
+                        "Length (ft)": f"{seg['length_ft']:.0f}",
+                        "ΔP (psi)": f"{seg['delta_P_psi']:.3f}",
+                    })
+                cards.append({
+                    "tag": f"DUCT-{prefix}101",
+                    "service": "Process Ductwork (all segments)",
+                    "equip_type": "ductwork",
+                    "sizing": {
+                        "Trains": f"{duct.get('n_trains', N_TRAINS)}",
+                        "Total ΔP": f"{duct.get('total_delta_P_psi', 0):.3f} psi",
+                        "Total ΔT Condensing": f"{duct.get('total_delta_T_cond_F', 0):.1f} °F",
+                    },
+                    "segments_table": seg_rows,
+                    "dimensions": f"{len(duct['segments'])} segments, {duct.get('n_trains', N_TRAINS)} trains",
+                    "weight_tons": None,  # included in structural steel
+                    "cost_dollars": total_duct_cost,
+                    "cost_per_kw": total_duct_cost / gross_kw if gross_kw else 0,
+                })
+
+            # --- Controls & Instrumentation ---
+            ref = EQUIP_REF["controls"]
+            cards.append({
+                "tag": f"C-{prefix}101",
+                "service": "Distributed Control System",
+                "equip_type": "controls",
+                "sizing": {
+                    "Plant Capacity": f"{gross_mw:.1f} MW gross",
+                    "I/O Count (est.)": f"{int(gross_mw * 80)} points",
+                },
+                "dimensions": "2 panels, 3W × 2D × 7H ft each",
+                "weight_tons": None,
+                "cost_dollars": costs.get("controls_instrumentation", 0),
+                "cost_per_kw": costs.get("controls_instrumentation", 0) / gross_kw if gross_kw else 0,
+            })
+
+            # --- Electrical ---
+            ref = EQUIP_REF["electrical"]
+            cards.append({
+                "tag": f"E-{prefix}101",
+                "service": "MV Switchgear, MCC, GSU Transformer",
+                "equip_type": "electrical",
+                "sizing": {
+                    "Plant Capacity": f"{gross_mw:.1f} MW gross",
+                    "Generator Voltage": "4,160 V (typical)",
+                    "GSU Rating": f"{gross_mw * 1.1:.0f} MVA (est.)",
+                },
+                "dimensions": "MCC lineup ~20 ft, transformer pad ~12 × 12 ft",
+                "weight_tons": None,
+                "cost_dollars": costs.get("electrical_equipment", 0),
+                "cost_per_kw": costs.get("electrical_equipment", 0) / gross_kw if gross_kw else 0,
+            })
+
+            # --- Structural Steel ---
+            steel_lb = costs.get("structural_steel_weight_lb", 0)
+            cards.append({
+                "tag": f"S-{prefix}101",
+                "service": "Pipe Racks, Equipment Supports, ACC Structure",
+                "equip_type": "structural_steel",
+                "sizing": {
+                    "Total Weight": f"{steel_lb:,.0f} lb ({steel_lb / 2000:,.1f} tons)",
+                },
+                "dimensions": "Site-specific layout",
+                "weight_tons": steel_lb / 2000,
+                "cost_dollars": costs.get("structural_steel", 0),
+                "cost_per_kw": costs.get("structural_steel", 0) / gross_kw if gross_kw else 0,
+            })
+
+            # --- Working Fluid Inventory ---
+            cards.append({
+                "tag": f"INV-{prefix}101",
+                "service": "Isopentane Initial Charge",
+                "equip_type": "wf_inventory",
+                "sizing": {
+                    "Budget Allowance": f"${costs.get('wf_inventory', 0):,.0f}",
+                },
+                "dimensions": "Delivered by tanker truck",
+                "weight_tons": None,
+                "cost_dollars": costs.get("wf_inventory", 0),
+                "cost_per_kw": costs.get("wf_inventory", 0) / gross_kw if gross_kw else 0,
+            })
+
+            return cards
+
+        # Build cards for both configs
+        cards_a = _build_equipment_cards(
+            "A", costs_a, perf_a, states_a, pwr_a, inputs,
+            duct_a, fan_a, pump_iso_a,
+        )
+        cards_b = _build_equipment_cards(
+            "B", costs_b, perf_b, states_b, pwr_b, inputs,
+            duct_b, fan_b, pump_iso_b,
+            pump_prop=pump_prop_b, prop_st=prop_states,
+        )
+
+        # Render two-column layout
+        col_ea, col_eb = st.columns(2)
+
+        def _render_card_column(col, cards, config_name):
+            with col:
+                st.caption(f"Config {config_name}")
+                for card in cards:
+                    ref = EQUIP_REF.get(card["equip_type"], {})
+                    with st.expander(f"**{card['tag']}** — {card['service']}"):
+                        left, right = st.columns([3, 2])
+                        with left:
+                            # Sizing parameters table
+                            sizing = card.get("sizing", {})
+                            if sizing:
+                                sz_df = pd.DataFrame(
+                                    [{"Parameter": k, "Value": v} for k, v in sizing.items()]
+                                )
+                                st.dataframe(sz_df, use_container_width=True, hide_index=True)
+
+                            # Ductwork segments sub-table
+                            if "segments_table" in card and card["segments_table"]:
+                                st.markdown("**Segment Details:**")
+                                st.dataframe(
+                                    pd.DataFrame(card["segments_table"]),
+                                    use_container_width=True, hide_index=True,
+                                )
+
+                            # Dimensions
+                            st.markdown(f"**Dimensions:** {card.get('dimensions', '—')}")
+
+                            # Weight
+                            wt = card.get("weight_tons")
+                            if wt is not None and wt > 0:
+                                st.markdown(f"**Weight:** {wt:,.1f} tons")
+                            elif wt is None:
+                                st.markdown("**Weight:** —")
+
+                        with right:
+                            # Vendor candidates
+                            vendors = ref.get("vendors", [])
+                            if vendors:
+                                st.markdown("**Vendor Candidates:**")
+                                for v in vendors:
+                                    st.markdown(f"- {v}")
+
+                            # Budget cost
+                            cost_d = card.get("cost_dollars", 0)
+                            cost_kw = card.get("cost_per_kw", 0)
+                            st.markdown(f"**Budget Cost:** ${cost_d:,.0f} (${cost_kw:.0f}/kW)")
+
+                            # Lead time
+                            lead = ref.get("lead_wk", "—")
+                            st.markdown(f"**Lead Time:** {lead} weeks")
+
+                            # Open questions
+                            questions = ref.get("questions", [])
+                            if questions:
+                                st.markdown("**Open Questions:**")
+                                for q in questions:
+                                    st.markdown(f"- {q}")
+
+        _render_card_column(col_ea, cards_a, "A")
+        _render_card_column(col_eb, cards_b, "B")
+
+        # Summary cross-check
+        gross_a = pwr_a["P_gross"]
+        gross_b = pwr_b["P_gross"]
+        total_equip_cards_a = sum(c.get("cost_dollars", 0) for c in cards_a)
+        total_equip_cards_b = sum(c.get("cost_dollars", 0) for c in cards_b)
+        equip_sub_a = costs_a.get("equipment_subtotal", 0)
+        equip_sub_b = costs_b.get("equipment_subtotal", 0)
+
+        st.caption(
+            f"Card total vs Equipment Subtotal — "
+            f"Config A: ${total_equip_cards_a:,.0f} vs ${equip_sub_a:,.0f} | "
+            f"Config B: ${total_equip_cards_b:,.0f} vs ${equip_sub_b:,.0f}"
+        )
+
+
+# ============================================================================
 # ANALYSIS TAB RENDERER
 # ============================================================================
 
@@ -1901,6 +2612,8 @@ def render_analysis_tab(inputs):
         ("Engineering & Procurement", "engineering"),
         ("Construction Mgmt", "construction_mgmt"),
         ("Contingency", "contingency"),
+        ("Gathering System", "gathering"),
+        ("Transmission & Distribution", "td"),
     ]
 
     comp_names = [c[0] for c in comp_list]
@@ -2120,10 +2833,11 @@ def render_analysis_tab(inputs):
 
     st.header("Technical Analysis")
 
-    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
+    tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8, tab9 = st.tabs([
         "T-s Diagram", "Duct Sizing", "Approach Optimization",
         "Brine Utilization", "Sensitivity Analysis", "Hydraulic Analysis",
         "Equipment Sizing Trade-offs", "Fan Power & ACC Optimization",
+        "Process Data Sheets",
     ])
 
     # -- Tab 1: T-s Diagram ---------------------------------------------------
@@ -3344,6 +4058,17 @@ the plant lifetime.
 - Higher dT_air = less ACC area but more fan power; star markers show the minimum total annualized cost
 """)
 
+
+    # -- Tab 9: Process Data Sheets --------------------------------------------
+    with tab9:
+        _render_process_data_sheets(
+            states_a, states_b, prop_states,
+            perf_a, perf_b, pwr_a, pwr_b,
+            costs_a, costs_b, inputs,
+            duct_a, duct_b,
+            fan_a, fan_b,
+            pump_iso_a, pump_iso_b, pump_prop_b,
+        )
 
     # ============================================================================
     # SECTION 5: ASSUMPTIONS AND SOFTWARE INFORMATION

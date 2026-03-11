@@ -7,8 +7,9 @@ Cost stack (calibrated to Turboden 93 MW lump-sum EPC project data):
   1. Equipment package (~$1,150/kW — TG set, HX, ACC, pumps, controls, electrical)
   2. Installation adders (BOP piping, civil, E&I, construction, engineering, commissioning)
   3. Contingency on all above (AACE Class 4)
-  → Total installed surface facility cost (~$2,500/kW before optimization)
-  + T&D and gathering (display-only, not in surface facility optimization)
+  4. Gathering system (injection pumps, brine piping to wells)
+  5. T&D (highlines, transformers, relays, interconnection)
+  → Total installed = all surface facilities, wellhead to interconnect
 """
 
 import math
@@ -49,9 +50,9 @@ COST_FACTORS = {
     "engineering_pct": 10,              # % of equipment — engineering & procurement
     "commissioning_per_kw": 65,         # $/kW gross — commissioning & startup
     "contingency_pct": 10,              # % of all above — AACE Class 4
-    # ── Project cost display items (NOT in surface facility optimization) ──
-    "td_per_kw": 355,                   # $/kW — transmission & distribution
-    "gathering_per_kw": 860,            # $/kW — wellfield gathering system
+    # ── Gathering & T&D (included in total installed cost) ──
+    "gathering_per_kw": 860,            # $/kW net — injection pumps, brine piping to wells
+    "td_per_kw": 355,                   # $/kW net — highlines, transformers, relays, interconnect
     # ── Hybrid wet/dry & dual pressure parametric factors ──
     "water_system_per_kw": 50,          # $/kW gross for hybrid wet/dry water system
     "hybrid_acc_bay_reduction": 0.17,   # 17% fewer ACC bays for hybrid
@@ -503,7 +504,7 @@ def _apply_indirect_costs(costs, inp, gross_power_kw=0, net_power_kw=None):
 
         cont_pct = inp.get("uc_contingency_pct", COST_FACTORS["contingency_pct"])
         costs["contingency"] = total_before_cont * cont_pct / 100
-        costs["total_installed"] = total_before_cont + costs["contingency"]
+        costs["plant_installed"] = total_before_cont + costs["contingency"]
     else:
         # New installation cost stack (calibrated to vendor EPC data)
         # Uses strategy-aware cost factors (procurement_strategy in inp)
@@ -546,17 +547,23 @@ def _apply_indirect_costs(costs, inp, gross_power_kw=0, net_power_kw=None):
         # Contingency (% of all above)
         cont_pct = cf["contingency_pct"]
         costs["contingency"] = total_before_cont * cont_pct / 100
-        costs["total_installed"] = total_before_cont + costs["contingency"]
+        costs["plant_installed"] = total_before_cont + costs["contingency"]
 
-    # ── Display-only project cost adders (NOT in surface facility total) ──
-    # T&D and gathering use net power basis (deliverable capacity)
+    # ── Gathering & T&D (wellhead-to-interconnect scope) ──────────
+    # Use net power basis (deliverable capacity at interconnect)
+    # cf may not exist in legacy mode — use strategy-aware factors or baseline
+    if not use_legacy:
+        strategy = inp.get("procurement_strategy", "oem_lump_sum")
+        _cf = get_effective_cost_factors(strategy)
+    else:
+        _cf = COST_FACTORS
     net_kw = net_power_kw if net_power_kw and net_power_kw > 0 else gross_kw
-    td_per_kw = COST_FACTORS.get("td_per_kw", 0)
-    gathering_per_kw = COST_FACTORS.get("gathering_per_kw", 0)
-    costs["td_cost"] = td_per_kw * net_kw
-    costs["gathering_cost"] = gathering_per_kw * net_kw
-    costs["total_project_cost"] = (
-        costs["total_installed"] + costs["td_cost"] + costs["gathering_cost"]
+    costs["gathering"] = _cf.get("gathering_per_kw", 860) * net_kw
+    costs["td"] = _cf.get("td_per_kw", 355) * net_kw
+
+    # Total installed = plant + gathering + T&D (all surface facilities)
+    costs["total_installed"] = (
+        costs["plant_installed"] + costs["gathering"] + costs["td"]
     )
 
     return costs
@@ -832,6 +839,168 @@ def calculate_costs_b(states, propane_states, performance, inputs, duct_result=N
     return costs
 
 
+def calculate_costs_dual_pressure(dual_result: dict, inputs: dict) -> dict:
+    """Component-by-component installed cost for dual-pressure ORC (Config D).
+
+    Two pressure stages (HP + LP) sharing brine and ACC. Equipment priced
+    per-stage, installation applied once on combined total.
+
+    HP cycle: recuperated (2 turbines, 2 pumps, 1 vaporizer, 1 preheater, 2 recuperators)
+    LP cycle: basic (2 turbines, 2 pumps, 1 vaporizer, 1 preheater)
+    Shared: ACC (combined heat rejection)
+    """
+    inp = {**_default_inputs(), **inputs}
+    perf = dual_result["performance"]
+    hp_perf = dual_result["hp_performance"]
+    lp_perf = dual_result["lp_performance"]
+    hp_states = dual_result["hp_states"]
+    lp_states = dual_result["lp_states"]
+
+    # Get effective cost factors for the selected procurement strategy
+    strategy = inp.get("procurement_strategy", "oem_lump_sum")
+    cf = get_effective_cost_factors(strategy)
+
+    costs = {}
+    costs["procurement_strategy"] = strategy
+
+    # HX cost multiplier
+    hx_mult = inp.get("uc_hx_multiplier", 1.0)
+    uc_turb = inp.get("uc_turbine_per_kw", cf["turbine_per_kw"])
+
+    # ── HP Turbine-generator (per-train × N_TRAINS) ──
+    hp_tg_cost = hp_perf["gross_power_kw"] * uc_turb
+
+    # ── LP Turbine-generator (per-train × N_TRAINS) ──
+    lp_tg_cost = lp_perf["gross_power_kw"] * uc_turb
+
+    # Combined turbine_generator for downstream compat
+    costs["turbine_generator"] = hp_tg_cost + lp_tg_cost
+
+    # ── HP Iso pump (per-train × N_TRAINS) ──
+    hp_pump_power = hp_perf["m_dot_iso"] * hp_perf["w_pump"]  # BTU/hr
+    hp_pump_hp = hp_pump_power / 2544.43
+    hp_pump_cost = hp_pump_hp * cf["iso_pump_per_hp"]
+
+    # ── LP Iso pump (per-train × N_TRAINS) ──
+    lp_pump_power = lp_perf["m_dot_iso"] * lp_perf["w_pump"]
+    lp_pump_hp = lp_pump_power / 2544.43
+    lp_pump_cost = lp_pump_hp * cf["iso_pump_per_hp"]
+
+    costs["iso_pump"] = hp_pump_cost + lp_pump_cost
+
+    # ── HP Vaporizer (SHARED, sized at HP total flow) ──
+    Q_vap_hp = hp_perf["m_dot_iso"] * hp_perf["q_vaporizer"] / 1e6  # MMBtu/hr
+    T_geo_in = inp["T_geo_in"]
+    T_split = perf["T_split"]
+    dT1_vap_hp = T_geo_in - hp_states["1"].T
+    dT2_vap_hp = hp_perf["T_brine_mid"] - hp_states["7"].T
+    lmtd_vap_hp = _lmtd(dT1_vap_hp, dT2_vap_hp)
+    vap_area_hp = _hx_area(Q_vap_hp, lmtd_vap_hp, U_VALUES["vaporizer"])
+    uc_vap = inp.get("uc_vaporizer_per_ft2", cf["vaporizer_per_ft2"]) * hx_mult
+
+    # ── HP Preheater (SHARED, sized at HP total flow) ──
+    Q_pre_hp = hp_perf["m_dot_iso"] * hp_perf["q_preheater"] / 1e6
+    dT1_pre_hp = hp_perf["T_brine_mid"] - hp_states["7"].T
+    dT2_pre_hp = T_split - hp_states["6"].T
+    lmtd_pre_hp = _lmtd(dT1_pre_hp, dT2_pre_hp)
+    pre_area_hp = _hx_area(Q_pre_hp, lmtd_pre_hp, U_VALUES["preheater"])
+    uc_pre = inp.get("uc_preheater_per_ft2", cf["preheater_per_ft2"]) * hx_mult
+
+    # ── LP Vaporizer (SHARED, sized at LP total flow) ──
+    Q_vap_lp = lp_perf["m_dot_iso"] * lp_perf["q_vaporizer"] / 1e6
+    dT1_vap_lp = T_split - lp_states["1"].T
+    dT2_vap_lp = lp_perf["T_brine_mid"] - lp_states["7"].T
+    lmtd_vap_lp = _lmtd(dT1_vap_lp, dT2_vap_lp)
+    vap_area_lp = _hx_area(Q_vap_lp, lmtd_vap_lp, U_VALUES["vaporizer"])
+
+    # ── LP Preheater (SHARED, sized at LP total flow) ──
+    Q_pre_lp = lp_perf["m_dot_iso"] * lp_perf["q_preheater"] / 1e6
+    dT1_pre_lp = lp_perf["T_brine_mid"] - lp_states["7"].T
+    T_geo_out_min = inp["T_geo_out_min"]
+    dT2_pre_lp = lp_perf["T_geo_out_calc"] - lp_states["6"].T
+    lmtd_pre_lp = _lmtd(dT1_pre_lp, dT2_pre_lp)
+    pre_area_lp = _hx_area(Q_pre_lp, lmtd_pre_lp, U_VALUES["preheater"])
+
+    # Combined HX costs (HP + LP)
+    costs["vaporizer"] = (vap_area_hp + vap_area_lp) * uc_vap
+    costs["vaporizer_area_ft2"] = vap_area_hp + vap_area_lp
+    costs["preheater"] = (pre_area_hp + pre_area_lp) * uc_pre
+    costs["preheater_area_ft2"] = pre_area_hp + pre_area_lp
+
+    # ── HP Recuperator (per-train × N_TRAINS) ──
+    hp_m_dot_train = hp_perf["m_dot_iso"] / N_TRAINS
+    Q_recup_train = hp_m_dot_train * hp_perf["q_recup"] / 1e6
+    uc_rec = inp.get("uc_recuperator_per_ft2", cf["recup_per_ft2"]) * hx_mult
+    if Q_recup_train > 0:
+        dT1_r = hp_states["2"].T - hp_states["6"].T
+        dT2_r = hp_states["3"].T - hp_states["5"].T
+        lmtd_recup = _lmtd(dT1_r, dT2_r)
+        recup_area_train = _hx_area(Q_recup_train, lmtd_recup, U_VALUES["recuperator"])
+        costs["recuperator"] = recup_area_train * uc_rec * N_TRAINS
+        costs["recuperator_area_ft2"] = recup_area_train * N_TRAINS
+    else:
+        costs["recuperator"] = 0
+        costs["recuperator_area_ft2"] = 0
+
+    # ── Shared ACC (combined HP + LP heat rejection) ──
+    Q_reject_total = perf["Q_reject_mmbtu_hr"]
+    T_cond = perf["T_cond"]
+    # Use per-bay costing
+    n_bays = inp.get("n_fan_bays_computed", 10)
+    if "uc_acc_per_bay" in inp:
+        costs["acc"] = n_bays * inp["uc_acc_per_bay"]
+    else:
+        costs["acc"] = n_bays * cf["acc_per_bay"]
+    costs["acc_n_bays"] = n_bays
+    acc_area_total = _acc_face_area(Q_reject_total, T_cond, inp["T_ambient"])
+    costs["acc_area_ft2"] = acc_area_total
+
+    # ── Ductwork (allowance for complex dual-exhaust merge) ──
+    gross_kw = perf["gross_power_kw"]
+    costs["ductwork"] = 15 * gross_kw  # $15/kW allowance
+    costs["ductwork_segments"] = {}
+
+    # ── Structural steel (1.3x single-pressure for more equipment support) ──
+    # Estimate from gross power basis
+    steel_per_lb = inp.get("uc_steel_per_lb", cf["steel_per_lb"])
+    # Base estimate: ~0.5 lb/kW for single-pressure, 1.3x for dual
+    base_steel_weight = 0.5 * gross_kw * 1.3
+    costs["structural_steel"] = base_steel_weight * steel_per_lb
+    costs["structural_steel_weight_lb"] = base_steel_weight
+
+    # No propane intermediate components
+    costs["intermediate_hx"] = 0
+    costs["intermediate_hx_area_ft2"] = 0
+    costs["propane_system"] = 0
+
+    # Working fluid inventory (sized per gross kW — more fluid for two loops)
+    costs["wf_inventory"] = cf.get("wf_inventory_per_kw", 0) * gross_kw * 1.3
+
+    # Controls & instrumentation (more I/O points for dual-pressure)
+    costs["controls_instrumentation"] = cf.get("controls_instrumentation_per_kw", 0) * gross_kw * 1.2
+
+    # Electrical equipment
+    costs["electrical_equipment"] = cf.get("electrical_equipment_per_kw", 0) * gross_kw
+
+    # Equipment subtotal
+    equipment_keys = [
+        "turbine_generator", "iso_pump", "vaporizer", "preheater",
+        "recuperator", "acc", "ductwork", "structural_steel",
+        "intermediate_hx", "propane_system",
+        "wf_inventory", "controls_instrumentation", "electrical_equipment",
+    ]
+    costs["equipment_subtotal"] = sum(costs[k] for k in equipment_keys)
+
+    # Apply installation & indirect cost layers
+    _apply_indirect_costs(costs, inp, gross_power_kw=gross_kw)
+
+    # Equipment count: 2 HP turbines, 2 LP turbines, 2 HP pumps, 2 LP pumps,
+    #                  1 HP vap, 1 HP pre, 1 LP vap, 1 LP pre, 2 HP recups, ACC
+    costs["equipment_count"] = 4 * N_TRAINS + 5  # = 13
+
+    return costs
+
+
 def construction_schedule(duct_a):
     """
     Absolute phase-based construction schedules for Config A and Config B.
@@ -965,6 +1134,48 @@ def construction_schedule(duct_a):
 
     savings = a_total - b_total
 
+    # --- Config D: Dual-pressure construction ---
+    # More equipment pads, 4 TG sets + 4 HX vessels, HP/LP piping in parallel
+    d_phases = []
+    t = 0
+
+    # Civil & foundations (more equipment pads)
+    d_phases.append({"name": "Civil & foundations", "start": t, "end": t + 18,
+                     "duration": 18, "color": "gray", "critical": True, "track": "main"})
+    t += 18
+
+    # Equipment delivery (4 TG sets + 4 HX vessels)
+    d_phases.append({"name": "Equipment delivery & setting", "start": t, "end": t + 14,
+                     "duration": 14, "color": "steelblue", "critical": True, "track": "main"})
+    t += 14
+
+    # HP piping (parallel with LP piping — not on critical path unless longer)
+    hp_pipe_start = t
+    d_phases.append({"name": "HP piping & connections", "start": t, "end": t + 12,
+                     "duration": 12, "color": "indianred", "critical": True, "track": "hp_piping"})
+
+    # LP piping (parallel with HP piping)
+    d_phases.append({"name": "LP piping & connections", "start": t, "end": t + 12,
+                     "duration": 12, "color": "lightcoral", "critical": False, "track": "lp_piping"})
+    t += 12  # max(HP, LP) = 12
+
+    # ACC structure & tubes
+    d_phases.append({"name": "ACC structure & tubes", "start": t, "end": t + 10,
+                     "duration": 10, "color": "green", "critical": True, "track": "main"})
+
+    # E&I — 50% overlap with piping + ACC
+    ei_start_d = hp_pipe_start + 6
+    d_phases.append({"name": "E&I", "start": ei_start_d, "end": ei_start_d + 10,
+                     "duration": 10, "color": "orange", "critical": False, "track": "main"})
+    t += 10  # ACC finishes
+
+    # Commissioning
+    d_phases.append({"name": "Commissioning", "start": t, "end": t + 8,
+                     "duration": 8, "color": "darkblue", "critical": True, "track": "main"})
+    t += 8
+
+    d_total = t  # 18 + 14 + 12 + 10 + 8 = 62
+
     return {
         "config_a": {
             "total_weeks": a_total,
@@ -973,6 +1184,10 @@ def construction_schedule(duct_a):
         "config_b": {
             "total_weeks": b_total,
             "phases": b_phases,
+        },
+        "config_d": {
+            "total_weeks": d_total,
+            "phases": d_phases,
         },
         "schedule_savings_weeks": savings,
         "schedule_savings_months": savings / 4.33,

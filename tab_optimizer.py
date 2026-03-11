@@ -1,11 +1,12 @@
 """
 Autonomous ORC Optimizer — Streamlit UI tab.
 
-Four sub-tabs:
+Five sub-tabs:
   1. Controls & Status — Start/Pause/Reset, live progress, best config
   2. Pareto Frontier — Scatter plot (efficiency vs $/kW), Pareto line
   3. Run History — Filterable results table
   4. Step Change Analysis — Incremental vs transformative cost pathways
+  5. FEED Package — Preliminary Front-End Engineering Design deliverables
 
 Execution model: ONE config per st.rerun() cycle for live UI updates.
 """
@@ -38,6 +39,7 @@ from optimizer_engine import (
     AI_GUIDED_MAX_ROUNDS,
     AI_GUIDED_BATCH_SIZE,
     COMPLEXITY_PENALTIES,
+    TURBINE_MARKET_LIMIT_MW,
 )
 from cost_model import STRATEGY_LABELS, STRATEGY_SHORT_LABELS
 from step_change_analysis import render_step_change_subtab
@@ -70,6 +72,9 @@ def _init_session_state():
         "dbd_update_phase": "idle",      # idle|preview|generating|preview_diff|reviewing|applying|complete
         "dbd_update_review_index": 0,
         "dbd_update_error": None,
+        # FEED package
+        "opt_feed_run_id": None,
+        "opt_feed_data": None,
     }
     for key, val in defaults.items():
         if key not in st.session_state:
@@ -317,8 +322,9 @@ def render_optimizer_tab(design_basis: dict):
                 st.session_state["dbd_update_phase"] = "preview"
 
     # ── Sub-tabs ─────────────────────────────────────────────────────
-    sub1, sub2, sub3, sub4 = st.tabs([
-        "Controls & Status", "Pareto Frontier", "Run History", "Step Change Analysis"
+    sub1, sub2, sub3, sub4, sub5 = st.tabs([
+        "Controls & Status", "Pareto Frontier", "Run History",
+        "Step Change Analysis", "FEED Package",
     ])
 
     with sub1:
@@ -332,6 +338,9 @@ def render_optimizer_tab(design_basis: dict):
 
     with sub4:
         render_step_change_subtab(store)
+
+    with sub5:
+        _render_feed_subtab(store, design_basis)
 
 
 def _render_controls(design_basis: dict, store: ResultStore):
@@ -1018,6 +1027,14 @@ def _render_pareto(store: ResultStore):
         pareto_rows = []
         for r in sorted(pareto, key=lambda x: x.total_adjusted_per_kW):
             cfg = r.config
+            # Turbine layout string
+            if r.n_turbine_units == 4:
+                turb_str = f"2x{r.hp_turbine_mw:.1f}+2x{r.lp_turbine_mw:.1f}"
+            elif r.n_turbine_units > 0:
+                turb_str = f"2x{r.hp_turbine_mw:.1f}"
+            else:
+                turb_str = "-"
+            mkt_str = "OK" if r.turbine_market_ok else "OVER"
             pareto_rows.append({
                 "Run": r.run_id,
                 "Fluid": cfg.get("working_fluid", "?"),
@@ -1030,6 +1047,8 @@ def _render_pareto(store: ResultStore):
                 "Cmplx $/kW": f"${r.complexity_per_kW:,.0f}",
                 "Adj $/kW": f"${r.total_adjusted_per_kW:,.0f}",
                 "Net MW": f"{r.net_power_MW:.2f}",
+                "Turbines": turb_str,
+                "Mkt": mkt_str,
                 "NPV ($M)": f"{r.npv_USD/1e6:.1f}",
                 "Schedule": f"{r.construction_weeks} wk",
                 "Target": "HIT" if r.target_fit else "",
@@ -1086,6 +1105,13 @@ def _render_history(store: ResultStore):
         if pareto_only and not r.pareto_optimal:
             continue
 
+        # Turbine layout
+        if r.converged and r.n_turbine_units == 4:
+            turb_hist = f"2x{r.hp_turbine_mw:.1f}+2x{r.lp_turbine_mw:.1f}"
+        elif r.converged and r.n_turbine_units > 0:
+            turb_hist = f"2x{r.hp_turbine_mw:.1f}"
+        else:
+            turb_hist = "-"
         rows.append({
             "Run": r.run_id,
             "Fluid": fl,
@@ -1102,6 +1128,7 @@ def _render_history(store: ResultStore):
             "Cmplx": f"${r.complexity_per_kW:,.0f}" if r.converged else "-",
             "Adj $/kW": f"${r.total_adjusted_per_kW:,.0f}" if r.converged else "-",
             "Net MW": f"{r.net_power_MW:.2f}" if r.converged else "-",
+            "Turbines": turb_hist,
             "Time": f"{r.duration_seconds:.1f}s" if r.duration_seconds else "-",
             "Pareto": "Y" if r.pareto_optimal else "",
             "Target": "HIT" if r.target_fit else "",
@@ -1122,6 +1149,35 @@ def _render_history(store: ResultStore):
                 sel = next((r for r in store.results if r.run_id == sel_id), None)
                 if sel:
                     _render_config_breakdown(sel)
+
+            # FEED Light Package trigger
+            st.divider()
+            st.subheader("FEED Light Package")
+            feed_id = st.selectbox(
+                "Select run for FEED package", run_ids, key="opt_feed_select",
+            )
+            if st.button("Generate FEED Package", type="primary", key="opt_feed_btn"):
+                st.session_state["opt_feed_run_id"] = feed_id
+                st.session_state["opt_feed_data"] = None  # clear cache
+                st.rerun()
+
+
+def _render_feed_subtab(store: ResultStore, design_basis: dict):
+    """FEED Package sub-tab — renders full FEED Light for selected run."""
+    from feed_package import render_feed_package
+
+    feed_id = st.session_state.get("opt_feed_run_id")
+    if feed_id is None:
+        st.info("Select a run from the **Run History** tab and click 'Generate FEED Package'.")
+        return
+    result = next((r for r in store.results if r.run_id == feed_id), None)
+    if result is None:
+        st.warning(f"Run #{feed_id} not found in result store.")
+        return
+    if not result.converged:
+        st.error(f"Run #{feed_id} did not converge — cannot generate FEED package.")
+        return
+    render_feed_package(result, design_basis)
 
 
 def _render_top_configs_report(store: ResultStore, stats: dict):
@@ -1166,6 +1222,21 @@ def _render_top_configs_report(store: ResultStore, stats: dict):
             c11.metric("LCOE", f"${r.lcoe_per_MWh:.1f}/MWh")
             c12.metric("Target Fit", fit_str)
 
+            # Turbine layout line
+            if r.n_turbine_units == 4:
+                mkt_icon = " OK" if r.turbine_market_ok else " OVER 20MW"
+                turb_line = (
+                    f"2x HP @ {r.hp_turbine_mw:.1f} MW + "
+                    f"2x LP @ {r.lp_turbine_mw:.1f} MW "
+                    f"({r.n_turbine_units} units){mkt_icon}"
+                )
+            elif r.n_turbine_units > 0:
+                mkt_icon = " OK" if r.turbine_market_ok else " OVER 20MW"
+                turb_line = f"2x @ {r.hp_turbine_mw:.1f} MW ({r.n_turbine_units} units){mkt_icon}"
+            else:
+                turb_line = "-"
+            st.markdown(f"**Turbine Layout:** {turb_line}")
+
             st.markdown("**Pinch Points:**")
             st.caption(
                 f"Vaporizer: {cfg.get('vaporizer_pinch_F','?')} F  |  "
@@ -1209,6 +1280,8 @@ def _render_top_configs_report(store: ResultStore, stats: dict):
             "ACC F": cfg.get("acc_approach_F", ""),
             "Pre F": cfg.get("preheater_pinch_F", ""),
             "Rec F": cfg.get("recuperator_pinch_F", ""),
+            "HP MW": r.hp_turbine_mw if r.hp_turbine_mw > 0 else "",
+            "LP MW": r.lp_turbine_mw if r.lp_turbine_mw > 0 else "",
         })
     if rows:
         df = pd.DataFrame(rows)

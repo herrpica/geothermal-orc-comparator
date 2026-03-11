@@ -46,9 +46,11 @@ TARGET_MAX_NET_MW = 57.0
 COMPLEXITY_PENALTIES = {
     "recuperator": 18,          # thermal cycling, fluid inventory, pinch degradation
     "propane_intermediate": 50, # leak risk, regulatory, fluid mgmt, isolation valves
-    "dual_pressure": 100,       # 2x rotating equipment, 2x HX sets, 2x controls
+    "dual_pressure": 40,        # 2x rotating equipment, 2x HX sets, 2x controls (real model captures equipment cost)
     "hybrid_wet_dry": 30,       # water treatment, seasonal switchover, freeze protection
 }
+
+TURBINE_MARKET_LIMIT_MW = 40.0  # ORC turbine market max per unit (gross shaft power)
 
 
 def calculate_complexity_penalty(cfg: "OptConfig") -> float:
@@ -99,8 +101,9 @@ class OptConfig:
 
     def to_tool_input(self) -> dict:
         """Convert to run_orc_analysis tool_input format."""
-        # hybrid_wet_dry uses Config A thermo model; propane_intermediate uses Config B
-        if self.heat_rejection in ("direct_acc", "hybrid_wet_dry"):
+        if self.topology == "dual_pressure":
+            config = "D"
+        elif self.heat_rejection in ("direct_acc", "hybrid_wet_dry"):
             config = "A"
         else:
             config = "B"
@@ -112,7 +115,7 @@ class OptConfig:
             "preheater_approach_delta_F": self.preheater_pinch_F,
             "procurement_strategy": self.procurement_strategy,
         }
-        # dual_pressure uses same thermo as recuperated
+        # dual_pressure and recuperated both use recuperator pinch
         if self.topology in ("recuperated", "dual_pressure"):
             ti["recuperator_approach_delta_F"] = self.recuperator_pinch_F
         else:
@@ -124,6 +127,9 @@ class OptConfig:
         """Filter invalid combinations."""
         # Can't use propane as working fluid with propane intermediate loop
         if self.working_fluid == "propane" and self.heat_rejection == "propane_intermediate":
+            return False
+        # Dual-pressure + propane IHX is invalid (dual-P uses shared ACC, not IHX)
+        if self.topology == "dual_pressure" and self.heat_rejection == "propane_intermediate":
             return False
         # Validate procurement strategy
         if self.procurement_strategy not in PROCUREMENT_STRATEGIES:
@@ -166,6 +172,10 @@ class OptResult:
     complexity_per_kW: float = 0.0
     total_adjusted_per_kW: float = 0.0  # capex_per_kW + complexity_per_kW
     procurement_strategy: str = "oem_lump_sum"
+    hp_turbine_mw: float = 0.0       # per-unit HP turbine size (hp_gross / N_TRAINS)
+    lp_turbine_mw: float = 0.0       # per-unit LP turbine size (lp_gross / N_TRAINS)
+    n_turbine_units: int = 0          # total turbine count (2 for single-P, 4 for dual-P)
+    turbine_market_ok: bool = True    # all units <= TURBINE_MARKET_LIMIT_MW
     bom_per_kw: dict = field(default_factory=dict)
     parasitic_breakdown: dict = field(default_factory=dict)
     thermal_detail: dict = field(default_factory=dict)
@@ -201,7 +211,7 @@ class ResultStore:
                 with open(self.path, "r", encoding="utf-8") as f:
                     data = json.load(f)
                 self.results = []
-                _bool_fields = {"converged", "schedule_fit", "target_fit", "pareto_optimal"}
+                _bool_fields = {"converged", "schedule_fit", "target_fit", "pareto_optimal", "turbine_market_ok"}
                 for d in data:
                     clean = {k: v for k, v in d.items()
                              if k in OptResult.__dataclass_fields__}
@@ -222,7 +232,7 @@ class ResultStore:
         for r in self.results:
             d = asdict(r)
             # Ensure booleans are actual bools, not numpy.bool_ or other types
-            for bf in ("converged", "schedule_fit", "target_fit", "pareto_optimal"):
+            for bf in ("converged", "schedule_fit", "target_fit", "pareto_optimal", "turbine_market_ok"):
                 if bf in d:
                     d[bf] = bool(d[bf])
             rows.append(d)
@@ -350,8 +360,10 @@ def update_pareto_frontier(store: ResultStore):
 def reevaluate_targets(store: ResultStore):
     """Recompute schedule_fit, target_fit, pareto for all results against current thresholds.
 
-    Also recomputes complexity_per_kW and total_adjusted_per_kW from config data.
+    Also recomputes complexity_per_kW and total_adjusted_per_kW from config data,
+    and turbine sizing fields for backward compat with stored results.
     """
+    N_TRAINS_SIZE = 2
     for r in store.results:
         # Recompute complexity from stored config
         cfg_data = r.config or {}
@@ -368,6 +380,26 @@ def reevaluate_targets(store: ResultStore):
             complexity += COMPLEXITY_PENALTIES["hybrid_wet_dry"]
         r.complexity_per_kW = complexity
         r.total_adjusted_per_kW = r.capex_per_kW + complexity
+
+        # Recompute turbine sizing if not already set
+        if r.n_turbine_units == 0 and r.converged and r.gross_power_MW > 0:
+            if topo == "dual_pressure":
+                # For old stored results without hp/lp breakdown, estimate 60/40 split
+                td = r.thermal_detail or {}
+                hp_kw = td.get("hp_gross_power_kw", r.gross_power_MW * 1000 * 0.6)
+                lp_kw = td.get("lp_gross_power_kw", r.gross_power_MW * 1000 * 0.4)
+                r.hp_turbine_mw = round(hp_kw / 1000 / N_TRAINS_SIZE, 2) if hp_kw else 0
+                r.lp_turbine_mw = round(lp_kw / 1000 / N_TRAINS_SIZE, 2) if lp_kw else 0
+                r.n_turbine_units = 4
+                r.turbine_market_ok = (
+                    r.hp_turbine_mw <= TURBINE_MARKET_LIMIT_MW
+                    and r.lp_turbine_mw <= TURBINE_MARKET_LIMIT_MW
+                )
+            else:
+                r.hp_turbine_mw = round(r.gross_power_MW / N_TRAINS_SIZE, 2)
+                r.lp_turbine_mw = 0.0
+                r.n_turbine_units = 2
+                r.turbine_market_ok = r.hp_turbine_mw <= TURBINE_MARKET_LIMIT_MW
 
         r.schedule_fit = bool(r.construction_weeks <= TARGET_SCHEDULE_WEEKS)
         r.target_fit = bool(
@@ -521,26 +553,25 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
         equip_kw = equip_kw_raw / net_kw if net_kw > 0 else equip_kw
         warnings.append("hybrid_wet_dry: ACC bays reduced 17%, +$50/kW water system")
 
+    # ── Turbine sizing (all topologies) ──────────────────────────
+    N_TRAINS_SIZE = 2
     if cfg.topology == "dual_pressure" and converged:
-        # Apply +3% efficiency gain and additional HX cost
-        eff_gain = CF["dual_pressure_efficiency_gain"]
-        hx_per_kw = CF["dual_pressure_hx_per_kw"]
-        sched_add = CF["dual_pressure_schedule_weeks"]
-        # Adjust efficiency and power
-        old_eff = efficiency
-        efficiency = old_eff + eff_gain
-        if old_eff > 0:
-            power_scale = efficiency / old_eff
-            gross_mw *= power_scale
-            net_mw *= power_scale
-        # Additional HX cost
-        dual_hx_cost = hx_per_kw * gross_mw * 1000
-        capex += dual_hx_cost
-        net_kw = net_mw * 1000 if net_mw > 0 else 1
-        capex_kw = capex / net_kw if net_kw > 0 else capex_kw
-        # Schedule impact
-        weeks += sched_add
-        warnings.append(f"dual_pressure: +{eff_gain*100:.0f}% eff, +${hx_per_kw}/kW HX, +{sched_add}wk")
+        hp_gross_kw = output.get("_detail", {}).get("hp_gross_power_kw", 0)
+        lp_gross_kw = output.get("_detail", {}).get("lp_gross_power_kw", 0)
+        hp_turb = hp_gross_kw / 1000 / N_TRAINS_SIZE if hp_gross_kw > 0 else 0
+        lp_turb = lp_gross_kw / 1000 / N_TRAINS_SIZE if lp_gross_kw > 0 else 0
+        n_units = 4  # 2 HP + 2 LP
+        market_ok = hp_turb <= TURBINE_MARKET_LIMIT_MW and lp_turb <= TURBINE_MARKET_LIMIT_MW
+    elif converged:
+        hp_turb = gross_mw / N_TRAINS_SIZE if gross_mw > 0 else 0
+        lp_turb = 0.0
+        n_units = 2
+        market_ok = hp_turb <= TURBINE_MARKET_LIMIT_MW
+    else:
+        hp_turb = 0.0
+        lp_turb = 0.0
+        n_units = 0
+        market_ok = True
 
     # BOM per kW breakdown (equipment + installation items)
     detail = output.get("_detail", {})
@@ -551,7 +582,8 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
                 "intermediate_hx", "propane_system",
                 "bop_piping", "civil_structural", "ei_installation",
                 "construction_labor", "engineering", "commissioning",
-                "contingency", "equipment_subtotal"]:
+                "contingency", "equipment_subtotal",
+                "gathering", "td", "plant_installed"]:
         cost_val = detail.get(f"cost_{key}", 0)
         bom_per_kw[key] = round(cost_val / net_kw, 1) if net_kw > 0 else 0
 
@@ -617,6 +649,10 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
         npv_USD=round(npv, 0),
         lcoe_per_MWh=round(lcoe, 1),
         procurement_strategy=cfg.procurement_strategy,
+        hp_turbine_mw=round(hp_turb, 2),
+        lp_turbine_mw=round(lp_turb, 2),
+        n_turbine_units=n_units,
+        turbine_market_ok=market_ok,
         bom_per_kw=bom_per_kw,
         parasitic_breakdown=parasitic_breakdown,
         thermal_detail=thermal_detail_dict,
@@ -864,9 +900,19 @@ COMPLEXITY PENALTIES (NPV of lifecycle costs beyond minimum viable design):
   - basic + direct_acc:   $0/kW   (minimum viable — reference design)
   Penalties are additive: recuperated + propane = ${COMPLEXITY_PENALTIES['recuperator'] + COMPLEXITY_PENALTIES['propane_intermediate']}/kW.
 
-IMPORTANT: Minimize total_adjusted_per_kW = installed_$/kW + complexity_$/kW, NOT just installed_$/kW.
-A basic/ACC config at $1,600/kW beats a recuperated/propane config at $1,550/kW
-because $1,550 + $68 complexity = $1,618 > $1,600.
+COST BASIS — ALL-IN SURFACE FACILITIES (wellhead to interconnect):
+  Total installed $/kW = plant_installed + gathering + T&D + complexity.
+  - Plant installed: equipment + BOP + civil + E&I + construction + engineering + contingency
+  - Gathering ($860/kW baseline): injection pumps, brine piping, wellfield headers, reinjection lines
+  - T&D ($355/kW baseline): highlines, GSU transformers, protection relays, interconnection
+  - Complexity: NPV of lifecycle cost for non-basic topology choices
+  Gathering + T&D = ~$1,215/kW — the largest single cost block and the biggest opportunity for reduction.
+
+IMPORTANT: Minimize total_adjusted_per_kW = installed_$/kW + complexity_$/kW, NOT just plant_$/kW.
+The $2,000/kW target is ASPIRATIONAL for all-in surface cost. Current best configs will be ~$3,000-3,500/kW.
+The optimizer's job is to minimize the controllable plant cost; the Step Change Analysis tab
+shows pathways to close the remaining gap through gathering simplification, T&D sharing,
+supplier volume contracts, and technology innovation.
 
 SEARCH SPACE:
 - Working fluids: {', '.join(WORKING_FLUIDS)}
