@@ -180,6 +180,8 @@ class OptResult:
     total_adjusted_per_kW: float = 0.0  # capex_per_kW + complexity_per_kW
     procurement_strategy: str = "oem_lump_sum"
     n_trains: int = 2
+    n_units: int = 1                   # identical ORC plants at site (multi-unit discount)
+    multi_unit_savings_pct: float = 0.0
     hp_turbine_mw: float = 0.0       # per-unit HP turbine size (hp_gross / n_trains)
     lp_turbine_mw: float = 0.0       # per-unit LP turbine size (lp_gross / n_trains)
     n_turbine_units: int = 0          # total turbine count (2 for single-P, 4 for dual-P)
@@ -578,18 +580,22 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
         lp_gross_kw = output.get("_detail", {}).get("lp_gross_power_kw", 0)
         hp_turb = hp_gross_kw / 1000 / n_trains if hp_gross_kw > 0 else 0
         lp_turb = lp_gross_kw / 1000 / n_trains if lp_gross_kw > 0 else 0
-        n_units = 2 * n_trains  # HP + LP per train
+        n_turb_units = 2 * n_trains  # HP + LP per train
         market_ok = hp_turb <= TURBINE_MARKET_LIMIT_MW and lp_turb <= TURBINE_MARKET_LIMIT_MW
     elif converged:
         hp_turb = gross_mw / n_trains if gross_mw > 0 else 0
         lp_turb = 0.0
-        n_units = n_trains
+        n_turb_units = n_trains
         market_ok = hp_turb <= TURBINE_MARKET_LIMIT_MW
     else:
         hp_turb = 0.0
         lp_turb = 0.0
-        n_units = 0
+        n_turb_units = 0
         market_ok = True
+
+    # ── Multi-unit site economics ────────────────────────────────
+    site_n_units = design_basis.get("n_units", 1)
+    multi_unit_savings = output.get("_detail", {}).get("multi_unit_savings_pct", 0.0)
 
     # BOM per kW breakdown (equipment + installation items)
     detail = output.get("_detail", {})
@@ -668,9 +674,11 @@ def run_single_config(cfg: OptConfig, design_basis: dict, store: ResultStore) ->
         lcoe_per_MWh=round(lcoe, 1),
         procurement_strategy=cfg.procurement_strategy,
         n_trains=cfg.n_trains,
+        n_units=site_n_units,
+        multi_unit_savings_pct=round(multi_unit_savings, 1),
         hp_turbine_mw=round(hp_turb, 2),
         lp_turbine_mw=round(lp_turb, 2),
-        n_turbine_units=n_units,
+        n_turbine_units=n_turb_units,
         turbine_market_ok=market_ok,
         bom_per_kw=bom_per_kw,
         parasitic_breakdown=parasitic_breakdown,

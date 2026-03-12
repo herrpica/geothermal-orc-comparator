@@ -26,6 +26,7 @@ from cost_model import (
     construction_schedule,
     acc_area_with_air_rise,
     pump_sizing,
+    apply_multi_unit_economics,
 )
 
 # ── Unit conversions ────────────────────────────────────────────────────────
@@ -99,6 +100,10 @@ def design_basis_to_inputs(design_basis: dict) -> dict:
         inp["dt_pinch_acc_a"] = design_basis["dt_pinch_acc"]
         inp["dt_pinch_acc_b"] = design_basis["dt_pinch_acc"]
 
+    # Multi-unit site (N identical ORC plants)
+    if "n_units" in design_basis:
+        inp["n_units"] = design_basis["n_units"]
+
     # Cost overrides — only pass through when NO procurement strategy will be
     # specified.  When a strategy IS used (optimizer path), the strategy's cost
     # factors must control equipment and construction costs; sidebar defaults
@@ -151,6 +156,10 @@ def tool_input_to_inputs(tool_input: dict, config: str) -> dict:
     # Turbine trains (1, 2, or 3 parallel trains)
     if "turbine_trains" in tool_input:
         inp["n_trains"] = tool_input["turbine_trains"]
+
+    # Multi-unit site (N identical ORC plants)
+    if "n_units" in tool_input:
+        inp["n_units"] = tool_input["n_units"]
 
     # Pressure drop fractions — scale default equipment dP values
     # Default dP values (psi) from thermodynamics._default_inputs():
@@ -296,6 +305,11 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
     gross_power_kw = power_bal["P_gross"]
     total_parasitic_kw = power_bal["W_total_parasitic"]
 
+    # ── Multi-unit site economics ─────────────────────────────────────
+    n_units = inputs.get("n_units", 1)
+    if n_units > 1:
+        apply_multi_unit_economics(costs, n_units)
+
     # ── Lifecycle economics ─────────────────────────────────────────────
     lc = lifecycle_cost(costs["total_installed"], net_power_kw, inputs)
 
@@ -379,6 +393,8 @@ def run_orc_analysis(tool_input: dict, design_basis: dict) -> dict:
             "working_fluid": inputs.get("working_fluid", "isopentane"),
             "procurement_strategy": inputs.get("procurement_strategy", "oem_lump_sum"),
             "n_trains": inputs.get("n_trains", 2),
+            "n_units": n_units,
+            "multi_unit_savings_pct": costs.get("multi_unit_savings_pct", 0.0),
             "T_cond_F": perf["T_cond"],
             "T_evap_F": perf["T_evap"],
             "P_high_psia": perf["P_high"],
@@ -585,6 +601,12 @@ RUN_ORC_ANALYSIS_TOOL = {
                 "type": "integer",
                 "enum": [1, 2, 3],
                 "description": "Number of parallel turbine/ACC trains (1, 2, or 3). Affects per-unit turbine sizing and ductwork.",
+            },
+            "n_units": {
+                "type": "integer",
+                "description": "Number of identical ORC units at the site (1-10). Bulk procurement and construction learning curve reduce per-unit cost.",
+                "minimum": 1,
+                "maximum": 10,
             },
             "isopentane_pressure_drop_fraction": {
                 "type": "number",

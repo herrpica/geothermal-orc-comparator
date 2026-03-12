@@ -569,6 +569,137 @@ def _apply_indirect_costs(costs, inp, gross_power_kw=0, net_power_kw=None):
     return costs
 
 
+# ── Multi-unit site economics ─────────────────────────────────────────────
+# When building N identical ORC units at one site, per-unit costs drop due to:
+#   - Equipment bulk procurement (volume discounts on TG, HX, ACC, pumps)
+#   - Engineering reuse (design once, replicate N times)
+#   - Construction learning curve (crews faster on repeat units)
+#   - Single mobilization (mob/demob shared across all units)
+#   - Commissioning efficiency (repeat startup procedures)
+#
+# Discount model calibrated to EPC multi-unit geothermal project data.
+# Discounts apply to per-unit cost; total site cost = per_unit × n_units.
+
+MULTI_UNIT_DISCOUNTS = {
+    # (n_units): {cost_category: fractional_discount}
+    # n_units=1 is baseline (no discount)
+    1: {"equipment": 0.00, "engineering": 0.00, "construction": 0.00, "commissioning": 0.00},
+    2: {"equipment": 0.05, "engineering": 0.40, "construction": 0.10, "commissioning": 0.15},
+    3: {"equipment": 0.08, "engineering": 0.50, "construction": 0.15, "commissioning": 0.20},
+    4: {"equipment": 0.10, "engineering": 0.55, "construction": 0.18, "commissioning": 0.22},
+    5: {"equipment": 0.12, "engineering": 0.58, "construction": 0.20, "commissioning": 0.25},
+}
+
+
+def _get_multi_unit_discounts(n_units: int) -> dict:
+    """Return discount fractions for a given unit count, interpolating if needed."""
+    if n_units <= 1:
+        return MULTI_UNIT_DISCOUNTS[1]
+    if n_units in MULTI_UNIT_DISCOUNTS:
+        return MULTI_UNIT_DISCOUNTS[n_units]
+    # For n > 5, cap at n=5 discounts (diminishing returns plateau)
+    if n_units >= 5:
+        return MULTI_UNIT_DISCOUNTS[5]
+    # Linear interpolation between defined points
+    lo = max(k for k in MULTI_UNIT_DISCOUNTS if k <= n_units)
+    hi = min(k for k in MULTI_UNIT_DISCOUNTS if k >= n_units)
+    frac = (n_units - lo) / (hi - lo) if hi != lo else 0
+    return {
+        cat: MULTI_UNIT_DISCOUNTS[lo][cat] + frac * (MULTI_UNIT_DISCOUNTS[hi][cat] - MULTI_UNIT_DISCOUNTS[lo][cat])
+        for cat in MULTI_UNIT_DISCOUNTS[lo]
+    }
+
+
+def apply_multi_unit_economics(costs: dict, n_units: int) -> dict:
+    """Apply multi-unit site discounts to a single-unit cost dict.
+
+    Modifies costs in-place. Stores original single-unit values with '_1u' suffix
+    and the per-unit discounted values as the primary keys.
+
+    Returns costs dict (mutated).
+    """
+    if n_units <= 1:
+        costs["n_units"] = 1
+        costs["multi_unit_savings_pct"] = 0.0
+        return costs
+
+    disc = _get_multi_unit_discounts(n_units)
+    original_total = costs.get("total_installed", 0)
+
+    # Save single-unit baseline
+    costs["total_installed_1u"] = original_total
+    costs["plant_installed_1u"] = costs.get("plant_installed", 0)
+    costs["equipment_subtotal_1u"] = costs.get("equipment_subtotal", 0)
+
+    # ── Equipment discount (bulk procurement) ──
+    equip_discount = disc["equipment"]
+    equipment_keys = [
+        "turbine_generator", "iso_pump", "vaporizer", "preheater",
+        "recuperator", "acc", "intermediate_hx", "propane_system",
+        "wf_inventory", "controls_instrumentation", "electrical_equipment",
+    ]
+    equip_savings = 0
+    for k in equipment_keys:
+        if k in costs and costs[k] > 0:
+            saving = costs[k] * equip_discount
+            costs[k] -= saving
+            equip_savings += saving
+
+    # Recalculate equipment_subtotal
+    costs["equipment_subtotal"] = sum(costs.get(k, 0) for k in equipment_keys)
+    costs["equipment_cost"] = costs["equipment_subtotal"]
+
+    # ── Engineering discount (design reuse) ──
+    eng_discount = disc["engineering"]
+    if "engineering" in costs:
+        costs["engineering"] *= (1 - eng_discount)
+
+    # ── Construction discount (learning curve + single mob) ──
+    con_discount = disc["construction"]
+    for k in ["construction_labor", "construction_mgmt", "civil_structural",
+              "foundation", "ei_installation", "bop_piping"]:
+        if k in costs and costs[k] > 0:
+            costs[k] *= (1 - con_discount)
+
+    # Ductwork and structural steel also benefit from construction learning
+    for k in ["ductwork", "structural_steel"]:
+        if k in costs and costs[k] > 0:
+            costs[k] *= (1 - con_discount)
+
+    # ── Commissioning discount (repeat procedures) ──
+    com_discount = disc["commissioning"]
+    if "commissioning" in costs:
+        costs["commissioning"] *= (1 - com_discount)
+
+    # ── Recalculate totals ──
+    # Recompute plant_installed from discounted components
+    total_before_cont = (
+        costs["equipment_subtotal"]
+        + costs.get("bop_piping", 0) + costs.get("civil_structural", 0)
+        + costs.get("ei_installation", 0) + costs.get("construction_labor", 0)
+        + costs.get("engineering", 0) + costs.get("commissioning", 0)
+    )
+    # Reapply contingency at same percentage
+    old_cont_pct = 0
+    old_tbc = costs.get("total_before_contingency", 0)
+    if old_tbc > 0:
+        old_cont_pct = costs.get("contingency", 0) / old_tbc
+    costs["total_before_contingency"] = total_before_cont
+    costs["contingency"] = total_before_cont * old_cont_pct
+    costs["plant_installed"] = total_before_cont + costs["contingency"]
+
+    # Gathering and T&D don't change (infrastructure scope per unit)
+    costs["total_installed"] = (
+        costs["plant_installed"] + costs.get("gathering", 0) + costs.get("td", 0)
+    )
+
+    costs["n_units"] = n_units
+    savings_pct = (1 - costs["total_installed"] / original_total) * 100 if original_total > 0 else 0
+    costs["multi_unit_savings_pct"] = round(savings_pct, 1)
+
+    return costs
+
+
 def calculate_costs_a(states, performance, inputs, duct_result=None) -> dict:
     """Component-by-component installed cost for Config A.
 

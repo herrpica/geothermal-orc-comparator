@@ -147,11 +147,19 @@ def render_optimizer_tab(design_basis: dict):
     # Re-evaluate all results against current thresholds
     reevaluate_targets(store)
 
+    _n_units_display = st.session_state.get("opt_n_units", 1) or 1
+    _units_label = f" | **{_n_units_display} identical units** (multi-unit discount)" if _n_units_display > 1 else ""
     st.caption(
         f"Target: **${user_capex:,.0f}/kW** installed cost | "
         f"**{user_schedule} weeks** schedule | "
         f"**{user_min_mw:.0f}–{user_max_mw:.0f} MW** net power band"
+        f"{_units_label}"
     )
+
+    # ── Inject multi-unit count into design_basis ──────────────────────
+    site_n_units = st.session_state.get("opt_n_units", 1)
+    if site_n_units and site_n_units > 1:
+        design_basis = {**design_basis, "n_units": site_n_units}
 
     # ── Single-config-per-rerun execution ──────────────────────────────
     if st.session_state["opt_running"] and not st.session_state["opt_paused"]:
@@ -401,6 +409,16 @@ def _render_controls(design_basis: dict, store: ResultStore):
         disabled=st.session_state["opt_running"],
     )
     selected_n_trains = sorted(selected_trains) or [2]
+
+    # ── Multi-unit site selector ──────────────────────────────────
+    n_units = st.number_input(
+        "Identical ORC units at site",
+        min_value=1, max_value=10, value=1, step=1,
+        help="Number of identical ORC plants. 2+ units get bulk procurement, "
+             "shared mobilization, and construction learning curve discounts.",
+        key="opt_n_units",
+        disabled=st.session_state["opt_running"],
+    )
 
     # ── Action buttons ─────────────────────────────────────────────
     col1, col2, col3, col4 = st.columns(4)
@@ -1255,6 +1273,8 @@ def _render_top_configs_report(store: ResultStore, stats: dict):
             else:
                 turb_line = "-"
             st.markdown(f"**Turbine Layout:** {turb_line}")
+            if r.n_units > 1:
+                st.markdown(f"**Site:** {r.n_units} identical units — {r.multi_unit_savings_pct:.1f}% per-unit savings")
 
             st.markdown("**Pinch Points:**")
             st.caption(
