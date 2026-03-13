@@ -912,6 +912,7 @@ DESIGN BASIS (fixed site conditions):
 - Ambient temperature: {design_basis.get('T_ambient_F', 'N/A')} °F
 - Turbine isentropic efficiency: {design_basis.get('eta_turbine', 'N/A')}
 - Pump isentropic efficiency: {design_basis.get('eta_pump', 'N/A')}
+- Identical ORC units at site: {design_basis.get('n_units', 1)} {"(multi-unit bulk/learning discounts applied to per-unit cost)" if design_basis.get('n_units', 1) > 1 else "(single unit)"}
 
 DESIGN RULES (from Design Basis Document):
 {philosophy_rules}

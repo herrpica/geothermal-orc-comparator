@@ -147,7 +147,8 @@ def render_optimizer_tab(design_basis: dict):
     # Re-evaluate all results against current thresholds
     reevaluate_targets(store)
 
-    _n_units_display = st.session_state.get("opt_n_units", 1) or 1
+    _n_units_display = st.session_state.get("opt_locked_n_units",
+                           st.session_state.get("opt_n_units", 1)) or 1
     _units_label = f" | **{_n_units_display} identical units** (multi-unit discount)" if _n_units_display > 1 else ""
     st.caption(
         f"Target: **${user_capex:,.0f}/kW** installed cost | "
@@ -157,9 +158,11 @@ def render_optimizer_tab(design_basis: dict):
     )
 
     # ── Inject multi-unit count into design_basis ──────────────────────
-    site_n_units = st.session_state.get("opt_n_units", 1)
+    # Use locked value (set at Start) during runs; fall back to widget value
+    site_n_units = st.session_state.get("opt_locked_n_units",
+                       st.session_state.get("opt_n_units", 1))
     if site_n_units and site_n_units > 1:
-        design_basis = {**design_basis, "n_units": site_n_units}
+        design_basis = {**design_basis, "n_units": int(site_n_units)}
 
     # ── Single-config-per-rerun execution ──────────────────────────────
     if st.session_state["opt_running"] and not st.session_state["opt_paused"]:
@@ -451,6 +454,7 @@ def _render_controls(design_basis: dict, store: ResultStore):
             st.session_state["opt_start_time"] = time.time()
             st.session_state["opt_config_times"] = []
             st.session_state["opt_selected_hr"] = selected_hr
+            st.session_state["opt_locked_n_units"] = n_units  # lock at start
             st.rerun()
 
     with col2:
