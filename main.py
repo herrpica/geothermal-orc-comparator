@@ -227,6 +227,15 @@ with st.sidebar:
             key="shared_capacity_factor",
         )
 
+    with st.expander("Site"):
+        prevailing_wind = st.selectbox(
+            "Prevailing wind direction",
+            options=["N", "NE", "E", "SE", "S", "SW", "W", "NW"],
+            index=5,  # default SW (Milford UT)
+            key="shared_prevailing_wind",
+            help="Used for ACC recirculation risk and plot plan orientation",
+        )
+
     st.markdown("---")
 
     st.checkbox(
@@ -257,6 +266,7 @@ shared_inputs = {
     "discount_rate": discount_rate,
     "project_life": project_life,
     "capacity_factor": capacity_factor,
+    "prevailing_wind": prevailing_wind,
 }
 
 # ── Tabs ───────────────────────────────────────────────────────────────────

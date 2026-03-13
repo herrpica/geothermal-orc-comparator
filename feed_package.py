@@ -537,9 +537,12 @@ def _render_equipment_tab(detail: dict, result):
 # ── TAB 3: Process Flow Description ─────────────────────────────────────────
 
 def _render_process_flow_tab(detail: dict, result):
-    """Process flow description with stream narratives, Mermaid PFD, control philosophy."""
+    """Process flow diagram with auto-generated Mermaid PFD from state points,
+    color-coded streams, equipment detail popups, and control philosophy."""
     config = _config_type(detail)
     states = detail.get("states", {})
+    costs = _costs_from_detail(detail)
+    power_bal = detail.get("power_balance", {})
     T_geo_in = detail.get("T_geo_in_F", 420)
     T_geo_out = detail.get("T_geo_out_min_F", 180)
     T_cond = detail.get("T_cond_F", 0)
@@ -548,114 +551,305 @@ def _render_process_flow_tab(detail: dict, result):
     P_low = detail.get("P_low_psia", 0)
     fluid = detail.get("working_fluid", "isopentane").title()
     n_fans = detail.get("fan_n_fans_used", 0)
-    P_gross = detail.get("power_balance", {}).get("P_gross", 0)
+    n_trains = detail.get("n_trains", N_TRAINS_DEFAULT)
+    P_gross = power_bal.get("P_gross", 0)
+    P_net = power_bal.get("P_net", 0)
+    m_dot_geo = detail.get("m_dot_geo_lb_s", 0) * 3600
 
-    # ── Stream Descriptions ─────────────────────────────────────
-    st.markdown("### Stream Descriptions")
+    # State helpers
+    def _st(k, field="T"):
+        s = states.get(str(k), {})
+        return s.get(field, 0)
 
-    narratives = [
-        f"**B-1:** Hot brine enters the plant at **{T_geo_in:.0f} F** from production wells "
-        f"at **{detail.get('m_dot_geo_lb_s', 0) * 3600:,.0f} lb/hr**.",
-        f"**B-2:** Cooled brine exits the preheater at approximately **{T_geo_out:.0f} F** "
-        f"and flows to reinjection wells.",
-    ]
+    def _phase(k):
+        s = states.get(str(k), {})
+        return s.get("phase", "?")
 
-    if config in ("A", "B"):
-        if "4" in states and "5" in states and "6" in states and "7" in states:
-            narratives.extend([
-                f"**WF-4:** Subcooled {fluid} exits the feed pump at **{states['4']['T']:.0f} F**, "
-                f"**{states['4']['P']:.0f} psia**.",
-            ])
-            if "5" in states and states["5"]["h"] != states["4"]["h"]:
-                narratives.append(
-                    f"**WF-5/6:** {fluid} is preheated through the recuperator cold side "
-                    f"to **{states['6']['T']:.0f} F**."
-                )
-            narratives.extend([
-                f"**WF-7:** {fluid} enters the vaporizer at **{states['7']['T']:.0f} F** "
-                f"after passing through the preheater.",
-                f"**WF-1:** Saturated {fluid} vapor exits the vaporizer at **{T_evap:.0f} F**, "
-                f"**{P_high:.0f} psia** and enters the turbine.",
-                f"**WF-2:** Expanded vapor exits the turbine at **{states.get('2', {}).get('T', T_cond):.0f} F**, "
-                f"**{P_low:.0f} psia**.",
-                f"**WF-3:** {fluid} exits the recuperator hot side (or turbine exhaust for basic cycle) "
-                f"and enters the condenser.",
-            ])
-
-    if config == "B":
-        prop_states = detail.get("prop_states", {})
-        if prop_states:
-            narratives.extend([
-                f"**PR-A:** Propane vapor exits the IHX shell side at "
-                f"**{prop_states.get('A', {}).get('T', 0):.0f} F** and flows to the propane ACC.",
-                f"**PR-B:** Subcooled propane exits the ACC at "
-                f"**{prop_states.get('B', {}).get('T', 0):.0f} F**.",
-                f"**PR-C:** Propane enters the IHX tube side after the circulation pump.",
-            ])
-
-    for n in narratives:
-        st.markdown(n)
-
-    # ── Equipment Connections (Mermaid) ─────────────────────────
+    # ── Mermaid PFD (color-coded) ─────────────────────────────
     st.markdown("### Process Flow Diagram")
 
+    # Stream condition labels: T / P / Phase
+    def _lbl(T, P, phase):
+        return f"{T:.0f}°F / {P:.0f} psia / {phase}"
+
     if config == "A":
+        s2_T, s2_P = _st(2, "T"), _st(2, "P")
+        s3_T, s3_P = _st(3, "T"), _st(3, "P")
+        s4_T, s4_P = _st(4, "T"), _st(4, "P")
+        s7_T, s7_P = _st(7, "T"), _st(7, "P")
+        has_recup = costs.get("recuperator_area_ft2", 0) > 0
+        recup_block = """
+    TG --> |"{turb_exit}"| RECUP["fa:fa-exchange-alt Recuperator<br/>HX-0103"]
+    RECUP --> |"{recup_exit}"| ACC
+    ACC --> |"{cond_exit}"| PP
+    PP --> |"{pump_exit}"| RECUP_C[Recuperator<br/>Cold Side]
+    RECUP_C --> PRE_WF""".format(
+            turb_exit=_lbl(s2_T, s2_P, _phase(2)),
+            recup_exit=_lbl(s3_T, s3_P, _phase(3)),
+            cond_exit=_lbl(s4_T, s4_P, _phase(4)),
+            pump_exit=_lbl(_st(5, "T"), _st(5, "P"), _phase(5)),
+        ) if has_recup else """
+    TG --> |"{turb_exit}"| ACC
+    ACC --> |"{cond_exit}"| PP
+    PP --> PRE_WF""".format(
+            turb_exit=_lbl(s2_T, s2_P, _phase(2)),
+            cond_exit=_lbl(s4_T, s4_P, _phase(4)),
+        )
+
         mermaid = f"""```mermaid
 graph LR
-    WELLS[Production Wells<br/>{T_geo_in:.0f} F] --> VAP[Vaporizer<br/>HX-0101]
-    VAP --> PRE[Preheater<br/>HX-0102]
-    PRE --> REINJ[Reinjection<br/>{T_geo_out:.0f} F]
-    PP[Feed Pump<br/>PP-0101] --> RECUP_C[Recuperator<br/>Cold Side]
-    RECUP_C --> PRE2[Preheater<br/>WF Side]
-    PRE2 --> VAP2[Vaporizer<br/>WF Side]
-    VAP2 --> TG[Turbine-Generator<br/>TG-0101<br/>{P_gross/1000:.1f} MW]
-    TG --> RECUP_H[Recuperator<br/>Hot Side]
-    RECUP_H --> ACC[ACC<br/>AC-0101<br/>{n_fans} fans]
-    ACC --> PP
+    classDef brine fill:#D2691E,stroke:#8B4513,color:#fff
+    classDef wf fill:#1E90FF,stroke:#104E8B,color:#fff
+    classDef equip fill:#2E8B57,stroke:#006400,color:#fff
+    classDef elec fill:#FFD700,stroke:#B8860B,color:#000
+    classDef parasitic fill:#CD853F,stroke:#8B6914,color:#fff
+
+    WELLS["fa:fa-industry Production Wells"]:::brine
+    VAP["fa:fa-fire Vaporizer<br/>HX-0101"]:::equip
+    PRE["fa:fa-thermometer-half Preheater<br/>HX-0102"]:::equip
+    REINJ["fa:fa-arrow-down Reinjection Wells"]:::brine
+    TG["fa:fa-cog Turbine-Generator<br/>TG-0101<br/>{P_gross/1000:.1f} MW"]:::equip
+    ACC["fa:fa-wind ACC<br/>AC-0101<br/>{n_fans} fans"]:::equip
+    PP["fa:fa-tint Feed Pump<br/>PP-0101"]:::equip
+    PRE_WF[Preheater WF Side]:::wf
+
+    WELLS --> |"{_lbl(T_geo_in, 200, 'Liquid')}<br/>{m_dot_geo:,.0f} lb/hr"| VAP
+    VAP --> PRE
+    PRE --> |"{_lbl(T_geo_out, 180, 'Liquid')}"| REINJ
+
+    PRE_WF --> |"{_lbl(s7_T, s7_P, _phase(7))}"| VAP
+    VAP --> |"{_lbl(T_evap, P_high, 'Sat Vapor')}"| TG
+{recup_block}
+
+    TG -.- |"{power_bal.get('W_iso_pump', 0):.0f} kW"| PUMP_P["Pump Parasitic"]:::parasitic
+    ACC -.- |"{power_bal.get('W_fans', 0):.0f} kW"| FAN_P["Fan Parasitic"]:::parasitic
 ```"""
     elif config == "B":
+        prop_states = detail.get("prop_states", {})
         T_prop_cond = detail.get("T_propane_cond_F", 0)
+        T_prop_evap = detail.get("T_propane_evap_F", T_prop_cond + 10)
+        s2_T, s2_P = _st(2, "T"), _st(2, "P")
+        s3_T, s3_P = _st(3, "T"), _st(3, "P")
+        s4_T, s4_P = _st(4, "T"), _st(4, "P")
+        s7_T, s7_P = _st(7, "T"), _st(7, "P")
+        prA_T = prop_states.get("A", {}).get("T", 0)
+        prA_P = prop_states.get("A", {}).get("P", 0)
+        prB_T = prop_states.get("B", {}).get("T", 0)
+        prB_P = prop_states.get("B", {}).get("P", 0)
+
         mermaid = f"""```mermaid
 graph LR
-    WELLS[Production Wells<br/>{T_geo_in:.0f} F] --> VAP[Vaporizer<br/>HX-0101]
-    VAP --> PRE[Preheater<br/>HX-0102]
-    PRE --> REINJ[Reinjection<br/>{T_geo_out:.0f} F]
-    PP[Feed Pump<br/>PP-0101] --> RECUP_C[Recuperator<br/>Cold Side]
-    RECUP_C --> PRE2[Preheater<br/>WF Side]
-    PRE2 --> VAP2[Vaporizer<br/>WF Side]
-    VAP2 --> TG[Turbine-Generator<br/>TG-0101<br/>{P_gross/1000:.1f} MW]
-    TG --> RECUP_H[Recuperator<br/>Hot Side]
-    RECUP_H --> IHX[Intermediate HX<br/>HX-0104]
+    classDef brine fill:#D2691E,stroke:#8B4513,color:#fff
+    classDef wf fill:#1E90FF,stroke:#104E8B,color:#fff
+    classDef propane fill:#32CD32,stroke:#228B22,color:#fff
+    classDef equip fill:#2E8B57,stroke:#006400,color:#fff
+    classDef parasitic fill:#CD853F,stroke:#8B6914,color:#fff
+
+    WELLS["fa:fa-industry Production Wells"]:::brine
+    VAP["fa:fa-fire Vaporizer<br/>HX-0101"]:::equip
+    PRE["fa:fa-thermometer-half Preheater<br/>HX-0102"]:::equip
+    REINJ["fa:fa-arrow-down Reinjection Wells"]:::brine
+    TG["fa:fa-cog Turbine-Generator<br/>TG-0101<br/>{P_gross/1000:.1f} MW"]:::equip
+    RECUP["fa:fa-exchange-alt Recuperator<br/>HX-0103"]:::equip
+    IHX["fa:fa-exchange-alt Intermediate HX<br/>HX-0104"]:::equip
+    ACC["fa:fa-wind Propane ACC<br/>AC-0101<br/>{n_fans} fans"]:::equip
+    PP["fa:fa-tint ISO Pump<br/>PP-0101"]:::equip
+    PPR["fa:fa-tint Propane Pump<br/>PP-0102"]:::propane
+
+    WELLS --> |"{_lbl(T_geo_in, 200, 'Liquid')}<br/>{m_dot_geo:,.0f} lb/hr"| VAP
+    VAP --> PRE
+    PRE --> |"{_lbl(T_geo_out, 180, 'Liquid')}"| REINJ
+
+    PP --> |"{_lbl(s4_T, s4_P, _phase(4))}"| RECUP
+    RECUP --> PRE_WF[Preheater WF]
+    PRE_WF --> |"{_lbl(s7_T, s7_P, _phase(7))}"| VAP
+    VAP --> |"{_lbl(T_evap, P_high, 'Sat Vapor')}"| TG
+    TG --> |"{_lbl(s2_T, s2_P, _phase(2))}"| RECUP
+    RECUP --> |"{_lbl(s3_T, s3_P, _phase(3))}"| IHX
     IHX --> PP
-    IHX --> |Propane| ACC[Propane ACC<br/>AC-0101<br/>{T_prop_cond:.0f} F]
-    ACC --> PPR[Propane Pump<br/>PP-0102]
+
+    IHX --> |"{_lbl(prA_T, prA_P, 'Sat Vapor')}"| ACC
+    ACC --> |"{_lbl(prB_T, prB_P, 'Liquid')}"| PPR
     PPR --> IHX
+
+    TG -.- |"{power_bal.get('W_iso_pump', 0):.0f} kW"| PUMP_P["Pump Parasitic"]:::parasitic
+    ACC -.- |"{power_bal.get('W_fans', 0):.0f} kW"| FAN_P["Fan Parasitic"]:::parasitic
 ```"""
-    else:  # Config D
+    else:  # Config D — dual-pressure with two parallel evaporation branches
         T_split = detail.get("T_split_F", 0)
+        hp_kw = detail.get("hp_gross_power_kw", 0)
+        lp_kw = detail.get("lp_gross_power_kw", 0)
         mermaid = f"""```mermaid
-graph LR
-    WELLS[Production Wells<br/>{T_geo_in:.0f} F] --> HP_VAP[HP Vaporizer]
-    HP_VAP --> HP_PRE[HP Preheater]
-    HP_PRE --> |{T_split:.0f} F| LP_VAP[LP Vaporizer]
-    LP_VAP --> LP_PRE[LP Preheater]
-    LP_PRE --> REINJ[Reinjection<br/>{T_geo_out:.0f} F]
-    HP_PP[HP Pump] --> HP_RECUP[HP Recuperator]
-    HP_RECUP --> HP_PRE2[HP Pre WF]
-    HP_PRE2 --> HP_VAP2[HP Vap WF]
-    HP_VAP2 --> HP_TG[HP Turbine<br/>{detail.get('hp_gross_power_kw',0)/1000:.1f} MW]
-    HP_TG --> HP_RECUP_H[HP Recup Hot]
-    HP_RECUP_H --> ACC[Shared ACC<br/>{n_fans} fans]
-    LP_PP[LP Pump] --> LP_PRE2[LP Pre WF]
-    LP_PRE2 --> LP_VAP2[LP Vap WF]
-    LP_VAP2 --> LP_TG[LP Turbine<br/>{detail.get('lp_gross_power_kw',0)/1000:.1f} MW]
+graph TD
+    classDef brine fill:#D2691E,stroke:#8B4513,color:#fff
+    classDef hp fill:#1E90FF,stroke:#104E8B,color:#fff
+    classDef lp fill:#00BFFF,stroke:#0099CC,color:#fff
+    classDef equip fill:#2E8B57,stroke:#006400,color:#fff
+    classDef parasitic fill:#CD853F,stroke:#8B6914,color:#fff
+    classDef acc fill:#87CEEB,stroke:#4682B4,color:#000
+
+    %% Brine cascade (top to bottom)
+    WELLS["fa:fa-industry Production Wells<br/>{T_geo_in:.0f}°F"]:::brine
+    HP_VAP_B["HP Vaporizer<br/>Brine Side"]:::equip
+    HP_PRE_B["HP Preheater<br/>Brine Side"]:::equip
+    SPLIT{{"Brine Split<br/>{T_split:.0f}°F"}}:::brine
+    LP_VAP_B["LP Vaporizer<br/>Brine Side"]:::equip
+    LP_PRE_B["LP Preheater<br/>Brine Side"]:::equip
+    REINJ["fa:fa-arrow-down Reinjection<br/>{T_geo_out:.0f}°F"]:::brine
+
+    WELLS --> HP_VAP_B --> HP_PRE_B --> SPLIT --> LP_VAP_B --> LP_PRE_B --> REINJ
+
+    %% HP WF loop (left branch)
+    HP_PP["HP Pump"]:::hp
+    HP_RECUP_C["HP Recuperator<br/>Cold Side"]:::hp
+    HP_PRE_W["HP Preheater<br/>WF Side"]:::hp
+    HP_VAP_W["HP Vaporizer<br/>WF Side"]:::hp
+    HP_TG["fa:fa-cog HP Turbine<br/>{hp_kw/1000:.1f} MW"]:::equip
+    HP_RECUP_H["HP Recuperator<br/>Hot Side"]:::hp
+
+    HP_PP --> HP_RECUP_C --> HP_PRE_W --> HP_VAP_W
+    HP_VAP_W --> |"{T_evap:.0f}°F / {P_high:.0f} psia"| HP_TG
+    HP_TG --> HP_RECUP_H
+
+    %% LP WF loop (right branch)
+    LP_PP["LP Pump"]:::lp
+    LP_PRE_W["LP Preheater<br/>WF Side"]:::lp
+    LP_VAP_W["LP Vaporizer<br/>WF Side"]:::lp
+    LP_TG["fa:fa-cog LP Turbine<br/>{lp_kw/1000:.1f} MW"]:::equip
+
+    LP_PP --> LP_PRE_W --> LP_VAP_W
+    LP_VAP_W --> LP_TG
+
+    %% Shared ACC merges both exhausts
+    ACC["fa:fa-wind Shared ACC<br/>{n_fans} fans"]:::acc
+    HP_RECUP_H --> ACC
     LP_TG --> ACC
     ACC --> HP_PP
     ACC --> LP_PP
+
+    %% Cross-links: brine heats WF
+    HP_VAP_B -.- HP_VAP_W
+    HP_PRE_B -.- HP_PRE_W
+    LP_VAP_B -.- LP_VAP_W
+    LP_PRE_B -.- LP_PRE_W
+
+    ACC -.- |"{power_bal.get('W_fans', 0):.0f} kW"| FAN_P["Fan Parasitic"]:::parasitic
+
+    ACC -.- |"{power_bal.get('W_fans', 0):.0f} kW"| FAN_P["Fan Parasitic"]:::parasitic
 ```"""
 
     st.markdown(mermaid)
-    st.caption("*Diagram is schematic — not to scale. For use by engineer to produce formal PFD.*")
+
+    # ── Legend ─────────────────────────────────────────────────
+    legend_cols = st.columns(5)
+    legend_cols[0].markdown(":brown_circle: **Brine**")
+    legend_cols[1].markdown(":large_blue_circle: **Working Fluid**")
+    if config == "B":
+        legend_cols[2].markdown(":green_circle: **Propane**")
+    elif config == "D":
+        legend_cols[2].markdown(":blue_heart: **HP Stage** / :droplet: **LP Stage**")
+    legend_cols[3].markdown(":green_heart: **Equipment**")
+    legend_cols[4].markdown(":orange_circle: **Parasitic**")
+
+    st.caption("*Auto-generated from H&MB state points. Not to scale.*")
+
+    # ── Equipment Detail Expanders ─────────────────────────────
+    st.markdown("### Equipment Detail")
+    st.caption("Click any equipment to see sizing, vendor candidates, and open items.")
+
+    _equip_details = []
+    # Turbine-Generator
+    ref = EQUIP_REF["turbine_generator"]
+    tg_cost = costs.get("turbine_generator", 0)
+    _equip_details.append(("TG-0101", "Turbine-Generator Set", {
+        "Quantity": f"{n_trains} units",
+        "Rating": f"{P_gross / n_trains / 1000:.1f} MW each ({P_gross/1000:.1f} MW total)",
+        "Isentropic Efficiency": f"{detail.get('eta_turbine', 0.82):.0%}",
+        "Weight": f"{ref['lb_per_kw'] * P_gross / 2000:.0f} tons total",
+        "Budget": f"${tg_cost:,.0f} (${tg_cost/P_net:.0f}/kW)" if P_net > 0 else "-",
+        "Vendors": ", ".join(ref["vendors"]),
+        "Lead Time": f"{ref['lead_wk']} weeks",
+    }, ["Confirm vendor efficiency guarantee at design conditions",
+        "Verify gearbox / direct-drive selection"]))
+
+    # Vaporizer
+    vap_area = costs.get("vaporizer_area_ft2", 0)
+    ref = EQUIP_REF["vaporizer"]
+    _equip_details.append(("HX-0101", "Vaporizer", {
+        "Quantity": f"{_hx_shells(vap_area)} shell(s)",
+        "Heat Transfer Area": f"{vap_area:,.0f} ft2",
+        "Shell Diameter": f"{_hx_shell_dia_in(vap_area / max(_hx_shells(vap_area), 1)):.0f}\" ID",
+        "Tube Length": f"{ref['tube_length_ft']}' (TEMA)",
+        "Budget": f"${costs.get('vaporizer', 0):,.0f}",
+        "Vendors": ", ".join(ref["vendors"]),
+        "Lead Time": f"{ref['lead_wk']} weeks",
+    }, ["Brine-side fouling factor and corrosion allowance",
+        "Tube material selection (brine service)"]))
+
+    # Preheater
+    pre_area = costs.get("preheater_area_ft2", 0)
+    ref = EQUIP_REF["preheater"]
+    _equip_details.append(("HX-0102", "Preheater", {
+        "Quantity": f"{_hx_shells(pre_area)} shell(s)",
+        "Heat Transfer Area": f"{pre_area:,.0f} ft2",
+        "Budget": f"${costs.get('preheater', 0):,.0f}",
+        "Vendors": ", ".join(ref["vendors"]),
+        "Lead Time": f"{ref['lead_wk']} weeks",
+    }, ["Brine-side scaling potential at lower temperatures"]))
+
+    # Recuperator (if present)
+    rec_area = costs.get("recuperator_area_ft2", 0)
+    if rec_area > 0:
+        ref = EQUIP_REF["recuperator"]
+        _equip_details.append(("HX-0103", "Recuperator", {
+            "Quantity": f"{_hx_shells(rec_area)} shell(s) x {n_trains} trains",
+            "Heat Transfer Area": f"{rec_area:,.0f} ft2 total",
+            "Budget": f"${costs.get('recuperator', 0):,.0f}",
+            "Vendors": ", ".join(ref["vendors"]),
+            "Lead Time": f"{ref['lead_wk']} weeks",
+        }, ["Thermal cycling fatigue analysis"]))
+
+    # ACC
+    n_bays = int(costs.get("acc_n_bays", 0))
+    ref = EQUIP_REF["acc"]
+    _equip_details.append(("AC-0101", "Air-Cooled Condenser", {
+        "Number of Bays": f"{n_bays}",
+        "Number of Fans": f"{n_fans}",
+        "Fan Power": f"{power_bal.get('W_fans', 0):,.0f} kW",
+        "Condensing Temperature": f"{T_cond:.0f} °F",
+        "Budget": f"${costs.get('acc', 0):,.0f}",
+        "Vendors": ", ".join(ref["vendors"]),
+        "Lead Time": f"{ref['lead_wk']} weeks",
+    }, ["Noise study at property line", "Wind effect on performance"]))
+
+    # Feed Pump
+    ref = EQUIP_REF["iso_pump"]
+    _equip_details.append(("PP-0101", "Isopentane Feed Pump", {
+        "Quantity": f"{n_trains} operating + 1 spare",
+        "Differential Pressure": f"{detail.get('pump_iso_dP_psi', 0):.0f} psi",
+        "Budget": f"${costs.get('iso_pump', 0):,.0f}",
+        "Vendors": ", ".join(ref["vendors"]),
+        "Lead Time": f"{ref['lead_wk']} weeks",
+    }, ["Mechanical seal selection for hydrocarbon service"]))
+
+    if config == "B":
+        ihx_area = costs.get("intermediate_hx_area_ft2", 0)
+        if ihx_area > 0:
+            ref = EQUIP_REF["ihx"]
+            _equip_details.append(("HX-0104", "Intermediate HX", {
+                "Heat Transfer Area": f"{ihx_area:,.0f} ft2",
+                "Budget": f"${costs.get('intermediate_hx', 0):,.0f}",
+                "Vendors": ", ".join(ref["vendors"]),
+            }, ["Propane-side pressure relief sizing"]))
+
+    for tag, service, params, open_items in _equip_details:
+        with st.expander(f"{tag} — {service}"):
+            for k, v in params.items():
+                st.markdown(f"**{k}:** {v}")
+            if open_items:
+                st.markdown("**Open Items:**")
+                for oi in open_items:
+                    st.markdown(f"- {oi}")
 
     # ── Control Philosophy ──────────────────────────────────────
     st.markdown("### Control Philosophy")
@@ -830,38 +1024,47 @@ def _render_instrumentation_tab(detail: dict, result):
 
 # ── TAB 5: Plot Plan Summary ────────────────────────────────────────────────
 
-def _render_plot_plan_tab(detail: dict, result):
-    """Equipment footprints, separation requirements, estimated plot area."""
+def _build_equipment_blocks(detail: dict) -> list[dict]:
+    """Build list of equipment blocks with sizing for plot plan layout.
+
+    Each block: {tag, service, w_ft, h_ft, system, color}
+    system: 'brine', 'wf', 'electrical', 'civil', 'propane'
+    """
     config = _config_type(detail)
     costs = _costs_from_detail(detail)
     power_bal = detail.get("power_balance", {})
     P_gross = power_bal.get("P_gross", 0)
-    P_net = power_bal.get("P_net", 0)
     n_bays = int(costs.get("acc_n_bays", 0))
-
-    # ── Equipment Footprint Table ───────────────────────────────
-    st.markdown("### Equipment Footprint Estimate")
-
-    footprints = []
-    total_ft2 = 0
-
     n_trains = detail.get("n_trains", N_TRAINS_DEFAULT)
 
-    # Turbine building
-    tg_ft2 = EQUIP_REF["turbine_generator"]["ft2_per_mw"] * (P_gross / 1000)
-    tg_side = math.sqrt(tg_ft2) if tg_ft2 > 0 else 0
-    footprints.append({
-        "Equipment": "Turbine-Generator Building",
-        "Count": n_trains, "Each (ft x ft)": f"{tg_side:.0f} x {tg_side:.0f}",
-        "Total (ft2)": f"{tg_ft2:,.0f}", "Source": "Calculated",
-    })
-    total_ft2 += tg_ft2
+    blocks = []
 
-    # Heat exchangers
-    for label, area_key, ref_key in [
-        ("Vaporizer", "vaporizer_area_ft2", "vaporizer"),
-        ("Preheater", "preheater_area_ft2", "preheater"),
-        ("Recuperator", "recuperator_area_ft2", "recuperator"),
+    # Color map by system
+    COLORS = {
+        "brine": "#D2691E",
+        "wf": "#1E90FF",
+        "propane": "#32CD32",
+        "electrical": "#FFD700",
+        "civil": "#A9A9A9",
+    }
+
+    # Turbine building — one block per train
+    tg_ft2_total = EQUIP_REF["turbine_generator"]["ft2_per_mw"] * (P_gross / 1000)
+    tg_ft2_each = tg_ft2_total / max(n_trains, 1)
+    tg_side = max(math.sqrt(tg_ft2_each), 15)
+    for i in range(n_trains):
+        suffix = chr(65 + i) if n_trains > 1 else ""
+        blocks.append({
+            "tag": f"TG-0101{suffix}", "service": "Turbine-Generator",
+            "w_ft": tg_side, "h_ft": tg_side,
+            "system": "wf", "color": COLORS["wf"], "group": "turbine",
+        })
+
+    # Heat exchangers (shared)
+    for label, tag, area_key, ref_key in [
+        ("Vaporizer", "HX-0101", "vaporizer_area_ft2", "vaporizer"),
+        ("Preheater", "HX-0102", "preheater_area_ft2", "preheater"),
+        ("Recuperator", "HX-0103", "recuperator_area_ft2", "recuperator"),
     ]:
         area = costs.get(area_key, 0)
         if area <= 0:
@@ -869,111 +1072,646 @@ def _render_plot_plan_tab(detail: dict, result):
         ref = EQUIP_REF[ref_key]
         n_shells = _hx_shells(area, ref.get("max_shell_area_ft2", 5000))
         tube_len = ref.get("tube_length_ft", 20)
-        shell_dia_in = _hx_shell_dia_in(area / n_shells if n_shells else area, tube_len)
-        shell_dia_ft = shell_dia_in / 12
-        # Footprint per shell: tube_length x (shell_dia + access)
-        fp_each = tube_len * (shell_dia_ft + 6)  # 6 ft access
-        fp_total = fp_each * n_shells
-        footprints.append({
-            "Equipment": label, "Count": n_shells,
-            "Each (ft x ft)": f"{tube_len:.0f} x {shell_dia_ft + 6:.0f}",
-            "Total (ft2)": f"{fp_total:,.0f}", "Source": "Calculated",
-        })
-        total_ft2 += fp_total
+        shell_dia_in = _hx_shell_dia_in(area / max(n_shells, 1), tube_len)
+        shell_w = max(shell_dia_in / 12 + 6, 8)  # add access
+        for s in range(n_shells):
+            suffix = chr(65 + s) if n_shells > 1 else ""
+            blocks.append({
+                "tag": f"{tag}{suffix}", "service": label,
+                "w_ft": tube_len, "h_ft": shell_w,
+                "system": "wf", "color": COLORS["wf"], "group": "hx",
+            })
 
+    # Intermediate HX (Config B)
     if config == "B":
         ihx_area = costs.get("intermediate_hx_area_ft2", 0)
         if ihx_area > 0:
             ref = EQUIP_REF["ihx"]
             n_shells = _hx_shells(ihx_area, ref.get("max_shell_area_ft2", 5000))
-            fp_each = 20 * 10
-            fp_total = fp_each * n_shells
-            footprints.append({
-                "Equipment": "Intermediate HX", "Count": n_shells,
-                "Each (ft x ft)": "20 x 10",
-                "Total (ft2)": f"{fp_total:,.0f}", "Source": "Calculated",
-            })
-            total_ft2 += fp_total
+            for s in range(n_shells):
+                suffix = chr(65 + s) if n_shells > 1 else ""
+                blocks.append({
+                    "tag": f"HX-0104{suffix}", "service": "Intermediate HX",
+                    "w_ft": 20, "h_ft": 10,
+                    "system": "propane", "color": COLORS["propane"], "group": "hx",
+                })
 
-    # ACC
-    acc_ft2_per_bay = 40 * 12  # 40 x 12 per bay typical
-    acc_total = acc_ft2_per_bay * n_bays
-    footprints.append({
-        "Equipment": "Air-Cooled Condenser", "Count": n_bays,
-        "Each (ft x ft)": "40 x 12",
-        "Total (ft2)": f"{acc_total:,.0f}", "Source": "Vendor typical",
-    })
-    total_ft2 += acc_total
+    # ACC — modeled as single large block (bay array)
+    if n_bays > 0:
+        # Typical A-frame: bays in rows, each 40 x 12 ft
+        # Real ACC banks: 2-4 rows, bays arrayed along the length
+        bays_per_row = min(n_bays, max(4, math.ceil(math.sqrt(n_bays * 3))))
+        n_rows = math.ceil(n_bays / bays_per_row)
+        acc_w = bays_per_row * 12  # bays side by side (12' wide)
+        acc_h = n_rows * 40  # 40 ft deep per row
+        blocks.append({
+            "tag": "AC-0101", "service": f"ACC ({n_bays} bays)",
+            "w_ft": acc_w, "h_ft": acc_h,
+            "system": "wf", "color": "#87CEEB", "group": "acc",
+        })
 
-    # Substation
-    sub_ft2 = 1200  # 40 x 30
-    footprints.append({
-        "Equipment": "Electrical Substation", "Count": 1,
-        "Each (ft x ft)": "40 x 30",
-        "Total (ft2)": f"{sub_ft2:,.0f}", "Source": "Typical",
+    # Feed pumps
+    for i in range(n_trains):
+        suffix = chr(65 + i) if n_trains > 1 else ""
+        blocks.append({
+            "tag": f"PP-0101{suffix}", "service": "ISO Pump",
+            "w_ft": 6, "h_ft": 4,
+            "system": "wf", "color": COLORS["wf"], "group": "pump",
+        })
+
+    if config == "B":
+        blocks.append({
+            "tag": "PP-0102", "service": "Propane Pump",
+            "w_ft": 6, "h_ft": 4,
+            "system": "propane", "color": COLORS["propane"], "group": "pump",
+        })
+
+    # Electrical substation
+    blocks.append({
+        "tag": "SS-0101", "service": "Electrical Substation",
+        "w_ft": 40, "h_ft": 30,
+        "system": "electrical", "color": COLORS["electrical"], "group": "electrical",
     })
-    total_ft2 += sub_ft2
 
     # Control building
-    ctrl_ft2 = 600  # 30 x 20
-    footprints.append({
-        "Equipment": "Control Building", "Count": 1,
-        "Each (ft x ft)": "30 x 20",
-        "Total (ft2)": f"{ctrl_ft2:,.0f}", "Source": "Typical",
+    blocks.append({
+        "tag": "CB-0101", "service": "Control Building",
+        "w_ft": 30, "h_ft": 20,
+        "system": "civil", "color": COLORS["civil"], "group": "civil",
     })
-    total_ft2 += ctrl_ft2
 
     # WF storage
-    wf_ft2 = 400  # 20 x 20 tank pad
-    footprints.append({
-        "Equipment": "WF Storage Tank", "Count": 1,
-        "Each (ft x ft)": "20 x 20",
-        "Total (ft2)": f"{wf_ft2:,.0f}", "Source": "Typical",
-    })
-    total_ft2 += wf_ft2
-
-    # Total
-    footprints.append({
-        "Equipment": "**TOTAL EQUIPMENT FOOTPRINT**", "Count": "",
-        "Each (ft x ft)": "", "Total (ft2)": f"{total_ft2:,.0f}", "Source": "",
+    blocks.append({
+        "tag": "TK-0101", "service": "WF Storage",
+        "w_ft": 20, "h_ft": 20,
+        "system": "wf", "color": "#B0C4DE", "group": "storage",
     })
 
-    st.dataframe(pd.DataFrame(footprints), use_container_width=True, hide_index=True)
+    # Brine manifold
+    blocks.append({
+        "tag": "BM-0101", "service": "Brine Manifold",
+        "w_ft": 25, "h_ft": 15,
+        "system": "brine", "color": COLORS["brine"], "group": "brine",
+    })
 
-    # ── Estimated Plot Area ─────────────────────────────────────
-    spacing_factor = 3.5
-    plot_ft2 = total_ft2 * spacing_factor
-    plot_acres = plot_ft2 / 43560
+    return blocks
 
-    st.markdown(f"### Estimated Plot Area")
-    c1, c2, c3 = st.columns(3)
-    c1.metric("Equipment Footprint", f"{total_ft2:,.0f} ft2")
-    c2.metric("Spacing Factor", f"{spacing_factor}x")
-    c3.metric("Estimated Plot", f"{plot_acres:.1f} acres")
 
-    # ── Minimum Separation Requirements ─────────────────────────
-    st.markdown("### Minimum Separation Requirements")
-    sep_rows = [{"From": f, "To": t, "Min Distance (ft)": d, "Basis": b}
-                for f, t, d, b in SEPARATION_RULES]
-    st.dataframe(pd.DataFrame(sep_rows), use_container_width=True, hide_index=True)
+# Wind direction vectors for plot plan
+_WIND_VECTORS = {
+    "N": (0, 1), "NE": (0.707, 0.707), "E": (1, 0), "SE": (0.707, -0.707),
+    "S": (0, -1), "SW": (-0.707, -0.707), "W": (-1, 0), "NW": (-0.707, 0.707),
+}
 
-    # ── Adjacency Constraints ───────────────────────────────────
-    st.markdown("### Adjacency Constraints")
-    constraints = [
-        "ACC should be located **downwind** of process area (prevailing wind study required)",
-        "Turbine building requires **crane access** on at least one side for rotor pull",
-        "Brine manifold should be **adjacent to production wells** to minimize piping runs",
-        "Electrical substation positioned for **shortest interconnection route**",
-        "WF storage tank requires **fire suppression access** on all sides",
-        "Control building located **upwind** and outside blast/fire zone",
+
+def _place_bank(blocks: list[dict], x_start: float, y_start: float,
+                max_per_row: int = 6, gap_x: float = 8, gap_y: float = 10) -> tuple:
+    """Place a group of blocks in rows. Returns (placed_blocks, x_extent, y_extent)."""
+    if not blocks:
+        return [], 0, 0
+    x, y = x_start, y_start
+    col = 0
+    row_h = 0
+    max_x = x_start
+    for b in blocks:
+        if col >= max_per_row:
+            col = 0
+            x = x_start
+            y -= row_h + gap_y
+            row_h = 0
+        b["x"] = x + b["w_ft"] / 2
+        b["y"] = y - b["h_ft"] / 2
+        x += b["w_ft"] + gap_x
+        max_x = max(max_x, x)
+        row_h = max(row_h, b["h_ft"])
+        col += 1
+    y_end = y - row_h
+    return blocks, max_x - x_start, y_start - y_end
+
+
+def _layout_equipment(blocks: list[dict], wind_dir: str = "SW") -> list[dict]:
+    """Place equipment blocks on a 2D grid respecting separation constraints.
+
+    Layout strategy (constraint-driven):
+    - Brine manifold at site boundary (top edge)
+    - HX bank in center process area (grouped into rows)
+    - Turbines adjacent to HX bank
+    - ACC downwind of turbine building, min 50 ft separation
+    - Electrical room min 25 ft from turbine, away from process
+    - Control building upwind, outside process area
+    - WF storage away from electrical (NFPA 30)
+
+    Returns blocks with added 'x' and 'y' (center coordinates, ft).
+    """
+    wind_dx, wind_dy = _WIND_VECTORS.get(wind_dir, (-0.707, -0.707))
+
+    # Categorize blocks
+    by_group = {}
+    for b in blocks:
+        by_group.setdefault(b["group"], []).append(b)
+
+    placed = []
+    y_cursor = 0
+
+    # ── Brine manifold at top (site boundary) ──
+    for b in by_group.get("brine", []):
+        b["x"] = 0
+        b["y"] = y_cursor
+        placed.append(b)
+    y_cursor -= 40
+
+    # ── HX bank (grouped into rows of max 6) ──
+    hx_blocks = by_group.get("hx", [])
+    hx_start_y = y_cursor
+    if hx_blocks:
+        _place_bank(hx_blocks, 0, y_cursor, max_per_row=6)
+        placed.extend(hx_blocks)
+        hx_max_x = max(b["x"] + b["w_ft"] / 2 for b in hx_blocks)
+        hx_min_y = min(b["y"] - b["h_ft"] / 2 for b in hx_blocks)
+        y_cursor = hx_min_y - 25
+    else:
+        hx_max_x = 0
+
+    # ── Turbine buildings (side by side) ──
+    turbine_blocks = by_group.get("turbine", [])
+    turb_x = 0
+    turb_center_y = y_cursor
+    for b in turbine_blocks:
+        b["x"] = turb_x + b["w_ft"] / 2
+        b["y"] = y_cursor - b["h_ft"] / 2
+        turb_x += b["w_ft"] + 15
+        placed.append(b)
+    turb_right = turb_x
+
+    # Pumps adjacent to turbines
+    pump_blocks = by_group.get("pump", [])
+    for b in pump_blocks:
+        b["x"] = turb_x + b["w_ft"] / 2
+        b["y"] = y_cursor - b["h_ft"] / 2
+        turb_x += b["w_ft"] + 8
+        placed.append(b)
+
+    turb_bottom = y_cursor - max((b["h_ft"] for b in turbine_blocks), default=30)
+
+    # ── ACC — downwind of turbine, min 50 ft ──
+    acc_blocks = by_group.get("acc", [])
+    if acc_blocks:
+        acc = acc_blocks[0]
+        turb_cx = turbine_blocks[0]["x"] if turbine_blocks else 0
+        turb_cy = turb_center_y - (turbine_blocks[0]["h_ft"] / 2 if turbine_blocks else 15)
+        sep_dist = max(60, 50 + acc["h_ft"] / 4)  # ensure > 50 ft edge-to-edge
+        acc["x"] = turb_cx + wind_dx * sep_dist
+        acc["y"] = turb_cy + wind_dy * sep_dist
+        placed.append(acc)
+
+    # ── Electrical substation: min 25 ft from turbine, to the right ──
+    process_right = max(hx_max_x, turb_right, 50)
+    for b in by_group.get("electrical", []):
+        b["x"] = process_right + 35 + b["w_ft"] / 2
+        b["y"] = hx_start_y - b["h_ft"] / 2
+        placed.append(b)
+    elec_x = process_right + 35
+
+    # ── Control building: upwind, outside process area ──
+    for b in by_group.get("civil", []):
+        b["x"] = -wind_dx * 80
+        b["y"] = -wind_dy * 80 + hx_start_y
+        placed.append(b)
+
+    # ── WF storage: away from electrical, near process ──
+    for b in by_group.get("storage", []):
+        b["x"] = -50
+        b["y"] = turb_bottom - 30
+        placed.append(b)
+
+    return placed
+
+
+def _draw_plot_plan(blocks: list[dict], wind_dir: str = "SW",
+                    annotations: list[dict] = None) -> "matplotlib.figure.Figure":
+    """Render equipment blocks as a scaled matplotlib plot plan.
+
+    Returns a matplotlib Figure with:
+    - Scaled colored rectangles for each equipment
+    - Tag + service labels
+    - North arrow, scale bar
+    - Wind direction indicator
+    - Separation distance annotations
+    """
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    import matplotlib.patches as patches
+    from matplotlib.patches import FancyArrowPatch
+
+    fig, ax = plt.subplots(1, 1, figsize=(14, 10))
+    ax.set_aspect("equal")
+
+    # Draw equipment blocks
+    all_x, all_y = [], []
+    for b in blocks:
+        cx, cy = b["x"], b["y"]
+        w, h = b["w_ft"], b["h_ft"]
+        x0 = cx - w / 2
+        y0 = cy - h / 2
+        rect = patches.FancyBboxPatch(
+            (x0, y0), w, h,
+            boxstyle="round,pad=1",
+            facecolor=b["color"], edgecolor="#333333",
+            linewidth=1.2, alpha=0.85,
+        )
+        ax.add_patch(rect)
+
+        # Label — adapt font size to block area
+        min_dim = min(w, h)
+        if min_dim >= 30:
+            fsize, label = 6.5, f"{b['tag']}\n{b['service']}\n{w:.0f}' x {h:.0f}'"
+        elif min_dim >= 15:
+            fsize, label = 5.5, f"{b['tag']}\n{b['service']}"
+        else:
+            fsize, label = 4.5, b['tag']
+        text_color = "#000000" if b["color"] in ("#FFD700", "#A9A9A9", "#87CEEB", "#B0C4DE") else "#FFFFFF"
+        ax.text(cx, cy, label, ha="center", va="center",
+                fontsize=fsize, fontweight="bold", color=text_color,
+                linespacing=1.3)
+
+        all_x.extend([x0, x0 + w])
+        all_y.extend([y0, y0 + h])
+
+    if not all_x:
+        return fig
+
+    # Compute bounds with padding
+    margin = 60
+    x_min, x_max = min(all_x) - margin, max(all_x) + margin
+    y_min, y_max = min(all_y) - margin, max(all_y) + margin
+    ax.set_xlim(x_min, x_max)
+    ax.set_ylim(y_min, y_max)
+
+    # ── Separation distance annotations ──
+    if annotations:
+        for ann in annotations:
+            ax.annotate(
+                "", xy=ann["xy1"], xytext=ann["xy0"],
+                arrowprops=dict(arrowstyle="<->", color="#CC0000", lw=1.5),
+            )
+            mid_x = (ann["xy0"][0] + ann["xy1"][0]) / 2
+            mid_y = (ann["xy0"][1] + ann["xy1"][1]) / 2
+            ax.text(mid_x, mid_y + 3, ann["label"],
+                    ha="center", va="bottom", fontsize=7, color="#CC0000",
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec="#CC0000", alpha=0.9))
+
+    # ── Annotate key separations automatically ──
+    block_map = {b["tag"]: b for b in blocks}
+    sep_pairs = [
+        ("TG-0101A", "AC-0101", 50, "ACC-TG min 50'"),
+        ("TG-0101", "AC-0101", 50, "ACC-TG min 50'"),
+        ("TG-0101A", "SS-0101", 25, "Elec-TG min 25'"),
+        ("TG-0101", "SS-0101", 25, "Elec-TG min 25'"),
+        ("TK-0101", "SS-0101", 100, "WF-Elec min 100'"),
     ]
-    for c in constraints:
-        st.markdown(f"- {c}")
+    for tag_a, tag_b, min_dist, label in sep_pairs:
+        a = block_map.get(tag_a)
+        b = block_map.get(tag_b)
+        if a and b:
+            dx = b["x"] - a["x"]
+            dy = b["y"] - a["y"]
+            dist = math.sqrt(dx * dx + dy * dy)
+            color = "#CC0000" if dist < min_dist else "#006400"
+            status = f"{dist:.0f}'" + (" VIOLATION" if dist < min_dist else " OK")
+            ax.annotate(
+                "", xy=(b["x"], b["y"]), xytext=(a["x"], a["y"]),
+                arrowprops=dict(arrowstyle="<->", color=color, lw=1.2, ls="--"),
+            )
+            mid_x = (a["x"] + b["x"]) / 2
+            mid_y = (a["y"] + b["y"]) / 2
+            ax.text(mid_x, mid_y + 5, f"{label}\n{status}",
+                    ha="center", va="bottom", fontsize=6, color=color,
+                    fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", ec=color, alpha=0.85))
+
+    # ── North arrow (upper right) ──
+    arrow_x = x_max - 30
+    arrow_y = y_max - 20
+    ax.annotate("N", xy=(arrow_x, arrow_y + 20), fontsize=12, fontweight="bold",
+                ha="center", va="bottom")
+    ax.annotate("", xy=(arrow_x, arrow_y + 18), xytext=(arrow_x, arrow_y),
+                arrowprops=dict(arrowstyle="-|>", color="black", lw=2))
+
+    # ── Wind direction arrow ──
+    wind_dx, wind_dy = _WIND_VECTORS.get(wind_dir, (-0.707, -0.707))
+    wx = x_max - 30
+    wy = y_max - 60
+    ax.annotate("", xy=(wx + wind_dx * 20, wy + wind_dy * 20),
+                xytext=(wx, wy),
+                arrowprops=dict(arrowstyle="-|>", color="#4169E1", lw=2))
+    ax.text(wx, wy - 10, f"Prevailing\nWind: {wind_dir}", ha="center",
+            fontsize=7, color="#4169E1", fontweight="bold")
+
+    # ── Scale bar (lower left) ──
+    bar_x = x_min + 20
+    bar_y = y_min + 15
+    bar_len = 100  # 100 ft
+    ax.plot([bar_x, bar_x + bar_len], [bar_y, bar_y], "k-", lw=3)
+    ax.plot([bar_x, bar_x], [bar_y - 3, bar_y + 3], "k-", lw=2)
+    ax.plot([bar_x + bar_len, bar_x + bar_len], [bar_y - 3, bar_y + 3], "k-", lw=2)
+    ax.text(bar_x + bar_len / 2, bar_y - 8, "100 ft", ha="center", fontsize=8,
+            fontweight="bold")
+
+    # ── Plot dimensions ──
+    plot_w = x_max - x_min - 2 * margin
+    plot_h = y_max - y_min - 2 * margin
+    area_acres = (plot_w * plot_h) / 43560
+    ax.set_title(
+        f"Plot Plan — {plot_w:.0f}' x {plot_h:.0f}' ({area_acres:.1f} acres)",
+        fontsize=13, fontweight="bold", pad=15,
+    )
+
+    # ── Legend ──
+    legend_items = [
+        patches.Patch(facecolor="#D2691E", edgecolor="#333", label="Brine"),
+        patches.Patch(facecolor="#1E90FF", edgecolor="#333", label="Working Fluid"),
+        patches.Patch(facecolor="#87CEEB", edgecolor="#333", label="ACC"),
+        patches.Patch(facecolor="#FFD700", edgecolor="#333", label="Electrical"),
+        patches.Patch(facecolor="#A9A9A9", edgecolor="#333", label="Civil"),
+    ]
+    if any(b["system"] == "propane" for b in blocks):
+        legend_items.insert(2, patches.Patch(facecolor="#32CD32", edgecolor="#333", label="Propane"))
+    ax.legend(handles=legend_items, loc="lower right", fontsize=7, framealpha=0.9)
+
+    ax.set_xlabel("East-West (ft)", fontsize=9)
+    ax.set_ylabel("North-South (ft)", fontsize=9)
+    ax.grid(True, alpha=0.2, linestyle="--")
+    ax.tick_params(labelsize=7)
+
+    fig.tight_layout()
+    return fig
+
+
+def _render_plot_plan_tab(detail: dict, result, design_basis: dict = None):
+    """Visual plot plan with scaled equipment, constraint checking, and AI layout modification."""
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+
+    design_basis = design_basis or {}
+    config = _config_type(detail)
+    costs = _costs_from_detail(detail)
+    power_bal = detail.get("power_balance", {})
+    P_gross = power_bal.get("P_gross", 0)
+    P_net = power_bal.get("P_net", 0)
+    n_bays = int(costs.get("acc_n_bays", 0))
+    n_trains = detail.get("n_trains", N_TRAINS_DEFAULT)
+
+    # ── Controls ──────────────────────────────────────────────
+    # Default wind direction from shared sidebar (design basis), overridable here
+    default_wind = design_basis.get("prevailing_wind", "SW")
+    wind_options = ["N", "NE", "E", "SE", "S", "SW", "W", "NW"]
+    default_idx = wind_options.index(default_wind) if default_wind in wind_options else 5
+    ctrl_cols = st.columns(2)
+    with ctrl_cols[0]:
+        wind_dir = st.selectbox(
+            "Prevailing wind direction",
+            options=wind_options,
+            index=default_idx,
+            key="feed_wind_dir",
+        )
+    with ctrl_cols[1]:
+        st.markdown(f"**Configuration:** {_config_label(result)}")
+        st.markdown(f"**Trains:** {n_trains} | **ACC Bays:** {n_bays} | **Gross:** {P_gross/1000:.1f} MW")
+
+    # ── Build and place equipment ─────────────────────────────
+    blocks = _build_equipment_blocks(detail)
+
+    # Check for AI layout modifications in session state
+    layout_key = "feed_layout_overrides"
+    overrides = st.session_state.get(layout_key, {})
+    placed = _layout_equipment(blocks, wind_dir)
+
+    # Apply any user overrides
+    for b in placed:
+        if b["tag"] in overrides:
+            b["x"] = overrides[b["tag"]].get("x", b["x"])
+            b["y"] = overrides[b["tag"]].get("y", b["y"])
+
+    # ── Draw plot plan ────────────────────────────────────────
+    fig = _draw_plot_plan(placed, wind_dir)
+    st.pyplot(fig, use_container_width=True)
+    plt.close(fig)
+
+    # ── PNG download ──────────────────────────────────────────
+    buf = io.BytesIO()
+    fig2 = _draw_plot_plan(placed, wind_dir)
+    fig2.savefig(buf, format="png", dpi=200, bbox_inches="tight",
+                 facecolor="white", edgecolor="none")
+    plt.close(fig2)
+    buf.seek(0)
+    st.download_button(
+        "Download Plot Plan (PNG)",
+        data=buf.getvalue(),
+        file_name=f"plot_plan_run{result.run_id}.png",
+        mime="image/png",
+    )
+
+    # ── Metrics ───────────────────────────────────────────────
+    total_ft2 = sum(b["w_ft"] * b["h_ft"] for b in placed)
+    all_x = [b["x"] + b["w_ft"] / 2 for b in placed] + [b["x"] - b["w_ft"] / 2 for b in placed]
+    all_y = [b["y"] + b["h_ft"] / 2 for b in placed] + [b["y"] - b["h_ft"] / 2 for b in placed]
+    plot_w = max(all_x) - min(all_x) if all_x else 0
+    plot_h = max(all_y) - min(all_y) if all_y else 0
+    plot_acres = (plot_w * plot_h) / 43560 if plot_w and plot_h else 0
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Equipment Footprint", f"{total_ft2:,.0f} ft²")
+    m2.metric("Plot Dimensions", f"{plot_w:.0f}' x {plot_h:.0f}'")
+    m3.metric("Estimated Plot", f"{plot_acres:.1f} acres")
+    m4.metric("Spacing Factor", f"{(plot_w * plot_h) / max(total_ft2, 1):.1f}x")
+
+    # ── Constraint Check Table ────────────────────────────────
+    st.markdown("### Separation Constraint Check")
+    block_map = {b["tag"]: b for b in placed}
+    constraint_checks = []
+
+    checks = [
+        ("ACC-Turbine", "AC-0101", ["TG-0101A", "TG-0101"], 50, "Thermal interference, API 2510"),
+        ("Elec-Turbine", "SS-0101", ["TG-0101A", "TG-0101"], 25, "NEC / NFPA 70"),
+        ("WF Storage-Elec", "TK-0101", ["SS-0101"], 100, "NFPA 30"),
+        ("Brine-Process", "BM-0101", ["HX-0101", "HX-0101A"], 25, "Piping economics"),
+    ]
+    for name, tag_a, tag_b_options, min_dist, basis in checks:
+        a = block_map.get(tag_a)
+        b = None
+        for tb in tag_b_options:
+            if tb in block_map:
+                b = block_map[tb]
+                break
+        if a and b:
+            dx = b["x"] - a["x"]
+            dy = b["y"] - a["y"]
+            dist = math.sqrt(dx * dx + dy * dy)
+            status = "PASS" if dist >= min_dist else "VIOLATION"
+            constraint_checks.append({
+                "Constraint": name, "Required (ft)": min_dist,
+                "Actual (ft)": f"{dist:.0f}", "Status": status, "Basis": basis,
+            })
+
+    if constraint_checks:
+        df_checks = pd.DataFrame(constraint_checks)
+        # Highlight violations
+        st.dataframe(df_checks, use_container_width=True, hide_index=True)
+        violations = [c for c in constraint_checks if c["Status"] == "VIOLATION"]
+        if violations:
+            st.error(f"{len(violations)} separation constraint violation(s) detected — see red annotations on plan.")
+        else:
+            st.success("All separation constraints satisfied.")
+
+    # ── Full separation rules reference ───────────────────────
+    with st.expander("Minimum Separation Requirements (Design Basis)"):
+        sep_rows = [{"From": f, "To": t, "Min Distance (ft)": d, "Basis": b}
+                    for f, t, d, b in SEPARATION_RULES]
+        st.dataframe(pd.DataFrame(sep_rows), use_container_width=True, hide_index=True)
+
+    # ── Equipment Footprint Table ─────────────────────────────
+    with st.expander("Equipment Footprint Details"):
+        fp_rows = []
+        for b in placed:
+            fp_rows.append({
+                "Tag": b["tag"], "Service": b["service"],
+                "Width (ft)": f"{b['w_ft']:.0f}", "Depth (ft)": f"{b['h_ft']:.0f}",
+                "Area (ft²)": f"{b['w_ft'] * b['h_ft']:,.0f}", "System": b["system"],
+            })
+        fp_rows.append({
+            "Tag": "TOTAL", "Service": "", "Width (ft)": "", "Depth (ft)": "",
+            "Area (ft²)": f"{total_ft2:,.0f}", "System": "",
+        })
+        st.dataframe(pd.DataFrame(fp_rows), use_container_width=True, hide_index=True)
+
+    # ── Interactive Layout Modification ───────────────────────
+    st.markdown("### Modify Layout")
+    user_change = st.text_input(
+        "Describe a layout change",
+        placeholder='e.g. "Move ACC 20 ft further north" or "Swap turbine and HX positions"',
+        key="feed_layout_change_input",
+    )
+    if user_change and st.button("Apply Change", key="feed_apply_layout"):
+        _apply_layout_change(user_change, placed, wind_dir, detail, result)
 
     st.warning(
-        "This output requires survey, geotechnical, and site-specific review "
-        "before use in layout design."
+        "This plot plan is preliminary and requires survey, geotechnical, "
+        "and site-specific review before use in layout design. "
+        "Separation distances are preliminary — requires fire protection "
+        "and hazardous area classification review per NFPA 30/70/497 and API 2510. "
+        "Do not treat as code-compliant without licensed engineering review."
     )
+
+
+def _apply_layout_change(user_request: str, placed: list[dict], wind_dir: str,
+                         detail: dict, result):
+    """Use Claude to interpret a natural-language layout change, check constraints, and redraw."""
+    import json as _json
+
+    try:
+        import anthropic
+        import streamlit as _st2
+        api_key = None
+        try:
+            api_key = st.secrets.get("ANTHROPIC_API_KEY")
+        except Exception:
+            pass
+        if not api_key:
+            import os
+            api_key = os.environ.get("ANTHROPIC_API_KEY")
+        if not api_key:
+            st.error("No API key — cannot interpret layout changes. Set ANTHROPIC_API_KEY.")
+            return
+
+        # Build context for Claude
+        equip_json = []
+        for b in placed:
+            equip_json.append({
+                "tag": b["tag"], "service": b["service"],
+                "x": round(b["x"], 1), "y": round(b["y"], 1),
+                "w_ft": round(b["w_ft"], 1), "h_ft": round(b["h_ft"], 1),
+                "system": b["system"],
+            })
+
+        constraints_text = "\n".join(
+            f"- {f} to {t}: min {d} ft ({b})" for f, t, d, b in SEPARATION_RULES
+        )
+
+        prompt = f"""You are a plant layout engineer. The user wants to modify an ORC power plant plot plan.
+
+CURRENT EQUIPMENT POSITIONS (x=East-West ft, y=North-South ft, center coordinates):
+{_json.dumps(equip_json, indent=2)}
+
+PREVAILING WIND: {wind_dir}
+
+SEPARATION CONSTRAINTS:
+{constraints_text}
+- ACC minimum 50 ft from Turbine Building
+- Electrical room minimum 25 ft from Turbine
+- WF Storage minimum 100 ft from Electrical
+
+USER REQUEST: "{user_request}"
+
+Interpret the request and return a JSON object with:
+1. "changes": dict of tag -> {{"x": new_x, "y": new_y}} for each moved equipment
+2. "explanation": brief explanation of what you changed
+3. "violations": list of any constraint violations introduced (empty if none)
+4. "suggestions": if violations exist, suggest the minimum fix to satisfy BOTH the user's intent AND the constraint
+5. "design_basis_updates": list of strings describing any design assumptions that changed (e.g. "ACC separation increased to 80 ft", "Plot orientation rotated 90°"). Empty list if layout-only.
+
+Do NOT refuse a change that violates a constraint — show the violation clearly and suggest the minimum modification.
+
+Return ONLY valid JSON, no markdown."""
+
+        client = anthropic.Anthropic(api_key=api_key)
+        response = client.messages.create(
+            model="claude-sonnet-4-20250514",
+            max_tokens=2000,
+            messages=[{"role": "user", "content": prompt}],
+        )
+
+        from synthesis import _extract_json
+        parsed = _extract_json(response.content[0].text)
+
+        if parsed and "changes" in parsed:
+            changes = parsed["changes"]
+            explanation = parsed.get("explanation", "Layout updated.")
+            violations = parsed.get("violations", [])
+            suggestions = parsed.get("suggestions", "")
+
+            # Store overrides in session state
+            overrides = st.session_state.get("feed_layout_overrides", {})
+            overrides.update(changes)
+            st.session_state["feed_layout_overrides"] = overrides
+
+            st.success(f"Layout updated: {explanation}")
+
+            if violations:
+                st.warning(
+                    f"**Constraint violations:** {'; '.join(violations)}\n\n"
+                    f"**Suggested fix:** {suggestions}"
+                )
+
+            # Flag design basis updates for DBD review
+            dbd_updates = parsed.get("design_basis_updates", [])
+            if dbd_updates:
+                st.info(
+                    "**Design Basis impact detected:**\n"
+                    + "\n".join(f"- {u}" for u in dbd_updates)
+                    + "\n\nConsider updating the Design Basis Document "
+                    "via the optimizer's DBD update workflow."
+                )
+                st.session_state["feed_layout_dbd_updates"] = dbd_updates
+
+            st.rerun()
+        else:
+            st.error("Could not parse layout change response.")
+
+    except Exception as e:
+        st.error(f"Layout modification failed: {str(e)[:200]}")
 
 
 # ── TAB 6: Open Items Log ───────────────────────────────────────────────────
@@ -1079,6 +1817,6 @@ def render_feed_package(result, design_basis: dict):
     with t4:
         _render_instrumentation_tab(detail, result)
     with t5:
-        _render_plot_plan_tab(detail, result)
+        _render_plot_plan_tab(detail, result, design_basis)
     with t6:
         _render_open_items_tab(detail, result)
