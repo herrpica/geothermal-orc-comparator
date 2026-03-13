@@ -20,6 +20,7 @@ from tab_technology import render_technology_tab
 from tab_optimizer import render_optimizer_tab
 from tab_knowledge import render_knowledge_tab
 from design_basis_document import render_dbd_tab
+from tab_geoblock import render_geoblock_tab
 
 # ── Page config ────────────────────────────────────────────────────────────
 
@@ -271,9 +272,10 @@ shared_inputs = {
 
 # ── Tabs ───────────────────────────────────────────────────────────────────
 
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7 = st.tabs([
     "🔧 ORC Analysis", "⚗️ Design Dialectic", "🔬 Technology Selection",
-    "🔍 Autonomous Optimizer", "📚 Knowledge Base", "📋 Design Basis"])
+    "🔍 Autonomous Optimizer", "📚 Knowledge Base", "📋 Design Basis",
+    "🏭 GeoBlock Catalog"])
 
 with tab1:
     analysis_inputs = build_analysis_sidebar(shared_inputs)
@@ -303,3 +305,6 @@ with tab5:
 
 with tab6:
     render_dbd_tab(design_basis)
+
+with tab7:
+    render_geoblock_tab(design_basis)
